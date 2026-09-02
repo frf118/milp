@@ -23,6 +23,7 @@ src_data_structures.xlsx
 /output/
 /alg/
 /.codex
+/.worktrees
 /design-system
 /.reasonix
 reasonix.toml
