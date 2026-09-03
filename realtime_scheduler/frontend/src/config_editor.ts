@@ -1533,12 +1533,19 @@ function renderWorkspaceControls() {
   const deviceSelect = document.getElementById("deviceSelect"), tests = state.workspaceDevice?.tests || [];
   deviceSelect.innerHTML = state.workspaceDevices.length ? state.workspaceDevices.map(device => `<option value="${escapeHtml(device.id)}" ${device.id === state.workspaceDeviceId ? "selected" : ""}>${escapeHtml(displayDeviceName(device.name))}</option>`).join("") : `<option value="">尚未导入设备</option>`;
   const natural = (left, right) => left.localeCompare(right, undefined, { numeric: true });
-  const groups = [...new Set(["", ...(state.workspaceDevice?.testGroups || []), ...tests.map(test => String(test.group || "").trim())])].sort((left, right) => (!left) - (!right) || natural(left, right));
+  const ungroupedTests = tests.some(test => !String(test.group || "").trim());
+  // “未分组”只在迁移前遗留测试实际存在时显示，避免给每台设备留下空的默认组。
+  const groups = [...new Set([
+    ...(ungroupedTests ? [""] : []),
+    ...(state.workspaceDevice?.testGroups || []).map(group => String(group || "").trim()).filter(Boolean),
+    ...tests.map(test => String(test.group || "").trim()).filter(Boolean),
+  ])].sort((left, right) => (!left) - (!right) || natural(left, right));
   const selectedGroup = groups.includes(state.activeTestGroup) ? state.activeTestGroup : (groups[0] || "");
+  state.activeTestGroup = selectedGroup;
   const groupSelect = document.getElementById("testGroupSelect");
-  groupSelect.innerHTML = groups.length ? groups.map(group => `<option value="${escapeHtml(group)}" title="${escapeHtml(group || "未分组")}" ${group === selectedGroup ? "selected" : ""}>${escapeHtml(group || "未分组")}</option>`).join("") : `<option value="">未分组</option>`;
-  groupSelect.title = selectedGroup || "未分组";
-  groupSelect.disabled = !state.workspaceDeviceId;
+  groupSelect.innerHTML = groups.length ? groups.map(group => `<option value="${escapeHtml(group)}" title="${escapeHtml(group || "未分组")}" ${group === selectedGroup ? "selected" : ""}>${escapeHtml(group || "未分组")}</option>`).join("") : `<option value="">尚无测试组</option>`;
+  groupSelect.title = selectedGroup || (groups.length ? "未分组" : "尚无测试组");
+  groupSelect.disabled = !state.workspaceDeviceId || !groups.length;
   const testSelect = document.getElementById("testCaseSelect");
   const visibleTests = tests.filter(test => String(test.group || "").trim() === selectedGroup).sort((left, right) => natural(left.name, right.name));
   testSelect.innerHTML = visibleTests.length ? visibleTests.map(test => `<option value="${escapeHtml(test.id)}" title="${escapeHtml(test.name)}" ${test.id === state.testCaseId ? "selected" : ""}>${escapeHtml(test.name)}</option>`).join("") : `<option value="">该组暂无测试</option>`;
@@ -3821,7 +3828,7 @@ function buildPayload() {
     // 初始执行模式随回放/步进模式走，避免 update 启动时的会话重置覆盖用户选择。
     options.scheduleAlphaGoExecutionMode = playbackMode === "step" ? "stepped" : "continuous";
   }
-  return { schemaVersion: EXPECTED_API_SCHEMA, workspaceDeviceId: state.workspaceDeviceId, workspaceTestId: state.testCaseId, deviceName: state.deviceName, device: state.device, strategy: state.strategy, roundCount: state.roundCount, options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), skipBaseline: skipBaselineEnabled(), recipes: collectRecipes(routes), cleans, routes, rounds: instances.rounds };
+  return { schemaVersion: EXPECTED_API_SCHEMA, workspaceDeviceId: state.workspaceDeviceId, workspaceTestId: state.testCaseId, deviceName: state.deviceName, device: state.device, strategy: state.strategy, roundCount: state.roundCount, options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), skipBaseline: skipBaselineEnabled(), cleanValidationTypes: cleanValidationTypes(), recipes: collectRecipes(routes), cleans, routes, rounds: instances.rounds };
 }
 
 /** 把数字输入限制在 [min, max] 并回填 DOM，防止手输越界值。 */
@@ -3845,6 +3852,13 @@ function validationParallelism() {
   return clampParallelismInput("validationParallelismInput", 1, 15, 2);
 }
 
+const CLEAN_VALIDATION_TYPES = ["preclean", "postclean", "wacclean", "dummy", "dummywac"] as const;
+
+/** 返回当前启用的 Clean 校验类型；未勾选类型不参与对应的业务规则判定。 */
+function cleanValidationTypes() {
+  return CLEAN_VALIDATION_TYPES.filter(type => document.getElementById(`cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`)?.checked === true);
+}
+
 let runSettingsPreferencesDirty = false;
 
 /** 收集运行设置弹窗的完整状态，作为本地偏好 API 的稳定载荷。 */
@@ -3855,6 +3869,7 @@ function currentRunSettingsPreferences() {
     skipBaseline: skipBaselineEnabled(),
     maximumWorkers: batchParallelism(),
     validationWorkers: validationParallelism(),
+    cleanValidationTypes: cleanValidationTypes(),
   };
 }
 
@@ -3874,6 +3889,11 @@ function applyRunSettingsPreferences(settings) {
   const validationWorkersInput = document.getElementById("validationParallelismInput");
   if (maximumWorkersInput) maximumWorkersInput.value = String(settings.maximumWorkers ?? 4);
   if (validationWorkersInput) validationWorkersInput.value = String(settings.validationWorkers ?? 2);
+  const enabledCleanTypes = new Set(Array.isArray(settings.cleanValidationTypes) ? settings.cleanValidationTypes : CLEAN_VALIDATION_TYPES);
+  CLEAN_VALIDATION_TYPES.forEach(type => {
+    const input = document.getElementById(`cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`);
+    if (input) input.checked = enabledCleanTypes.has(type);
+  });
   batchParallelism();
   validationParallelism();
   runSettingsPreferencesDirty = false;
@@ -3912,9 +3932,10 @@ function updateRunSettingsButtonLabel() {
   const skipBaseline = document.getElementById("skipBaselineInput")?.checked === true;
   const algorithmWorkers = batchParallelism();
   const validationWorkers = validationParallelism();
+  const enabledCleanTypes = cleanValidationTypes();
   const validationInput = document.getElementById("validationParallelismInput");
   if (validationInput) validationInput.disabled = !hongYe;
-  const labels = [compatibility && "兼容模式", hongYe && "HongYe Check", skipBaseline && "跳过 Baseline"].filter(Boolean);
+  const labels = [compatibility && "兼容模式", hongYe && "HongYe Check", skipBaseline && "跳过 Baseline", enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length && `Clean 校验 ${enabledCleanTypes.length}/${CLEAN_VALIDATION_TYPES.length}`].filter(Boolean);
   const parallelism = `算法×${algorithmWorkers}${hongYe ? ` 校验×${validationWorkers}` : ""}`;
   const summary = labels.length ? `运行设置：${labels.join("、")}（${parallelism}）` : `运行设置：${parallelism}`;
   button.setAttribute("aria-label", summary);
@@ -3922,7 +3943,7 @@ function updateRunSettingsButtonLabel() {
   button.classList.toggle(
     "is-customized",
     !compatibility || !hongYe || !skipBaseline
-      || algorithmWorkers !== 4 || validationWorkers !== 2,
+      || algorithmWorkers !== 4 || validationWorkers !== 2 || enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length,
   );
 }
 
@@ -4451,7 +4472,7 @@ async function runCurrentTestGroup(selectedTestIds = null) {
     const response = await fetch("/api/run-batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId: state.workspaceDeviceId, group: state.activeTestGroup, testIds: tests.map(test => test.id), strategy: state.strategy, options: state.options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), skipBaseline: skipBaselineEnabled(), maximumWorkers: batchParallelism(), validationWorkers: validationParallelism() }),
+      body: JSON.stringify({ deviceId: state.workspaceDeviceId, group: state.activeTestGroup, testIds: tests.map(test => test.id), strategy: state.strategy, options: state.options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), skipBaseline: skipBaselineEnabled(), maximumWorkers: batchParallelism(), validationWorkers: validationParallelism(), cleanValidationTypes: cleanValidationTypes() }),
     });
     let result = await response.json();
     if (!response.ok || !result.batchId || !Array.isArray(result.items)) throw new Error(result.error || `服务返回 ${response.status}`);
@@ -4821,7 +4842,7 @@ function renderBatchItems(items) {
     return `
       <div class="batch-result ${escapeHtml(item.status || "queued")}${selected ? " selected" : ""}" data-batch-item-index="${index}">
         <div class="batch-result-head">
-          <button class="batch-result-title" type="button" aria-pressed="${selected}" aria-label="查看 ${escapeHtml(displayId)} ${escapeHtml(item.testName || "")} 的详细指标"><strong title="${escapeHtml(`${item.testId || ""} · ${item.testName || ""}`)}"><span class="batch-result-order">${escapeHtml(displayId)}</span>${escapeHtml(item.testName || `测试 ${index + 1}`)}</strong></button>
+          <button class="batch-result-title" type="button" aria-pressed="${selected}" aria-label="查看 ${escapeHtml(item.testName || `测试 ${index + 1}`)} 的详细指标"><strong title="${escapeHtml(item.testName || `测试 ${index + 1}`)}">${escapeHtml(item.testName || `测试 ${index + 1}`)}</strong></button>
           <div class="batch-result-meta">
             <span class="batch-status">${statusLabels[item.status] || "等待中"}</span>
             ${item.logUrl ? `<a class="btn" href="${escapeHtml(item.logUrl)}" download>日志</a>` : `<span class="btn" aria-disabled="true">日志</span>`}
@@ -5308,7 +5329,7 @@ document.getElementById("batchRunButton").addEventListener("click", runCurrentTe
 document.getElementById("openRunSettingsButton").addEventListener("click", openRunSettingsDialog);
 document.getElementById("runSettingsDialogClose").addEventListener("click", closeRunSettingsDialog);
 document.getElementById("runSettingsDialog").addEventListener("close", finishRunSettingsDialog);
-["hongYeCheckInput", "compatibilityModeInput", "skipBaselineInput", "batchParallelismInput", "validationParallelismInput"].forEach(id => {
+["hongYeCheckInput", "compatibilityModeInput", "skipBaselineInput", "batchParallelismInput", "validationParallelismInput", ...CLEAN_VALIDATION_TYPES.map(type => `cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`)].forEach(id => {
   document.getElementById(id).addEventListener("change", () => {
     runSettingsPreferencesDirty = true;
     updateRunSettingsButtonLabel();

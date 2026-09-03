@@ -12,7 +12,7 @@ python -m realtime_scheduler.backend.main --open
 
 默认地址为 `http://127.0.0.1:8765/config_editor.html`
 
-“运行设置”中的兼容、校验、Baseline 开关以及算法/HongYe 并行数会保存在本机
+“运行设置”中的兼容、校验、Baseline 开关、Clean 校验类型以及算法/HongYe 并行数会保存在本机
 `realtime_scheduler/data/run_preferences.json`，刷新页面或重启服务后自动恢复。
 
 首次打开页面后，在“设备与测试集”卡片选择“导入”：
@@ -25,7 +25,7 @@ python -m realtime_scheduler.backend.main --open
 
 ## 命令行运行测试
 
-使用 [`scripts/run_dataset_suite.py`](scripts/run_dataset_suite.py) 可直接运行本地`realtime_scheduler/data/datasets/` 中的测试集。默认使用平台内置 MoveList 校验器，不启动 HongYe，也跳过 Baseline，适合本地复现与调试。
+使用 [`scripts/run_dataset_suite.py`](scripts/run_dataset_suite.py) 可直接运行本地`realtime_scheduler/data/datasets/` 中的测试集。默认启用 HongYe 校验并跳过 Baseline；如需使用平台内置 MoveList 校验器，可传入 `--no-hongye-check`。
 
 先逐层列出可用设备、测试组和测试：
 
