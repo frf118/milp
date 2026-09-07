@@ -101,8 +101,8 @@ if ALGORITHM_REPOSITORY_PRESENT:
             TIME_TOLERANCE,
         )
         SearchCancelledError = None
-        if "schedule-alphago" in builtin_supported_algorithms:
-            from src.schedule.strategies.schedule_alphago.telemetry import (
+        if "search-tree" in builtin_supported_algorithms:
+            from src.schedule.strategies.search_tree.telemetry import (
                 SearchCancelledError,
             )
     except Exception as error:  # noqa: BLE001
@@ -117,7 +117,9 @@ if not BUILTIN_ALGORITHM_AVAILABLE:
     MODELS_DIR = ALGORITHM_ROOT / "results" / "models"
     builtin_supported_algorithms = frozenset()
 from realtime_scheduler.backend.algorithms.interface import (
+    OTHER_ALGORITHM_STRATEGY_PREFIX,
     discover_other_algorithms,
+    get_replay_actions as algorithm_get_replay_actions,
     init as algorithm_init,
     session as algorithm_session,
     update as algorithm_update,
@@ -192,7 +194,7 @@ MAX_CJOB_CYCLE = 1000
 WORKSPACE_DELETE_CLEANUP_RETRY_DELAYS_SECONDS = (0.0, 0.05, 0.2, 0.5, 1.0)
 MAX_WORKSPACE_DEVICE_COUNT = 10
 CJOB_CYCLE_EVENT_EPSILON_MULTIPLIER = 2.0
-WORKSPACE_STORE_VERSION = 7
+WORKSPACE_STORE_VERSION = 8
 WORKSPACE_STORE_VERSION_FILE = "manifest.json"
 LEGACY_WORKSPACE_STORE_VERSION_FILE = ".workspace-version.json"
 WORKSPACE_TEST_INDEX_FILE = ".tests-index.json"
@@ -234,6 +236,7 @@ DATA_DIR = Path(
 EXPORT_DIR = REALTIME_APP_DIR / "exports"
 EDITOR_PATH = FRONTEND_DIR / "config_editor.html"
 VIEWER_PATH = FRONTEND_DIR / "movelist_gantt_viewer.html"
+DOCUMENTATION_PAGE_PATH = FRONTEND_DIR / "documentation.html"
 ROUTE_EDITOR_LOGIC_PATH = FRONTEND_DIR / "route_editor_logic.js"
 FRONTEND_ASSET_DIR = FRONTEND_DIR / "assets"
 DOCUMENTATION_DIR = DATA_DIR / "documentation"

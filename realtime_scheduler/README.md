@@ -17,7 +17,8 @@
   参数决定算法。
 - `backend/execution/batch_service.py`：批量运行、Heuristic Baseline、并发进度与取消状态。
 - `backend/execution/plan_builder.py`：设备归一化、Route/Recipe 和各轮 CJob/PJob 请求建模。
-- `frontend/config_editor.html`：只保存调度平台的页面骨架。
+- `frontend/config_editor.html`：只保存调度平台主控制台的页面骨架。
+- `frontend/documentation.html`：独立的本地 Markdown 使用文档页面。
 - `frontend/src/`：TypeScript 前端源码，按 API、数据模型、Route 逻辑和页面入口拆分。
 - `frontend/src/workspace_visualizer.ts`：MoveList 回放、腔室门状态与设备工作台；性能指标通过 `/api/analysis/*` 获取。
 - `frontend/assets/`：可由 Python 服务直接托管的构建产物与样式。
@@ -39,6 +40,10 @@
 `StateVariables`、清洗计数和在机物料属于持续运行状态，必须原样保留，不能被新
 一代初始化数据覆盖。
 
+拓扑回放可调用算法入口的可选 `get_replay_actions` 函数，在每个 Pick、Place、Swap
+边界展示使能、物理拦截和死锁规则拦截动作。算法未实现该函数时动作卡片保持空白；
+回放页面不运行或展示推荐模型。
+
 完整开发环境启动：
 
 `alg\.venv\Scripts\python.exe -m realtime_scheduler.backend.main --port 8765 --open`
@@ -55,7 +60,7 @@ npm run build
 ```
 
 `npm run check` 检查独立 TypeScript 业务模块，`npm run build` 更新
-`assets/config_editor.js`，并生成供 Node 单元测试使用的 `route_editor_logic.js`
+`assets/config_editor.js` 和 `assets/documentation_page.js`，并生成供 Node 单元测试使用的 `route_editor_logic.js`
 与 `workspace_visualizer_logic.js`。
 
 每次修改前端都必须递增 `frontend/package.json` 和 `package-lock.json` 中的版本号，
@@ -78,7 +83,10 @@ npm run build
   取消 HongYe 后仍会保留平台状态推进校验。开始运行区域的“兼容模式”默认勾选，
   平台按 HongYe `module-parallel` 规则让各 Module 并行推进、同 Module 串行推进，
   Move 等待其本代 `PreMoveID` 实际结束后才开始；缺失的开关门动作会按设备语义
-  自动补齐。所有算法都会把实际推进通知记录为 `AlgUpdateMove`。
+  自动补齐。设备配置可设置固定执行值，或按比例/绝对上下限生成以理论值为中心的
+  可复现波动；仅在运行设置启用“设备执行时间模拟”时应用。修正后的结束时刻继续沿
+  `PreMoveID` 和同 Module 队列传播，算法 `AlgInit` 仍只接收标准理论时间。
+  所有算法都会把实际推进通知记录为 `AlgUpdateMove`。
 
 本地算法列表不在前端写死，而是由算法仓库根目录的 `algorithms.json` 控制。
 服务会在每次健康检查时重读清单；配置中的算法还必须存在于
@@ -121,7 +129,7 @@ PJob 继续复用。
 并把 HongYe 校验并行数配置为 1~15；所有测试及自动补算的 Heuristic Baseline 共享
 同一校验配额，避免 MoveStateSim 的高内存占用随算法 worker 数一起增长。8 项及以上
 使用配置数量的隔离进程，避免算法全局会话状态把并发退化为串行。页面每秒更新总体进度，
-运行设置的四个开关与两个并发数会原子保存到本地 `data/run_preferences.json`，刷新页面
+运行设置的执行开关、校验开关与两个并发数会原子保存到本地 `data/run_preferences.json`，刷新页面
 或重启服务后自动恢复；该文件不属于设备/测试集交换包。
 结果卡片按名称中的数字自然排序（如 test1、test2、test10）并固定展示；数量较多时在
 结果区域内滚动，并只在项目状态变化时重绘。

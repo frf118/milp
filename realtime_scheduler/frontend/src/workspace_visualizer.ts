@@ -18,6 +18,7 @@ import type {
   ResourcePerformance,
   ResourceKind,
   SchedulePerformance,
+  ThroughputTimelinePoint,
   WaferResidenceTime,
 } from "./analysis_contracts";
 
@@ -92,6 +93,7 @@ export interface LoadPortSlotSnapshot {
   processed: boolean;
 }
 
+/** 旧结果文件中的模型候选，仅用于忽略历史 DecisionTrace 时保持解析兼容。 */
 export interface DecisionCandidate {
   actionId: string;
   actor: string;
@@ -132,7 +134,25 @@ export interface DecisionCandidateGroup {
   candidates: DecisionCandidate[];
 }
 
-type RecommendationModel = "e2e-ctq" | "dual-actor-e2e";
+type ActionDiagnosticStatus = "enabled" | "physical-blocked" | "deadlock-blocked";
+
+export interface ReplayActionDiagnostic {
+  actionId: string;
+  kind: "pick" | "place" | "swap";
+  status: ActionDiagnosticStatus;
+  reason: string;
+  actor: string;
+  robot: string;
+  materialIds: string[];
+  source: string;
+  sourceSlot: number;
+  destination: string;
+  destinationSlot: number;
+  earliestStart: number;
+  finishTime: number;
+}
+
+type RecommendationModel = "actions" | "e2e-ctq" | "dual-actor-e2e";
 
 export interface DecisionTraceStep {
   model: RecommendationModel;
@@ -151,6 +171,10 @@ export interface DecisionTraceStep {
   replayEvaluated: boolean;
   candidates: DecisionCandidate[];
   candidateGroups: DecisionCandidateGroup[];
+  actionDiagnosticsSource: string;
+  actionDiagnosticsProvider: string;
+  actionCounts: Record<ActionDiagnosticStatus, number>;
+  actionDiagnostics: ReplayActionDiagnostic[];
 }
 
 interface NormalizedMove extends MoveRecord {
@@ -169,10 +193,9 @@ interface WorkspaceElements {
   content: HTMLElement;
   topologyPlayback: HTMLElement;
   stage: HTMLElement;
+  frontSlotOverview: HTMLElement;
   decisionLens: HTMLElement;
-  recommendationModel: HTMLSelectElement;
-  recommendationModelHint: HTMLElement;
-  pauseOnDecisionChangeButton: HTMLButtonElement;
+  actionStatusFilters: HTMLInputElement[];
   activeMoves: HTMLElement;
   source: HTMLElement;
   currentTime: HTMLElement;
@@ -263,7 +286,7 @@ function finiteNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback;
 }
 
-/** 把可选模型指标规范为有限数字；缺失或非有限值统一返回 null。 */
+/** 把旧结果中的可选数值规范为有限数字；缺失或非有限值统一返回 null。 */
 function nullableFiniteNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
@@ -291,7 +314,7 @@ export function normalizeMovePayload(payload: unknown): MoveRecord[] {
     .map(record => ({ ...record }));
 }
 
-/** 规范单个模型候选；双 Actor 的 actor 可由所属候选组补齐。 */
+/** 规范旧结果文件中的候选字段；当前动作状态卡片不会展示这些字段。 */
 function normalizeDecisionCandidate(
   candidate: UnknownRecord,
   actor = "",
@@ -326,6 +349,29 @@ function normalizeDecisionCandidate(
   };
 }
 
+/** 规范算法接口返回的 Pick、Place、Swap 动作诊断。 */
+function normalizeReplayActionDiagnostic(value: UnknownRecord): ReplayActionDiagnostic | null {
+  const kind = String(value.kind ?? "").toLowerCase();
+  const status = String(value.status ?? "").toLowerCase();
+  if (!["pick", "place", "swap"].includes(kind)) return null;
+  if (!["enabled", "physical-blocked", "deadlock-blocked"].includes(status)) return null;
+  return {
+    actionId: String(value.actionId ?? ""),
+    kind: kind as ReplayActionDiagnostic["kind"],
+    status: status as ActionDiagnosticStatus,
+    reason: String(value.reason ?? ""),
+    actor: String(value.actor ?? ""),
+    robot: String(value.robot ?? ""),
+    materialIds: listValue(value.materialIds).map(String),
+    source: String(value.source ?? ""),
+    sourceSlot: finiteNumber(value.sourceSlot),
+    destination: String(value.destination ?? ""),
+    destinationSlot: finiteNumber(value.destinationSlot),
+    earliestStart: finiteNumber(value.earliestStart),
+    finishTime: finiteNumber(value.finishTime),
+  };
+}
+
 /** 从运行结果中提取 E2E 联合推荐或双 Actor 分域原子推荐。 */
 export function normalizeDecisionTrace(payload: unknown): DecisionTraceStep[] {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
@@ -340,9 +386,11 @@ export function normalizeDecisionTrace(payload: unknown): DecisionTraceStep[] {
     .filter((step): step is UnknownRecord => Boolean(step) && typeof step === "object" && !Array.isArray(step))
     .map((step): DecisionTraceStep => {
       const modelSignature = `${String(step.model ?? "")} ${String(meta.schema ?? "")} ${String(meta.model ?? "")}`.toLowerCase();
-      const model: RecommendationModel = modelSignature.includes("dual-actor") || modelSignature.includes("双 actor")
-        ? "dual-actor-e2e"
-        : "e2e-ctq";
+      const model: RecommendationModel = modelSignature.includes("actions")
+        ? "actions"
+        : modelSignature.includes("dual-actor") || modelSignature.includes("双 actor")
+          ? "dual-actor-e2e"
+          : "e2e-ctq";
       const rawCandidates = Array.isArray(step.candidates)
         ? step.candidates
         : model === "dual-actor-e2e" && Array.isArray(step.proposals)
@@ -401,6 +449,13 @@ export function normalizeDecisionTrace(payload: unknown): DecisionTraceStep[] {
         }).filter(group => group.candidates.length);
       }
       if (candidateGroups.length) candidates = candidateGroups.flatMap(group => group.candidates);
+      const actionDiagnostics = listValue(step.actionDiagnostics)
+        .filter((action): action is UnknownRecord => Boolean(action) && typeof action === "object" && !Array.isArray(action))
+        .map(normalizeReplayActionDiagnostic)
+        .filter((action): action is ReplayActionDiagnostic => Boolean(action));
+      const rawActionCounts = step.actionCounts && typeof step.actionCounts === "object"
+        ? step.actionCounts as UnknownRecord
+        : {};
       return {
         model,
         modelLabel: String(step.modelLabel ?? (model === "dual-actor-e2e" ? "双 Actor 原子调度" : "E2E-CTQ")),
@@ -418,6 +473,14 @@ export function normalizeDecisionTrace(payload: unknown): DecisionTraceStep[] {
         replayEvaluated: Boolean(step.replayEvaluated),
         candidates,
         candidateGroups,
+        actionDiagnosticsSource: String(step.actionDiagnosticsSource ?? ""),
+        actionDiagnosticsProvider: String(step.actionDiagnosticsProvider ?? ""),
+        actionCounts: {
+          enabled: finiteNumber(rawActionCounts.enabled),
+          "physical-blocked": finiteNumber(rawActionCounts["physical-blocked"]),
+          "deadlock-blocked": finiteNumber(rawActionCounts["deadlock-blocked"]),
+        },
+        actionDiagnostics,
       };
     })
     .sort((left, right) => left.time - right.time || left.decisionIndex - right.decisionIndex);
@@ -630,12 +693,17 @@ function isAlignerModule(name: string, type = ""): boolean {
   return type.trim().toLowerCase() === "aligner" || /^(AL|ALIGNER)$/i.test(name.trim());
 }
 
-/** 画布隐藏不参与搬运路径、也没有独立拓扑语义的站点。 */
+/** 判断站点是否是真空框架顶部的加热腔；它在拓扑中沿用 PM 的腔室外观。 */
+function isHeaterModule(name: string, type = ""): boolean {
+  return type.trim().toLowerCase() === "heater" || /^HEATER$/i.test(name.trim());
+}
+
+/** 画布隐藏不参与当前回放拓扑的站点；Buffer 与 LP4 暂不进入新布局。 */
 function isTopologyHiddenModule(module: ModuleSnapshot): boolean {
   const name = module.name.trim();
   const type = module.type.trim().toLowerCase();
-  return /^HEATER$/i.test(name)
-    || type === "heater";
+  return isBufferModule(name, type)
+    || /^LP4$/i.test(name);
 }
 
 /** 判断名称是否代表装载端口。 */
@@ -1590,6 +1658,10 @@ function collectElements(root: Document): WorkspaceElements {
     if (!element) throw new Error(`结果分析页面缺少页面节点：${id}`);
     return element as ElementType;
   };
+  const optionalSelect = (id: string, value: string): HTMLSelectElement => (
+    root.getElementById(id) as HTMLSelectElement | null
+    ?? { value, addEventListener: () => undefined } as unknown as HTMLSelectElement
+  );
   return {
     toolbar: required("visualToolbar"),
     groupAnalysis: required("testGroupAnalysisPanel"),
@@ -1598,10 +1670,11 @@ function collectElements(root: Document): WorkspaceElements {
     content: required("visualContent"),
     topologyPlayback: required("visualTopologyPlayback"),
     stage: required("visualDeviceStage"),
+    /* 独立逻辑测试可使用精简页面夹具；真实页面始终提供该节点。 */
+    frontSlotOverview: (root.getElementById("visualFrontSlotOverview") as HTMLElement | null)
+      ?? { innerHTML: "" } as HTMLElement,
     decisionLens: required("visualDecisionLens"),
-    recommendationModel: required<HTMLSelectElement>("visualRecommendationModel"),
-    recommendationModelHint: required("visualRecommendationModelHint"),
-    pauseOnDecisionChangeButton: required<HTMLButtonElement>("visualPauseOnDecisionChangeButton"),
+    actionStatusFilters: Array.from(root.querySelectorAll<HTMLInputElement>("[data-action-status-filter]")),
     activeMoves: required("visualActiveMoves"),
     source: required("visualSource"),
     currentTime: required("visualCurrentTime"),
@@ -1757,7 +1830,9 @@ export function snapshotWithFullDeviceModules(
 function topologyGroups(modules: ModuleSnapshot[]): TopologyGroups {
   const loadLocks = modules.filter(module => isLoadLockName(module.name, module.type));
   const loadPorts = modules.filter(module => isLoadPortName(module.name, module.type));
-  const processModules = modules.filter(module => isProcessModule(module.name, module.type));
+  const processModules = modules.filter(module => (
+    isProcessModule(module.name, module.type) || isHeaterModule(module.name, module.type)
+  ));
   const assignedNames = new Set([...loadLocks, ...loadPorts, ...processModules].map(module => module.name));
   return {
     processModules,
@@ -1817,17 +1892,24 @@ function renderWaferToken(
   return `<span class="wafer-token wafer-${state}" style="--wafer-progress:${normalizedProgress * 360}deg" title="晶圆 ${escapeHtml(wafer)}，来源 ${escapeHtml(originLabel)}，${processed ? "已加工" : "未加工"}"><span><b class="wafer-origin-label">${escapeHtml(originLabel)}</b></span></span>`;
 }
 
-/** 门始终朝向对应机械手；LoadLock 改由正视双层结构单独表达。 */
+/** 门始终朝向对应机械手；LoadLock 的上下门由俯视结构单独表达。 */
 function moduleDoorSides(
   module: ModuleSnapshot,
   role: "process" | "lock" | "port" | "auxiliary",
   layout: TopologyLayout = "single",
   roleIndex = 0,
+  attachmentId = "",
 ): Array<"top" | "right" | "bottom" | "left"> {
   if (module.door === "doorless") return [];
   if (role === "lock") return [];
   if (role === "port") return ["top"];
   const name = module.name.trim().toUpperCase();
+  if (role === "process" && attachmentId) {
+    if (attachmentId.endsWith("@left")) return ["right"];
+    if (attachmentId.endsWith("@right")) return ["left"];
+    if (attachmentId.endsWith("@top")) return ["bottom"];
+    if (attachmentId.endsWith("@bottom")) return ["top"];
+  }
   if (layout === "cascade" && role === "process") {
     /* 级联腔室按布局槽位朝向机器手，不依赖 PM1/PM2 等设备名称。 */
     const cascadeDoorSides: Array<Array<"top" | "right" | "bottom" | "left">> = [
@@ -1835,9 +1917,16 @@ function moduleDoorSides(
     ];
     return cascadeDoorSides[roleIndex] ?? ["top"];
   }
+  if (layout === "dual" && role === "process") {
+    /* 双腔 U 形中，左右列的两腔都朝中央真空手开门。 */
+    const dualDoorSides: Array<Array<"top" | "right" | "bottom" | "left">> = [
+      ["right"], ["right"], ["bottom"], ["bottom"], ["left"], ["left"],
+    ];
+    return dualDoorSides[roleIndex] ?? ["top"];
+  }
   if (role === "process") {
     const standardDoorSides: Array<Array<"top" | "right" | "bottom" | "left">> = [
-      ["right"], ["right"], ["bottom"], ["bottom"], ["left"], ["left"],
+      ["right"], ["left"], ["bottom"], ["bottom"], ["left"], ["left"],
     ];
     return standardDoorSides[roleIndex] ?? ["top"];
   }
@@ -1847,28 +1936,96 @@ function moduleDoorSides(
   return ["top"];
 }
 
-/** 绘制 LoadPort 正视晶圆盒；空槽、未加工和已加工均保留独立语义。 */
-function renderLoadPortCassette(module: ModuleSnapshot): string {
-  const slots = module.loadPortSlots.length
+/** 返回模块当前可见的物理槽位；空设备仍保留由容量声明的槽位。 */
+function visibleModuleSlots(module: ModuleSnapshot, kind: "port" | "lock" | "cooler"): LoadPortSlotSnapshot[] {
+  const recordedSlots = kind === "port"
     ? module.loadPortSlots
-    : module.wafers.map((wafer, index) => ({
-        slot: index + 1,
-        wafer,
-        processed: module.processedWafers.includes(wafer),
-      }));
+    : kind === "lock"
+      ? module.loadLockSlots
+      : [];
+  if (recordedSlots.length) return recordedSlots;
+  const slotCount = Math.max(kind === "lock" ? 2 : 1, module.slotCapacity, module.wafers.length);
+  return Array.from({ length: slotCount }, (_, index) => ({
+    slot: index + 1,
+    wafer: module.wafers[index] ?? "",
+    processed: module.processedWafers.includes(module.wafers[index] ?? ""),
+  }));
+}
+
+/** 绘制左侧独立的正视槽位区；模块按类型分行，槽位高度随数量自然延展。 */
+export function renderFrontSlotOverview(modules: ModuleSnapshot[]): string {
+  const visibleModules = modules.filter(module => !isTopologyHiddenModule(module));
+  type FrontSlotModule = { module: ModuleSnapshot; kind: "port" | "lock" | "cooler" };
+  const moduleNameOrder = (left: FrontSlotModule, right: FrontSlotModule): number => {
+    const leftName = left.module.name.trim();
+    const rightName = right.module.name.trim();
+    const leftPort = /^LP(\d+)$/i.exec(leftName);
+    const rightPort = /^LP(\d+)$/i.exec(rightName);
+    if (leftPort && rightPort) return Number(leftPort[1]) - Number(rightPort[1]);
+    if (leftPort) return -1;
+    if (rightPort) return 1;
+    return leftName.localeCompare(rightName, undefined, { numeric: true });
+  };
+  const loadPorts = visibleModules
+    .filter(module => isLoadPortName(module.name, module.type))
+    .map(module => ({ module, kind: "port" as const }))
+    .sort(moduleNameOrder);
+  const coolers = visibleModules
+    .filter(module => isCoolerModule(module.name, module.type))
+    .map(module => ({ module, kind: "cooler" as const }))
+    .sort(moduleNameOrder);
+  const loadLocks = visibleModules
+    .filter(module => isLoadLockName(module.name, module.type))
+    .map(module => ({ module, kind: "lock" as const }))
+    .sort(moduleNameOrder);
+  const splitRows = (items: FrontSlotModule[], columns: number): FrontSlotModule[][] => (
+    Array.from({ length: Math.ceil(items.length / columns) }, (_, index) => items.slice(index * columns, (index + 1) * columns))
+  );
+  /* LoadLock 优先展示；LoadPort 两列换行，Cooler 与 LoadLock 分别保持为独立的设备类型行。 */
+  const slotRows = [
+    ...splitRows(loadLocks, 2),
+    ...splitRows(loadPorts, 2),
+    ...splitRows(coolers, 2),
+  ].filter(row => row.length);
+  const renderSlots = (slots: LoadPortSlotSnapshot[], module: ModuleSnapshot): string => (
+    slots.map(slot => {
+      const state = !slot.wafer ? "empty" : slot.processed ? "processed" : "unprocessed";
+      const identity = `${module.name}.${slot.slot}`;
+      const detail = slot.wafer
+        ? `${identity} · 晶圆 ${slot.wafer}，${slot.processed ? "已加工" : "未加工"}`
+        : `${identity} · 空槽`;
+      return `<span class="front-slot is-${state}" tabindex="0" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}"></span>`;
+    }).join("")
+  );
+  if (!slotRows.length) return "";
+  const renderModule = ({ module, kind }: FrontSlotModule): string => {
+    const slots = visibleModuleSlots(module, kind);
+    return `<div class="front-module">
+      <strong title="${escapeHtml(module.name)}">${escapeHtml(module.name)}</strong>
+      <div class="front-slot-board" style="--front-slot-count:${slots.length}" role="group" aria-label="${escapeHtml(`${module.name} 正视槽位`)}">${renderSlots(slots, module)}</div>
+    </div>`;
+  };
+  const content = slotRows.map(row => `<div class="front-slot-row front-slot-row-${row[0].kind}" style="--front-row-module-count:${row.length}">${row.map(renderModule).join("")}</div>`).join("");
+  return `<div class="topology-front-content" role="group" aria-label="设备正视槽位">${content}</div>`;
+}
+
+/** 把 LoadPort 显示为俯视装载台，主画布不再绘制正视晶圆盒。 */
+function renderLoadPortTopView(
+  module: ModuleSnapshot,
+  wafers: string,
+  accessibleStatus: string,
+  candidate: CandidateDestinationSummary | undefined,
+): string {
+  const slots = visibleModuleSlots(module, "port");
   const processed = slots.filter(slot => slot.wafer && slot.processed).length;
   const unprocessed = slots.filter(slot => slot.wafer && !slot.processed).length;
-  const slotMarkup = slots.map(slot => {
-    const state = !slot.wafer ? "empty" : slot.processed ? "processed" : "unprocessed";
-    const label = slot.wafer
-      ? `槽位 ${slot.slot}，晶圆 ${slot.wafer}，${slot.processed ? "已加工" : "未加工"}`
-      : `槽位 ${slot.slot}，空`;
-    return `<span class="load-port-slot is-${state}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></span>`;
-  }).join("");
-  return `<div class="load-port-cassette" role="group" aria-label="${escapeHtml(`${module.name} 正视晶圆盒，共 ${slots.length} 个槽位，未加工 ${unprocessed}，已加工 ${processed}`)}">
-    <span class="load-port-cassette-handle" aria-hidden="true"></span>
-    <div class="load-port-slot-bank" style="--load-port-slot-count:${slots.length}">${slotMarkup}</div>
-  </div>`;
+  const candidateLabel = candidate ? `，${candidate.count} 个可行动作` : "";
+  const isDummy = isDummyPortName(module.name) || module.type.trim().toLowerCase() === "dummyport";
+  return `<strong class="equipment-external-name equipment-external-name-port">${escapeHtml(module.name)}</strong>
+    <article class="equipment-card equipment-port-top-view status-${module.status} door-${module.door} ${isDummy ? "is-dummy-port" : ""} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""}" aria-label="${escapeHtml(`${accessibleStatus}，俯视装载台，共 ${slots.length} 个槽位，未加工 ${unprocessed}，已加工 ${processed}${candidateLabel}`)}">
+      <span class="port-top-gate" aria-hidden="true"></span>
+      <span class="port-top-cassette ${wafers ? "is-occupied" : "is-empty"}">${wafers || "<i></i>"}</span>
+    </article>`;
 }
 
 /** 绘制拓扑中的紧凑腔室；晶圆标签只展示首次确认的来源模块。 */
@@ -1879,6 +2036,7 @@ function renderModule(
   candidate: CandidateDestinationSummary | undefined,
   layout: TopologyLayout = "single",
   roleIndex = 0,
+  attachmentId = "",
 ): string {
   const waferProgress = module.status === "processing" ? module.progress : 0;
   const visibleWaferCount = role === "lock" ? 2 : 1;
@@ -1892,36 +2050,39 @@ function renderModule(
   const overflow = layerCount > visibleWaferCount
     ? `<span class="wafer-more">+ ${layerCount - visibleWaferCount}</span>`
     : "";
-  const doors = moduleDoorSides(module, role, layout, roleIndex)
+  const doors = moduleDoorSides(module, role, layout, roleIndex, attachmentId)
     .map(side => `<i class="chamber-door chamber-door-${side}"></i>`)
     .join("");
   const accessibleStatus = `${module.name}，${STATUS_LABELS[module.status]}，${DOOR_LABELS[module.door]}`;
   const candidateLabel = candidate
     ? `${candidate.count} 个可行动作，最高模型偏好 ${(candidate.preference * 100).toFixed(0)}%`
     : "";
+  if (role === "port") return renderLoadPortTopView(module, wafers, accessibleStatus, candidate);
   if (role === "auxiliary" && isAlignerModule(module.name, module.type)) {
     return `<strong class="equipment-external-name equipment-external-name-aligner">${escapeHtml(module.name)}</strong>
       <article class="equipment-utility equipment-aligner status-${module.status} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `，${candidateLabel}` : ""}`)}">
         <div class="aligner-cross ${wafers ? "is-occupied" : "is-empty"}" aria-hidden="true"><i></i><i></i>${wafers}</div>
       </article>`;
   }
-  if (role === "auxiliary" && (isBufferModule(module.name, module.type) || isCoolerModule(module.name, module.type))) {
-    const utilityKind = isBufferModule(module.name, module.type) ? "buffer" : "cooler";
-    const coolerSlotCount = Math.max(2, Math.min(8, module.slotCapacity || module.wafers.length || 3));
-    const coolerSlots = Array.from({ length: coolerSlotCount }, (_, index) => {
-      const wafer = module.wafers[index] ?? "";
-      const processed = wafer && processedWafers.has(wafer);
-      const label = wafer
-        ? `槽位 ${index + 1}，晶圆 ${wafer}，${processed ? "已加工" : "未加工"}`
-        : `槽位 ${index + 1}，空`;
-      return `<span class="cooler-slot ${wafer ? `is-occupied wafer-${processed ? "processed" : "unprocessed"}` : "is-empty"}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></span>`;
-    }).join("");
-    const utilityBody = utilityKind === "buffer"
-      ? `<div class="buffer-tray ${wafers ? "is-occupied" : "is-empty"}" aria-hidden="true"><span></span><span></span><span></span>${wafers}</div>`
-      : `<div class="cooler-slot-bank ${wafers ? "is-occupied" : "is-empty"}" role="group" aria-label="${escapeHtml(`${module.name} 正视冷却槽，共 ${coolerSlotCount} 个槽位`)}">${coolerSlots}</div>`;
-    return `<strong class="equipment-external-name equipment-external-name-${utilityKind}">${escapeHtml(module.name)}</strong>
-      <article class="equipment-utility equipment-${utilityKind} status-${module.status} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `，${candidateLabel}` : ""}`)}">
-        ${utilityBody}
+  if (role === "auxiliary" && isCoolerModule(module.name, module.type)) {
+    const coolerSlots = visibleModuleSlots(module, "cooler");
+    /* 冷却槽物理上沿竖直方向堆叠，俯视图只显示最上方的可见晶圆。 */
+    const visibleSlot = coolerSlots.find(slot => slot.wafer) ?? coolerSlots[0];
+    const state = !visibleSlot?.wafer ? "empty" : visibleSlot.processed ? "processed" : "unprocessed";
+    const label = visibleSlot?.wafer
+      ? `${module.name}.${visibleSlot.slot}，晶圆 ${visibleSlot.wafer}，${visibleSlot.processed ? "已加工" : "未加工"}`
+      : `${module.name}.${visibleSlot?.slot ?? 1}，空槽`;
+    const visibleWafer = visibleSlot?.wafer
+      ? renderWaferToken(
+          visibleSlot.wafer,
+          waferOrigins[visibleSlot.wafer] ?? "",
+          waferProgress,
+          visibleSlot.processed,
+        )
+      : "";
+    return `<strong class="equipment-external-name equipment-external-name-cooler">${escapeHtml(module.name)}</strong>
+      <article class="equipment-utility equipment-cooler-top-view status-${module.status} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}，俯视冷却盘${candidateLabel ? `，${candidateLabel}` : ""}`)}">
+        <div class="cooler-top-plate" role="group" aria-label="${escapeHtml(`${module.name} 俯视冷却盘`)}"><span class="cooler-top-pocket is-${state}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${visibleWafer}</span></div>
       </article>`;
   }
   const atmosphereLevel = role === "lock"
@@ -1934,21 +2095,28 @@ function renderModule(
           : 0
     : 0;
   const loadLockLayers = role === "lock"
-      ? `<div class="loadlock-layers" aria-hidden="true">${[0, 1].map(index => {
-        const layer = module.loadLockSlots[index];
-        // 槽位快照中的空字符串表示该物理层确实为空，不能再回退到按名称排序的
-        // module.wafers，否则交换后被取空的上层会重复画出仍留在下层的晶圆。
-        const wafer = layer ? layer.wafer : module.wafers[index];
-        const processed = layer ? layer.processed : (wafer ? processedWafers.has(wafer) : false);
-        const waferState = processed ? "processed" : "unprocessed";
-        return `<div class="loadlock-layer ${wafer ? "is-occupied" : "is-empty"}">${wafer ? `<span class="loadlock-wafer-line wafer-${waferState}" title="晶圆 ${escapeHtml(wafer)}（${processed ? "已加工" : "未加工"}）"></span>` : ""}</div>`;
-      }).join("")}${overflow}</div>`
+      ? (() => {
+        const slots = visibleModuleSlots(module, "lock");
+        /* 两层 LoadLock 槽沿竖直方向重叠，俯视图仅露出最上方的在位晶圆。 */
+        const visibleSlot = slots.find(slot => slot.wafer) ?? slots[0];
+        const state = !visibleSlot?.wafer ? "empty" : visibleSlot.processed ? "processed" : "unprocessed";
+        const label = visibleSlot?.wafer
+          ? `${module.name}.${visibleSlot.slot}，晶圆 ${visibleSlot.wafer}，${visibleSlot.processed ? "已加工" : "未加工"}`
+          : `${module.name}.${visibleSlot?.slot ?? 1}，空槽`;
+        const visibleWafer = visibleSlot?.wafer
+          ? renderWaferToken(
+              visibleSlot.wafer,
+              waferOrigins[visibleSlot.wafer] ?? "",
+              waferProgress,
+              visibleSlot.processed,
+            )
+          : "";
+        return `<div class="loadlock-top-chamber" role="group" aria-label="${escapeHtml(`${module.name} 俯视 LoadLock`)}"><span class="loadlock-top-seat is-${state}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${visibleWafer}</span></div>`;
+      })()
     : role === "process"
       ? `<div class="process-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>`
-      : role === "port"
-        ? ``
-        : role === "auxiliary"
-          ? `<div class="auxiliary-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>`
+      : role === "auxiliary"
+        ? `<div class="auxiliary-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>`
         : `<div class="wafer-stack">${wafers}${overflow}</div>`;
   const bodyMarkup = role === "process"
     ? `<div class="equipment-process-shell"><div class="equipment-body">${loadLockLayers}</div></div>`
@@ -1956,20 +2124,10 @@ function renderModule(
   const article = `
     <article class="equipment-card equipment-${role} status-${module.status} door-${module.door} ${module.loadLockPhase ? `loadlock-${module.loadLockPhase}` : ""} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" style="--module-progress:${Math.round(module.progress * 100)}%;--loadlock-atmosphere:${Math.max(0, Math.min(100, atmosphereLevel)).toFixed(1)}%;--loadlock-atmosphere-ratio:${Math.max(0, Math.min(1, atmosphereLevel / 100)).toFixed(3)}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `，${candidateLabel}` : ""}`)}">
        ${bodyMarkup}
-      <div class="chamber-doors" aria-hidden="true">${role === "lock" ? '<i class="loadlock-door loadlock-door-vacuum"></i><i class="loadlock-door loadlock-door-atmosphere"></i>' : doors}</div>
+      <div class="chamber-doors" aria-hidden="true">${role === "lock" ? '<i class="loadlock-top-gate loadlock-top-gate-vacuum"></i><i class="loadlock-top-gate loadlock-top-gate-atmosphere"></i>' : doors}</div>
     </article>`;
   if (role === "process" || role === "auxiliary" || role === "lock") {
     return `<strong class="equipment-external-name">${escapeHtml(module.name)}</strong>${article}`;
-  }
-  if (role === "port") {
-    const isDummy = isDummyPortName(module.name) || module.type.trim().toLowerCase() === "dummyport";
-    const portDoors = moduleDoorSides(module, role, layout, roleIndex)
-      .map(side => `<i class="chamber-door chamber-door-${side}"></i>`)
-      .join("");
-    return `<strong class="equipment-external-name ${isDummy ? "equipment-external-name-dummy" : "equipment-external-name-port"}">${escapeHtml(module.name)}</strong><div class="load-port-assembly ${isDummy ? "is-dummy-port" : "is-load-port"} door-${module.door}" role="group" aria-label="${escapeHtml(`${accessibleStatus}${isDummy ? "，Dummy Port" : ""}${candidateLabel ? `，${candidateLabel}` : ""}`)}">
-      <div class="chamber-doors" aria-hidden="true">${portDoors}</div>
-      ${renderLoadPortCassette(module)}
-    </div>`;
   }
   return article;
 }
@@ -2014,31 +2172,49 @@ interface TopologyPosition {
   topPixels: number;
   widthPixels?: number;
   heightPixels?: number;
+  /** 位置来源的稳定框架附着点；用于把视觉节点与机器骨架绑定。 */
+  attachmentId?: string;
+  /** 框架节点使用相对画布中心的固定像素横坐标，避免侧栏挤压后脱离方形框架。 */
+  fixedLeftOffsetPixels?: number;
 }
 
-interface TopologyVerticalExtent {
-  top: number;
-  bottom: number;
+interface TopologyMachineFrame {
+  id: string;
+  label: string;
+  centerLeftPercent: number;
+  centerTopPixels: number;
+  widthPixels: number;
+  heightPixels: number;
+  shape: "square" | "flat" | "atmosphere";
 }
 
 const TOPOLOGY_COLUMN_PERCENTAGES = [26, 42, 58, 74] as const;
 const TOPOLOGY_ROW_TOP_PIXELS = [52, 154, 256, 358, 460, 562, 664, 786, 929, 1031, 1133] as const;
 const TOPOLOGY_VIEWBOX_WIDTH = 1000;
 const TOPOLOGY_ITEM_SIZE = 96;
-const TOPOLOGY_PROCESS_WIDTH = 104;
-const TOPOLOGY_PROCESS_HEIGHT = 104;
+const TOPOLOGY_PROCESS_WIDTH = 82;
+const TOPOLOGY_PROCESS_HEIGHT = 82;
 const TOPOLOGY_ROBOT_SIZE = 132;
-const TOPOLOGY_LOADLOCK_WIDTH = 120;
-const TOPOLOGY_LOADLOCK_HEIGHT = 72;
-const TOPOLOGY_LOADPORT_WIDTH = 112;
-const TOPOLOGY_LOADPORT_HEIGHT = 104;
+/* 单腔、双腔均沿用原双腔的紧凑 LoadLock 尺寸。 */
+const TOPOLOGY_LOADLOCK_WIDTH = 82;
+const TOPOLOGY_LOADLOCK_HEIGHT = 82;
+/** 同一桥接链相邻 LoadLock 外框之间保留的最小可读间隙。 */
+const TOPOLOGY_LOADLOCK_BRIDGE_GAP = 2;
+/* 级联双框等宽，LoadLock 的中心距离等于其自身宽度，从而形成紧贴的一对。 */
+const TOPOLOGY_CASCADE_FRAME_WIDTH = 240;
+const TOPOLOGY_CASCADE_VTR1_HEIGHT = 128;
+const TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET = (TOPOLOGY_LOADLOCK_WIDTH + 1) / TOPOLOGY_CASCADE_FRAME_WIDTH;
+const TOPOLOGY_LOADPORT_WIDTH = 82;
+const TOPOLOGY_LOADPORT_HEIGHT = 82;
 const TOPOLOGY_LOADPORT_BASE_HEIGHT = 22;
 /* 底座顶沿仅压住晶圆盒底边 2px，使 LoadPort 明确站在下托之上。 */
 const TOPOLOGY_LOADPORT_BASE_OVERHANG = 16;
+/** 大气框架内部设备与边缘保持的紧凑留白。 */
+const TOPOLOGY_ATMOSPHERE_INTERIOR_INSET = 14;
 const TOPOLOGY_BUFFER_WIDTH = 104;
 const TOPOLOGY_BUFFER_HEIGHT = 56;
 const TOPOLOGY_COOLER_WIDTH = 76;
-const TOPOLOGY_COOLER_HEIGHT = 56;
+const TOPOLOGY_COOLER_HEIGHT = 72;
 const TOPOLOGY_ALIGNER_WIDTH = 76;
 const TOPOLOGY_ALIGNER_HEIGHT = 54;
 const TOPOLOGY_LOADLOCK_ROW_TOP_PIXELS = [664, 740] as const;
@@ -2046,19 +2222,214 @@ const TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS = 866;
 const TOPOLOGY_LOADPORT_ROW_TOP_PIXELS = 1006;
 const TOPOLOGY_CANVAS_PADDING = 28;
 const TOPOLOGY_EXTERNAL_LABEL_CLEARANCE = 22;
-const TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP = TOPOLOGY_ROW_TOP_PIXELS[4] - 32;
-const TOPOLOGY_SINGLE_PROCESS_LOWER_TOP = TOPOLOGY_ROW_TOP_PIXELS[5] - 10;
-/* 级联设备紧凑布局（垂直间距自上而下收紧，元素间隙 ≥16px）。 */
-const TOPOLOGY_CASCADE_PM_TOP = 60;
-const TOPOLOGY_CASCADE_UPPER_ROBOT_TOP = 190;
-const TOPOLOGY_CASCADE_BRIDGE_TOP = 310;
-const TOPOLOGY_CASCADE_LOWER_ROBOT_TOP = 430;
-const TOPOLOGY_CASCADE_LOCK_ROW_TOP = 548;
+/* 真空机器框架是拓扑布局的唯一几何基准；模块只引用框架边缘的不可见附着点。 */
+const TOPOLOGY_MACHINE_FRAMES: Record<TopologyLayout, readonly TopologyMachineFrame[]> = {
+  single: [{
+    id: "vacuum-main",
+    label: "VTR VACUUM FRAME",
+    centerLeftPercent: 50,
+    centerTopPixels: 270,
+    widthPixels: 240,
+    heightPixels: 240,
+    shape: "square",
+  }],
+  dual: [{
+    id: "vacuum-main",
+    label: "",
+    centerLeftPercent: 50,
+    centerTopPixels: 270,
+    widthPixels: 240,
+    heightPixels: 240,
+    shape: "square",
+  }],
+  cascade: [
+    {
+      id: "vacuum-vtr-2",
+      label: "",
+      centerLeftPercent: 50,
+      centerTopPixels: 230,
+      widthPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
+      heightPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
+      shape: "square",
+    },
+    {
+      id: "vacuum-vtr-1",
+      label: "",
+      centerLeftPercent: 50,
+      /* 上移 8px，使 UBR/DBR 同时贴合 VTR_2 底边与 VTR_1 顶边。 */
+      centerTopPixels: 496,
+      widthPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
+      heightPixels: TOPOLOGY_CASCADE_VTR1_HEIGHT,
+      shape: "flat",
+    },
+  ],
+};
+/* 大气侧使用独立框架；其上边承接 LoadLock，下边承接三个实际 LoadPort。 */
+const TOPOLOGY_ATMOSPHERE_FRAMES: Record<TopologyLayout, TopologyMachineFrame> = {
+  single: {
+    id: "atmosphere-main",
+    /* 大气框架仅表达附着边界，不在框内重复显示区域名称。 */
+    label: "",
+    centerLeftPercent: 50,
+    /* LoadLock 作为真空与大气框架之间的桥接腔。 */
+    centerTopPixels: 547,
+    widthPixels: 425,
+    heightPixels: 150,
+    shape: "atmosphere",
+  },
+  dual: {
+    id: "atmosphere-main",
+    label: "",
+    centerLeftPercent: 50,
+    centerTopPixels: 547,
+    widthPixels: 425,
+    heightPixels: 150,
+    shape: "atmosphere",
+  },
+  cascade: {
+    id: "atmosphere-main",
+    label: "",
+    centerLeftPercent: 50,
+    centerTopPixels: 717,
+    widthPixels: 425,
+    heightPixels: 150,
+    shape: "atmosphere",
+  },
+};
+const TOPOLOGY_CASCADE_LOCK_ROW_TOP = 597;
 const TOPOLOGY_CASCADE_LOCK_ROW_GAP = 80;
-const TOPOLOGY_CASCADE_ATM_TOP = 742;
+const TOPOLOGY_CASCADE_ATM_TOP = 720;
 /* 大气侧在所有拓扑中共用同一垂直节奏：LoadPort 位于 ATR 下方 140px。 */
 const TOPOLOGY_ATMOSPHERE_LOADPORT_OFFSET = 140;
 const TOPOLOGY_CASCADE_LOADPORT_TOP = TOPOLOGY_CASCADE_ATM_TOP + TOPOLOGY_ATMOSPHERE_LOADPORT_OFFSET;
+
+/** 返回指定布局的机器框架；索引在级联布局中固定为 VTR_2、VTR_1。 */
+function topologyMachineFrame(layout: TopologyLayout, index = 0): TopologyMachineFrame {
+  return TOPOLOGY_MACHINE_FRAMES[layout][index] ?? TOPOLOGY_MACHINE_FRAMES[layout][0];
+}
+
+/** 返回大气传输框架；所有实际 LoadPort 和非桥接 LoadLock 均以它为附着基准。 */
+function topologyAtmosphereFrame(layout: TopologyLayout): TopologyMachineFrame {
+  return TOPOLOGY_ATMOSPHERE_FRAMES[layout];
+}
+
+/**
+ * 由机器框架边缘生成模块中心点，使模块外框与框架边缘严格相切。
+ * offset 取 -1～1，表示沿该边从左/上到右/下的位置。
+ */
+function topologyFrameAttachment(
+  frame: TopologyMachineFrame,
+  attachmentId: string,
+  side: "top" | "right" | "bottom" | "left" | "center",
+  offset: number,
+  widthPixels: number,
+  heightPixels: number,
+): TopologyPosition {
+  const halfWidthPercent = widthPixels / TOPOLOGY_VIEWBOX_WIDTH * 50;
+  const frameWidthPercent = frame.widthPixels / TOPOLOGY_VIEWBOX_WIDTH * 100;
+  if (side === "center") {
+    return {
+      leftPercent: frame.centerLeftPercent,
+      topPixels: frame.centerTopPixels,
+      widthPixels,
+      heightPixels,
+      attachmentId,
+      fixedLeftOffsetPixels: 0,
+    };
+  }
+  const horizontalOffset = offset * frameWidthPercent / 2;
+  const verticalOffset = offset * frame.heightPixels / 2;
+  return {
+    leftPercent: side === "left"
+      ? frame.centerLeftPercent - frameWidthPercent / 2 - halfWidthPercent
+      : side === "right"
+        ? frame.centerLeftPercent + frameWidthPercent / 2 + halfWidthPercent
+        : frame.centerLeftPercent + horizontalOffset,
+    topPixels: Math.round(side === "top"
+      ? frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2
+      : side === "bottom"
+        ? frame.centerTopPixels + frame.heightPixels / 2 + heightPixels / 2
+        : frame.centerTopPixels + verticalOffset),
+    widthPixels,
+    heightPixels,
+    attachmentId,
+    fixedLeftOffsetPixels: (side === "left"
+      ? -frame.widthPixels / 2 - widthPixels / 2
+      : side === "right"
+        ? frame.widthPixels / 2 + widthPixels / 2
+        : horizontalOffset / 100 * TOPOLOGY_VIEWBOX_WIDTH),
+  };
+}
+
+/**
+ * 计算连接真空与大气侧的 LoadLock 位置。
+ *
+ * LoadLock 的上缘由真空框架下边锚定，下缘与大气框架上边相切。横坐标从真空
+ * 框架推导，并按两框架宽度换算为大气框架上的同一物理位置，避免缩放后偏离中轴。
+ */
+function topologyVacuumAtmosphereLoadLockBridge(
+  layout: TopologyLayout,
+  lockIndex: number,
+  atmosphereOffset: number,
+): TopologyPosition {
+  const vacuumFrame = layout === "cascade"
+    ? topologyMachineFrame("cascade", 1)
+    : topologyMachineFrame(layout);
+  const atmosphereFrame = topologyAtmosphereFrame(layout);
+  const vacuumOffset = atmosphereOffset * atmosphereFrame.widthPixels / vacuumFrame.widthPixels;
+  const vacuumAttachment = topologyFrameAttachment(
+    vacuumFrame,
+    `${vacuumFrame.id}-loadlock-${lockIndex + 1}@bottom`,
+    "bottom",
+    vacuumOffset,
+    TOPOLOGY_LOADLOCK_WIDTH,
+    TOPOLOGY_LOADLOCK_HEIGHT,
+  );
+  const atmosphereAttachment = topologyFrameAttachment(
+    atmosphereFrame,
+    `${atmosphereFrame.id}-loadlock-${lockIndex + 1}@top`,
+    "top",
+    atmosphereOffset,
+    TOPOLOGY_LOADLOCK_WIDTH,
+    TOPOLOGY_LOADLOCK_HEIGHT,
+  );
+  return {
+    ...vacuumAttachment,
+    /* 两端框架的中心距由常量固定；保留大气锚点的纵坐标以表达两侧同时相切。 */
+    topPixels: atmosphereAttachment.topPixels,
+    attachmentId: `${vacuumAttachment.attachmentId}|${atmosphereAttachment.attachmentId}`,
+  };
+}
+
+/** 返回在一条桥接链中居中且以固定窄间隔连续排列的横向偏移。 */
+function topologyTightLoadLockOffsets(count: number, frameWidthPixels: number): number[] {
+  if (count <= 1) return [0];
+  const centerSpacing = TOPOLOGY_LOADLOCK_WIDTH + TOPOLOGY_LOADLOCK_BRIDGE_GAP;
+  const offsetStep = centerSpacing / (frameWidthPixels / 2);
+  return Array.from(
+    { length: count },
+    (_, index) => (index - (count - 1) / 2) * offsetStep,
+  );
+}
+
+/** 把辅助设备固定在框架内部四角，避免随画布宽度变化而漂移。 */
+function topologyFrameInteriorCorner(
+  frame: TopologyMachineFrame,
+  attachmentId: string,
+  horizontal: "left" | "right",
+  widthPixels: number,
+  heightPixels: number,
+): TopologyPosition {
+  const horizontalOffset = frame.widthPixels / 2 - TOPOLOGY_ATMOSPHERE_INTERIOR_INSET - widthPixels / 2;
+  return {
+    leftPercent: frame.centerLeftPercent + (horizontal === "left" ? -horizontalOffset : horizontalOffset) / TOPOLOGY_VIEWBOX_WIDTH * 100,
+    topPixels: frame.centerTopPixels - frame.heightPixels / 2 + TOPOLOGY_ATMOSPHERE_INTERIOR_INSET + heightPixels / 2,
+    widthPixels,
+    heightPixels,
+    attachmentId,
+    fixedLeftOffsetPixels: horizontal === "left" ? -horizontalOffset : horizontalOffset,
+  };
+}
 
 /** 返回均匀分布在四列设备网格中的横向位置。 */
 function distributedTopologyColumns(count: number): number[] {
@@ -2150,15 +2521,18 @@ function moduleTopologyPosition(
   const column = TOPOLOGY_COLUMN_PERCENTAGES;
   const row = TOPOLOGY_ROW_TOP_PIXELS;
   if (layout === "cascade" && role === "process") {
-    const ordered = [...roleModules].sort((left, right) => naturalCompare(left.name, right.name));
+    const ordered = [...roleModules]
+      .filter(item => !isHeaterModule(item.name, item.type))
+      .sort((left, right) => naturalCompare(left.name, right.name));
     const layoutIndex = Math.max(0, ordered.findIndex(item => item.name === module.name));
-    const positions: TopologyPosition[] = [
-      { leftPercent: column[0], topPixels: TOPOLOGY_CASCADE_LOWER_ROBOT_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_CASCADE_LOWER_ROBOT_TOP },
-      { leftPercent: 50, topPixels: TOPOLOGY_CASCADE_PM_TOP },
-      { leftPercent: column[0], topPixels: TOPOLOGY_CASCADE_UPPER_ROBOT_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_CASCADE_UPPER_ROBOT_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_CASCADE_PM_TOP },
+    const upperFrame = topologyMachineFrame("cascade", 0);
+    const lowerFrame = topologyMachineFrame("cascade", 1);
+    const positions = [
+      topologyFrameAttachment(lowerFrame, "vtr-1-process-left@left", "left", 0, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(lowerFrame, "vtr-1-process-right@right", "right", 0, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(upperFrame, "vtr-2-process-left-lower@left", "left", .55, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(upperFrame, "vtr-2-process-top-left@top", "top", -.45, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(upperFrame, "vtr-2-process-right-upper@right", "right", -.45, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
     ];
     const position = positions[layoutIndex] ?? {
       leftPercent: distributedTopologyColumns(roleCount)[layoutIndex] ?? 50,
@@ -2166,16 +2540,60 @@ function moduleTopologyPosition(
     };
     return { ...position, widthPixels: TOPOLOGY_PROCESS_WIDTH, heightPixels: TOPOLOGY_PROCESS_HEIGHT };
   }
+  if (layout === "dual" && role === "process") {
+    /*
+     * 双腔设备采用稳定的 U 形布局，而不是复用单腔的编号顺序：
+     * PM1 两腔在左列，PM2 两腔在上排，PM3 两腔在右列。
+     * 左、右列的下腔从上排所有腔室的底边之后开始，避免两排视觉相交。
+     */
+    const dualBaseName = module.name.replace(/-\d+$/, "");
+    const dualSlotIndex = Math.max(0, Number(/-(\d+)$/.exec(module.name)?.[1] ?? "1") - 1);
+    const dualBaseNames = [...new Set(roleModules
+      .map(item => item.name.replace(/-\d+$/, "")))]
+      .sort(naturalCompare);
+    const dualBaseIndex = Math.max(0, dualBaseNames.indexOf(dualBaseName));
+    const frame = topologyMachineFrame("dual");
+    const dualLayout: TopologyPosition[][] = [
+      [
+        topologyFrameAttachment(frame, "dual-pm1-upper@left", "left", -.38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+        topologyFrameAttachment(frame, "dual-pm1-lower@left", "left", .38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      ],
+      [
+        topologyFrameAttachment(frame, "dual-pm2-left@top", "top", -.5, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+        topologyFrameAttachment(frame, "dual-pm2-right@top", "top", .5, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      ],
+      [
+        topologyFrameAttachment(frame, "dual-pm3-upper@right", "right", -.38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+        topologyFrameAttachment(frame, "dual-pm3-lower@right", "right", .38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      ],
+    ];
+    const position = dualLayout[dualBaseIndex]?.[dualSlotIndex] ?? {
+      leftPercent: distributedTopologyColumns(roleCount)[dualBaseIndex] ?? 50,
+      topPixels: TOPOLOGY_ROW_TOP_PIXELS[3],
+    };
+    return { ...position, widthPixels: TOPOLOGY_PROCESS_WIDTH, heightPixels: TOPOLOGY_PROCESS_HEIGHT };
+  }
   if (role === "process") {
-    const ordered = [...roleModules].sort((left, right) => naturalCompare(left.name, right.name));
+    const frame = topologyMachineFrame("single");
+    if (isHeaterModule(module.name, module.type)) {
+      return topologyFrameAttachment(
+        frame,
+        "single-heater-top-left@top",
+        "top",
+        -.5,
+        TOPOLOGY_PROCESS_WIDTH,
+        TOPOLOGY_PROCESS_HEIGHT,
+      );
+    }
+    const ordered = [...roleModules]
+      .filter(item => !isHeaterModule(item.name, item.type))
+      .sort((left, right) => naturalCompare(left.name, right.name));
     const layoutIndex = Math.max(0, ordered.findIndex(item => item.name === module.name));
-    const positions: TopologyPosition[] = [
-      { leftPercent: column[0], topPixels: TOPOLOGY_SINGLE_PROCESS_LOWER_TOP },
-      { leftPercent: column[0], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP },
-      { leftPercent: column[1], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP - TOPOLOGY_PROCESS_HEIGHT },
-      { leftPercent: column[2], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP - TOPOLOGY_PROCESS_HEIGHT },
-      { leftPercent: column[3], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_SINGLE_PROCESS_LOWER_TOP },
+    const positions = [
+      topologyFrameAttachment(frame, "single-process-left-upper@left", "left", -.32, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(frame, "single-process-left-lower@left", "left", .48, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(frame, "single-process-right-upper@right", "right", -.32, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(frame, "single-process-right-lower@right", "right", .48, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
     ];
     const position = positions[layoutIndex] ?? {
       leftPercent: distributedTopologyColumns(roleCount)[layoutIndex] ?? 50,
@@ -2184,17 +2602,29 @@ function moduleTopologyPosition(
     return { ...position, widthPixels: TOPOLOGY_PROCESS_WIDTH, heightPixels: TOPOLOGY_PROCESS_HEIGHT };
   }
   if (layout === "cascade" && role === "lock" && bridgeLoadLockNames.has(module.name)) {
-    const bridgeIndex = [...bridgeLoadLockNames].indexOf(module.name);
-    return {
-      leftPercent: bridgeIndex % 2 === 0 ? column[1] : column[2],
-      topPixels: TOPOLOGY_CASCADE_BRIDGE_TOP,
-      widthPixels: TOPOLOGY_LOADLOCK_WIDTH,
-      heightPixels: TOPOLOGY_LOADLOCK_HEIGHT,
-    };
+    const orderedBridges = [...bridgeLoadLockNames];
+    const bridgeIndex = Math.max(0, orderedBridges.indexOf(module.name));
+    return topologyFrameAttachment(
+      topologyMachineFrame("cascade", 0),
+      bridgeIndex % 2 === 0 ? "cascade-bridge-left" : "cascade-bridge-right",
+      "bottom",
+      bridgeIndex % 2 === 0
+        ? -TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET
+        : TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET,
+      TOPOLOGY_LOADLOCK_WIDTH,
+      TOPOLOGY_LOADLOCK_HEIGHT,
+    );
   }
   if (role === "lock") {
-    const canonicalOrder: Record<string, number> = { LA: 0, LB: 1, LC: 2, LD: 3 };
-    const orderedLoadLocks = [...roleModules].sort((left, right) => {
+    /* 双腔设备的四个 LoadLock 对应一条横向接口链：LC → LA → LB → LD。 */
+    const canonicalOrder: Record<string, number> = layout === "dual"
+      ? { LC: 0, LA: 1, LB: 2, LD: 3 }
+      : { LA: 0, LB: 1, LC: 2, LD: 3 };
+    /* UBR/DBR 已连接两级真空框架，不能占用 LA/LB 的大气桥接锚点。 */
+    const atmosphereLoadLocks = layout === "cascade"
+      ? roleModules.filter(item => !bridgeLoadLockNames.has(item.name))
+      : roleModules;
+    const orderedLoadLocks = [...atmosphereLoadLocks].sort((left, right) => {
       const leftName = left.name.trim().toUpperCase();
       const rightName = right.name.trim().toUpperCase();
       const leftRank = canonicalOrder[leftName] ?? 100;
@@ -2202,6 +2632,18 @@ function moduleTopologyPosition(
       return leftRank - rightRank || naturalCompare(left.name, right.name);
     });
     const gridIndex = Math.max(0, orderedLoadLocks.findIndex(item => item.name === module.name));
+    if ((layout === "single" || layout === "dual" || layout === "cascade") && gridIndex < 4) {
+      const atmosphereLockCount = orderedLoadLocks.length;
+      const offsets = topologyTightLoadLockOffsets(
+        atmosphereLockCount,
+        topologyAtmosphereFrame(layout).widthPixels,
+      );
+      return topologyVacuumAtmosphereLoadLockBridge(
+        layout,
+        gridIndex,
+        offsets[gridIndex] ?? 0,
+      );
+    }
     const loadLockRowTop = layout === "cascade" ? TOPOLOGY_CASCADE_LOCK_ROW_TOP : TOPOLOGY_LOADLOCK_ROW_TOP_PIXELS[0];
     const loadLockRowGap = layout === "cascade"
       ? TOPOLOGY_CASCADE_LOCK_ROW_GAP
@@ -2224,7 +2666,23 @@ function moduleTopologyPosition(
       return leftRank - rightRank || naturalCompare(left.name, right.name);
     });
     const portIndex = Math.max(0, orderedPorts.findIndex(item => item.name === module.name));
-    const currentIsDummy = isDummyPortName(module.name) || module.type.trim().toLowerCase() === "dummyport";
+    if (portIndex < 4) {
+      const offsets = orderedPorts.length <= 1
+        ? [0]
+        : orderedPorts.length === 2
+          ? [-.3, .3]
+          : orderedPorts.length === 3
+            ? [-.6, 0, .6]
+            : [-.7, -.233, .233, .7];
+      return topologyFrameAttachment(
+        topologyAtmosphereFrame(layout),
+        `atmosphere-port-${portIndex + 1}@bottom`,
+        "bottom",
+        offsets[portIndex] ?? 0,
+        TOPOLOGY_LOADPORT_WIDTH,
+        TOPOLOGY_LOADPORT_HEIGHT,
+      );
+    }
     const portColumns = roleCount === 5
       ? [26, 38, 50, 62, 74]
       : roleCount <= column.length
@@ -2232,36 +2690,29 @@ function moduleTopologyPosition(
         : Array.from({ length: roleCount }, (_, current) => 20 + current * 60 / (roleCount - 1));
     const loadPortTop = layout === "cascade" ? TOPOLOGY_CASCADE_LOADPORT_TOP : TOPOLOGY_LOADPORT_ROW_TOP_PIXELS;
     return {
-      /* 四列语义固定为 LP1 / LP2 / LP3 / Dummy Port；缺少 LP3 时保留空位。 */
-      leftPercent: currentIsDummy && roleCount <= column.length
-        ? column[3]
-        : portColumns[portIndex] ?? column[0],
+      leftPercent: portColumns[portIndex] ?? column[0],
       topPixels: loadPortTop,
       widthPixels: TOPOLOGY_LOADPORT_WIDTH,
       heightPixels: TOPOLOGY_LOADPORT_HEIGHT,
     };
   }
   if (isAlignerModule(module.name, module.type)) {
-    return {
-      leftPercent: 10,
-      topPixels: layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS,
-      widthPixels: TOPOLOGY_ALIGNER_WIDTH,
-      heightPixels: TOPOLOGY_ALIGNER_HEIGHT,
-    };
+    return topologyFrameInteriorCorner(
+      topologyAtmosphereFrame(layout),
+      "atmosphere-aligner-top-left@inside",
+      "left",
+      TOPOLOGY_ALIGNER_WIDTH,
+      TOPOLOGY_ALIGNER_HEIGHT,
+    );
   }
   if (role === "auxiliary" && isCoolerModule(module.name, module.type)) {
-    const atmosphereTop = layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS;
-    const leftUtilities = roleModules
-      .filter(item => isCoolerModule(item.name, item.type))
-      .sort((left, right) => naturalCompare(left.name, right.name));
-    const coolerIndex = Math.max(0, leftUtilities.findIndex(item => item.name === module.name));
-    const hasAligner = roleModules.some(item => isAlignerModule(item.name, item.type));
-    return {
-      leftPercent: 10,
-      topPixels: atmosphereTop + (hasAligner ? 80 : 0) + coolerIndex * 80,
-      widthPixels: TOPOLOGY_COOLER_WIDTH,
-      heightPixels: TOPOLOGY_COOLER_HEIGHT,
-    };
+    return topologyFrameInteriorCorner(
+      topologyAtmosphereFrame(layout),
+      "atmosphere-cooler-top-right@inside",
+      "right",
+      TOPOLOGY_COOLER_WIDTH,
+      TOPOLOGY_COOLER_HEIGHT,
+    );
   }
   if (role === "auxiliary" && isBufferModule(module.name, module.type)) {
     const atmosphereTop = layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS;
@@ -2308,42 +2759,54 @@ function robotTopologyPosition(
   layout: TopologyLayout,
 ): TopologyPosition {
   if (environment === "atmosphere") {
-    const atmosphereTop = layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS;
+    const atmosphereFrame = topologyAtmosphereFrame(layout);
     if (robotCount > 1) {
       return {
         leftPercent: distributedTopologyColumns(robotCount)[robotIndex] ?? 50,
-        topPixels: atmosphereTop,
+        topPixels: atmosphereFrame.centerTopPixels,
         widthPixels: TOPOLOGY_ROBOT_SIZE,
         heightPixels: TOPOLOGY_ROBOT_SIZE,
       };
     }
-    return {
-      leftPercent: 50,
-      topPixels: atmosphereTop,
-      widthPixels: TOPOLOGY_ROBOT_SIZE,
-      heightPixels: TOPOLOGY_ROBOT_SIZE,
-    };
+    return topologyFrameAttachment(
+      atmosphereFrame,
+      "atr-center",
+      "center",
+      0,
+      TOPOLOGY_ROBOT_SIZE,
+      TOPOLOGY_ROBOT_SIZE,
+    );
   }
   if (layout === "cascade") {
-    /* 第一个真空手服务下层，其余真空手进入上层并横向分布；不依赖 VTR_1/VTR_2 命名。 */
-    const upperCount = Math.max(1, robotCount - 1);
-    return {
-      leftPercent: robotIndex === 0
-        ? 50
-        : distributedTopologyColumns(upperCount)[robotIndex - 1] ?? 50,
-      topPixels: robotIndex === 0
-        ? TOPOLOGY_CASCADE_LOWER_ROBOT_TOP
-        : TOPOLOGY_CASCADE_UPPER_ROBOT_TOP,
-      widthPixels: TOPOLOGY_ROBOT_SIZE,
-      heightPixels: TOPOLOGY_ROBOT_SIZE,
-    };
+    /* 第一把真空手属于下层扁框架，其余真空手属于上层方框架。 */
+    const frame = topologyMachineFrame("cascade", robotIndex === 0 ? 1 : 0);
+    return topologyFrameAttachment(
+      frame,
+      robotIndex === 0 ? "vtr-1-center" : `vtr-2-center-${robotIndex}`,
+      "center",
+      0,
+      TOPOLOGY_ROBOT_SIZE,
+      TOPOLOGY_ROBOT_SIZE,
+    );
   }
-  return {
-    leftPercent: 50,
-    topPixels: (TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP + TOPOLOGY_SINGLE_PROCESS_LOWER_TOP) / 2,
-    widthPixels: TOPOLOGY_ROBOT_SIZE,
-    heightPixels: TOPOLOGY_ROBOT_SIZE,
-  };
+  if (layout === "dual") {
+    return topologyFrameAttachment(
+      topologyMachineFrame("dual"),
+      "dual-robot-center",
+      "center",
+      0,
+      TOPOLOGY_ROBOT_SIZE,
+      TOPOLOGY_ROBOT_SIZE,
+    );
+  }
+  return topologyFrameAttachment(
+    topologyMachineFrame("single"),
+    "single-robot-center",
+    "center",
+    0,
+    TOPOLOGY_ROBOT_SIZE,
+    TOPOLOGY_ROBOT_SIZE,
+  );
 }
 
 /** 把百分比横坐标转换为设备画布 SVG viewBox 坐标。 */
@@ -2351,19 +2814,6 @@ function topologySvgPoint(position: TopologyPosition): { x: number; y: number } 
   return {
     x: position.leftPercent / 100 * TOPOLOGY_VIEWBOX_WIDTH,
     y: position.topPixels,
-  };
-}
-
-/** 返回一组拓扑设备的垂直物理边界，用于绘制整机区域底板。 */
-function topologyVerticalExtent(positions: TopologyPosition[]): TopologyVerticalExtent | null {
-  if (!positions.length) return null;
-  return {
-    top: Math.min(...positions.map(position => (
-      position.topPixels - (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2
-    ))),
-    bottom: Math.max(...positions.map(position => (
-      position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2
-    ))),
   };
 }
 
@@ -2525,6 +2975,7 @@ export function renderEquipmentTopology(
   const layout = device
     ? detectDeviceTopologyLayout(device)
     : detectTopologyLayout(visibleModules, snapshot.robots.length);
+  const machineFrames = TOPOLOGY_MACHINE_FRAMES[layout].map(frame => ({ ...frame }));
   /* 双腔布局把 MultiProcessChamber 拆成独立腔室卡片，占满单腔 6 腔室 U 形布局。 */
   const processChamberViews = layout === "dual"
     ? expandDualProcessChambers(groups.processModules)
@@ -2583,9 +3034,22 @@ export function renderEquipmentTopology(
   positionRobotGroup(vacuumRobots, "vacuum");
   positionRobotGroup(atmosphereRobots, "atmosphere");
 
+  const atmosphereFrame = { ...topologyAtmosphereFrame(layout) };
   const allPositions = [
     ...modulePositions.values(),
     ...robotPositions.values(),
+    ...machineFrames.map(frame => ({
+      leftPercent: frame.centerLeftPercent,
+      topPixels: frame.centerTopPixels,
+      widthPixels: frame.widthPixels,
+      heightPixels: frame.heightPixels,
+    })),
+    {
+      leftPercent: atmosphereFrame.centerLeftPercent,
+      topPixels: atmosphereFrame.centerTopPixels,
+      widthPixels: atmosphereFrame.widthPixels,
+      heightPixels: atmosphereFrame.heightPixels,
+    },
   ];
   const minimumTop = allPositions.length
     ? Math.min(...allPositions.map(position => position.topPixels - (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2))
@@ -2604,68 +3068,27 @@ export function renderEquipmentTopology(
   for (const [name, position] of robotPositions) {
     robotPositions.set(name, { ...position, topPixels: position.topPixels + verticalOffset });
   }
-
-  const positionedModules = (modules: ModuleSnapshot[]): TopologyPosition[] => modules
-    .map(module => modulePositions.get(module.name))
-    .filter((position): position is TopologyPosition => Boolean(position));
-  const positionedRobots = (robots: RobotSnapshot[]): TopologyPosition[] => robots
-    .map(robot => robotPositions.get(robot.name))
-    .filter((position): position is TopologyPosition => Boolean(position));
-  /* 级联布局中桥接腔归入真空区，其余 LoadLock 作为大气/真空接口。 */
-  const interfaceLoadLocks = groups.loadLocks.filter(module => !bridgeLoadLockNames.has(module.name));
-  const vacuumExtent = topologyVerticalExtent([
-    ...positionedModules(processChamberViews.map(item => item.view)),
-    ...positionedRobots(vacuumRobots),
-    ...positionedModules(groups.loadLocks.filter(module => bridgeLoadLockNames.has(module.name))),
-  ]);
-  const interfaceExtent = topologyVerticalExtent(positionedModules(interfaceLoadLocks));
-  let atmosphereExtent = topologyVerticalExtent([
-    ...positionedModules(groups.auxiliaryModules),
-    ...positionedModules(groups.loadPorts),
-    ...positionedRobots(atmosphereRobots),
-  ]);
-  if (interfaceExtent && atmosphereExtent) {
-    /*
-     * 大气侧整组贴合接口带：设备内容的顶边与接口带底边保持 12px 分区间距。
-     * 整组平移不会改变内部布局或区域高度，只消除 LA/LB 下方的额外空白。
-     */
-    const atmosphereOffset = interfaceExtent.bottom + 24 - atmosphereExtent.top;
-    const shiftPosition = (position: TopologyPosition | undefined): void => {
-      if (position) position.topPixels += atmosphereOffset;
-    };
-    groups.auxiliaryModules.forEach(module => shiftPosition(modulePositions.get(module.name)));
-    groups.loadPorts.forEach(module => shiftPosition(modulePositions.get(module.name)));
-    atmosphereRobots.forEach(robot => shiftPosition(robotPositions.get(robot.name)));
-    atmosphereExtent = topologyVerticalExtent([
-      ...positionedModules(groups.auxiliaryModules),
-      ...positionedModules(groups.loadPorts),
-      ...positionedRobots(atmosphereRobots),
-    ]);
-    const finalMaximumBottom = Math.max(
-      ...[...modulePositions.values()].map(position => position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2),
-      ...[...robotPositions.values()].map(position => position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2),
-    );
-    canvasHeight = Math.max(520, Math.ceil(finalMaximumBottom + TOPOLOGY_CANVAS_PADDING));
-  }
-  const interfaceTop = interfaceExtent ? Math.max(12, interfaceExtent.top - 12) : Math.round(canvasHeight * .48);
-  const interfaceBottom = interfaceExtent ? Math.min(canvasHeight - 12, interfaceExtent.bottom + 12) : interfaceTop;
-  const vacuumTop = vacuumExtent ? Math.max(12, vacuumExtent.top - 24) : 12;
-  const vacuumBottom = Math.max(vacuumTop + 120, interfaceTop - 12);
-  /* 大气区高度只由大气侧内容决定；位置则紧接接口带，避免区域之间出现断层。 */
-  const atmosphereTop = atmosphereExtent
-    ? interfaceExtent ? interfaceBottom + 12 : Math.max(12, atmosphereExtent.top)
-    : interfaceExtent ? interfaceBottom + 12 : Math.round(canvasHeight * .52);
-  const atmosphereBottom = atmosphereExtent
-    ? Math.min(canvasHeight - 12, atmosphereExtent.bottom + 24)
-    : canvasHeight - 12;
-  const machineAreaMarkup = `
-    <div class="topology-zone topology-zone-vacuum" style="--zone-top:${vacuumTop}px;--zone-height:${Math.max(120, vacuumBottom - vacuumTop)}px" aria-hidden="true">
-      <span><small>真空加工区</small></span>
-    </div>
-    ${interfaceExtent ? `<div class="topology-interface-bay" style="--zone-top:${interfaceTop}px;--zone-height:${Math.max(96, interfaceBottom - interfaceTop)}px" aria-hidden="true"><span>VACUUM / ATM INTERFACE</span></div>` : ""}
-    <div class="topology-zone topology-zone-atmosphere" style="--zone-top:${atmosphereTop}px;--zone-height:${Math.max(120, atmosphereBottom - atmosphereTop)}px" aria-hidden="true">
-      <span><small>大气传输区</small></span>
+  machineFrames.forEach(frame => {
+    frame.centerTopPixels += verticalOffset;
+  });
+  atmosphereFrame.centerTopPixels += verticalOffset;
+  const machineAreaMarkup = "";
+  const machineFrameMarkup = [...machineFrames, atmosphereFrame].map(frame => {
+    const frameAnchors = (["top", "right", "bottom", "left"] as const)
+      .flatMap(edge => [1, 2].map(index => (
+        `<i class="topology-frame-anchor topology-frame-anchor-${edge} topology-frame-anchor-${index}" data-anchor-id="${escapeHtml(frame.id)}-${edge}-${index}" data-anchor-edge="${edge}" aria-hidden="true"></i>`
+      )))
+      .join("");
+    return `
+    <div class="topology-machine-frame topology-machine-frame-${frame.shape}" data-frame-id="${escapeHtml(frame.id)}" style="--frame-left:${frame.centerLeftPercent}%;--frame-top:${frame.centerTopPixels}px;--frame-width:${frame.widthPixels}px;--frame-height:${frame.heightPixels}px" aria-hidden="true">
+      ${frame.label ? `<span>${escapeHtml(frame.label)}</span>` : ""}
+      ${frameAnchors}
     </div>`;
+  }).join("");
+  const attachmentPointMarkup = [...modulePositions.values(), ...robotPositions.values()]
+    .filter(position => position.attachmentId)
+    .map(position => `<i class="topology-attachment-point" data-attachment-id="${escapeHtml(position.attachmentId ?? "")}" style="--attachment-left:${position.leftPercent}%;--attachment-top:${position.topPixels}px" aria-hidden="true"></i>`)
+    .join("");
 
   const renderModuleGroup = (
     modules: ModuleSnapshot[],
@@ -2675,16 +3098,11 @@ export function renderEquipmentTopology(
     if (!position) return "";
     /* 展开后的腔室卡片仍用原 PM 模块名查询候选动作高亮。 */
     const candidateSource = processSourceNames.get(module.name) ?? module.name;
-    return `<div class="reference-module-position" style="--module-left:${position.leftPercent}%;--module-top:${position.topPixels}px">${renderModule(module, snapshot.waferOrigins, role, destinations.get(candidateSource), layout, roleIndex)}</div>`;
+    const fixedLeft = position.fixedLeftOffsetPixels === undefined
+      ? ""
+      : `;--fixed-left:calc(50% ${position.fixedLeftOffsetPixels < 0 ? "-" : "+"} ${Math.abs(position.fixedLeftOffsetPixels)}px)`;
+    return `<div class="reference-module-position" style="--module-left:${position.leftPercent}%;--module-top:${position.topPixels}px${fixedLeft}">${renderModule(module, snapshot.waferOrigins, role, destinations.get(candidateSource), layout, roleIndex, position.attachmentId)}</div>`;
   }).join("");
-  const positionedLoadPorts = positionedModules(groups.loadPorts);
-  const loadPortBaseMarkup = positionedLoadPorts.length ? (() => {
-    const lefts = positionedLoadPorts.map((position) => position.leftPercent);
-    const baseCenter = (Math.min(...lefts) + Math.max(...lefts)) / 2;
-    const baseWidth = Math.max(...lefts) - Math.min(...lefts) + TOPOLOGY_LOADPORT_WIDTH / TOPOLOGY_VIEWBOX_WIDTH * 100;
-    const baseTop = positionedLoadPorts[0].topPixels + TOPOLOGY_LOADPORT_HEIGHT / 2 + TOPOLOGY_LOADPORT_BASE_OVERHANG - TOPOLOGY_LOADPORT_BASE_HEIGHT / 2;
-    return `<div class="load-port-shared-base" style="--base-left:${baseCenter.toFixed(2)}%;--base-width:${baseWidth.toFixed(2)}%;--base-top:${baseTop.toFixed(1)}px" aria-hidden="true"></div>`;
-  })() : "";
   const moduleMarkup = [
     renderModuleGroup(processChamberViews.map(item => item.view), "process"),
     renderModuleGroup(groups.loadLocks, "lock"),
@@ -2720,50 +3138,31 @@ export function renderEquipmentTopology(
       }
     }
     const angleDegrees = armAngle * 180 / Math.PI;
-    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees)}</div>`;
+    const fixedLeft = position.fixedLeftOffsetPixels === undefined
+      ? ""
+      : `;--fixed-left:calc(50% ${position.fixedLeftOffsetPixels < 0 ? "-" : "+"} ${Math.abs(position.fixedLeftOffsetPixels)}px)`;
+    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px${fixedLeft}">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees)}</div>`;
   }).join("");
   const robotMarkup = renderRobotGroup(vacuumRobots, "vacuum")
     + renderRobotGroup(atmosphereRobots, "atmosphere");
   return `
     <section class="equipment-schematic" data-topology-layout="${layout}" aria-label="完整设备拓扑回放">
       <div class="schematic-canvas reference-grid-canvas" style="--topology-canvas-height:${canvasHeight}px">
+        <div class="topology-status-legend" role="group" aria-label="回放状态图例">
+          <span><i class="topology-status-legend-processing"></i>加工</span>
+          <span><i class="topology-status-legend-pumping"></i>抽气</span>
+          <span><i class="topology-status-legend-venting"></i>充气</span>
+          <span><i class="topology-status-legend-cleaning"></i>清洁</span>
+          <span><i class="topology-status-legend-transfer"></i>传输</span>
+          <span><i class="topology-status-legend-door"></i>门动作</span>
+        </div>
         ${machineAreaMarkup}
-        ${loadPortBaseMarkup}
+        ${machineFrameMarkup}
+        ${attachmentPointMarkup}
         ${moduleMarkup}
         ${robotMarkup}
       </div>
     </section>`;
-}
-
-/** 把可选秒数格式化为适合紧凑决策列表的文本。 */
-function modelSeconds(value: number | null, sign = false): string {
-  if (value === null) return "—";
-  const prefix = sign && value > PERFORMANCE_DISPLAY_TOLERANCE ? "+" : "";
-  return `${prefix}${value.toFixed(value >= 100 ? 0 : 1)}s`;
-}
-
-/** 避免把非零偏好四舍五入成具有误导性的 0%。 */
-function modelPreference(value: number): string {
-  const percent = Math.max(0, value) * 100;
-  if (percent > 0 && Math.round(percent) === 0) return "<1%";
-  return `${Math.round(percent)}%`;
-}
-
-/** 生成候选动作的人类可读路径标签。 */
-function decisionCandidatePath(candidate: DecisionCandidate): string {
-  const robotHand = `${candidate.robot || "Robot"} 手上`;
-  if (candidate.kind === "pick") {
-    return `${candidate.source || "—"} → ${robotHand}`;
-  }
-  if (candidate.kind === "place") {
-    return `${robotHand} → ${candidate.destination || "—"}${candidate.destinationSlot ? ` · 槽 ${candidate.destinationSlot}` : ""}`;
-  }
-  if (candidate.kind === "swap") {
-    return `${robotHand} ↔ ${candidate.destination || "—"}${candidate.destinationSlot ? ` · 槽 ${candidate.destinationSlot}` : ""}`;
-  }
-  const source = candidate.source || "当前位置";
-  const destination = candidate.destination || "—";
-  return `${source} → ${destination}${candidate.destinationSlot ? ` · 槽 ${candidate.destinationSlot}` : ""}`;
 }
 
 /** 生成与候选排序无关的决策空间签名，只在可行动作集合变化时改变。 */
@@ -2795,146 +3194,66 @@ export function primitiveDecisionBoundaryTimes(moves: MoveRecord[]): number[] {
   )].sort((left, right) => left - right);
 }
 
-/** 绘制当前合法动作空间；模型推荐和原计划只作为候选自身的状态标签。 */
-function renderDecisionLens(
+/** 绘制算法动作接口返回的原子动作分类。 */
+export function renderDecisionLens(
   decision: DecisionTraceStep | null,
   requestState: "idle" | "loading" | "error" = "idle",
   requestError = "",
+  statusFilters: ActionDiagnosticStatus[] = ["enabled"],
 ): string {
   if (!decision) {
     if (requestState === "loading") {
       return `
         <div class="decision-empty is-loading" role="status" aria-live="polite">
           <div class="visual-loader" aria-hidden="true"></div>
-          <strong>正在评估当前合法动作</strong>
-          <p>正在重建机器状态并运行推荐模型。</p>
+          <strong>正在更新当前动作</strong>
+          <p>正在按 Move 状态调用算法动作接口。</p>
         </div>`;
     }
     if (requestState === "error") {
       return `
         <div class="decision-empty is-error" role="alert">
-          <strong>推荐模型评估失败</strong>
-          <p>${escapeHtml(requestError || "无法获取当前合法动作，请检查服务状态。")}</p>
+          <strong>动作接口调用失败</strong>
+          <p>${escapeHtml(requestError || "无法获取当前动作，请检查服务状态。")}</p>
         </div>`;
     }
     return `
       <div class="decision-empty">
-        <strong>当前时刻暂无合法动作</strong>
-        <p>回放到下一设备事件后更新。</p>
+        <strong>当前动作卡片为空</strong>
+        <p>当前算法未提供动作接口，或回放到此时没有动作。</p>
       </div>`;
   }
-  if (decision.model === "dual-actor-e2e") {
-    return renderDualActorDecisionLens(decision);
-  }
-  const shownText = decision.candidatesTruncated
-    ? `展示 Top ${decision.shownCandidateCount} / ${decision.candidateCount}`
-    : `${decision.candidateCount} 个可行动作`;
-  const hasExplicitRecommendation = decision.candidates.some(candidate => candidate.selected)
-    || Boolean(decision.selectedActionId);
-  const rankedCandidates = [...decision.candidates].sort((left, right) =>
-    Number(left.priorityDeferred) - Number(right.priorityDeferred)
-      || right.policyPreference - left.policyPreference
-      || left.rank - right.rank
-      || left.actionId.localeCompare(right.actionId));
-  const candidates = rankedCandidates.map((candidate, index) => {
-    const preference = modelPreference(candidate.policyPreference);
-    const isRecommendation = hasExplicitRecommendation
-      ? candidate.selected || candidate.actionId === decision.selectedActionId
-      : index === 0;
-    const tags = `${isRecommendation ? '<span class="decision-tag is-recommendation">E2E推荐</span>' : ""}${candidate.executed ? '<span class="decision-tag is-plan">与计划一致</span>' : ""}`;
-    const delta = isRecommendation
-      ? "Δ 基准"
-      : `Δ ${modelSeconds(candidate.makespanDelta, true)}`;
+  const statusLabels: Record<ActionDiagnosticStatus, string> = {
+    enabled: "使能",
+    "physical-blocked": "物理拦截",
+    "deadlock-blocked": "死锁规则拦截",
+  };
+  const kindLabels = { pick: "Pick", place: "Place", swap: "Swap" };
+  const visibleActions = decision.actionDiagnostics.filter(action => statusFilters.includes(action.status));
+  const cards = visibleActions.map(action => {
+    const source = action.sourceSlot > 0 ? `${action.source} #${action.sourceSlot}` : action.source;
+    const destination = action.destinationSlot > 0
+      ? `${action.destination} #${action.destinationSlot}`
+      : action.destination;
     return `
-      <li class="decision-candidate">
-        <div class="decision-candidate-rank" aria-label="第 ${index + 1} 名">${index + 1}</div>
+      <li class="decision-candidate action-card action-status-${action.status}">
+        <span class="decision-tag action-kind">${kindLabels[action.kind]}</span>
         <div class="decision-candidate-main">
-          <div class="decision-candidate-title"><strong>${escapeHtml(decisionCandidatePath(candidate))}</strong>${tags}</div>
-          <small>${escapeHtml(candidate.robot || "Robot")} · ${escapeHtml(candidate.flowKind || candidate.kind)}</small>
-          <div class="decision-candidate-detail">
-            <span>剩余工期 <strong>${modelSeconds(candidate.expectedRemainingMakespan)}</strong></span>
-            <span>${delta}</span>
-          </div>
+          <div class="decision-candidate-title"><strong>${escapeHtml(source || action.robot)} → ${escapeHtml(destination || "Robot hand")}</strong></div>
+          <small>${escapeHtml(action.robot || "Robot")} · ${action.materialIds.length ? `Material ${escapeHtml(action.materialIds.join(", "))}` : "无物料标识"}</small>
+          ${action.reason ? `<p class="action-block-reason">${escapeHtml(action.reason)}</p>` : ""}
         </div>
-        <strong class="decision-candidate-preference" aria-label="E2E 偏好 ${preference}">${preference}</strong>
+        <span class="decision-tag action-status">${statusLabels[action.status]}</span>
       </li>`;
   }).join("");
+  const counts = decision.actionCounts;
+  const provider = decision.actionDiagnosticsSource === "algorithm"
+    ? `算法接口 · ${decision.actionDiagnosticsProvider || "未命名实现"}`
+    : "算法未提供动作接口";
   return `
-    <section class="decision-candidate-section" aria-labelledby="decisionCandidatesTitle">
-      <header>
-        <strong id="decisionCandidatesTitle">决策 #${decision.decisionIndex} <small>@ ${formatSeconds(decision.time)}s</small></strong>
-        <span>${escapeHtml(shownText)} · E2E 排序</span>
-      </header>
-      ${candidates ? `<ol>${candidates}</ol>` : '<p class="decision-alternative-empty">当前没有合法动作</p>'}
-    </section>`;
-}
-
-/** 双 Actor 候选严格按大气端、真空端拆成两张独立榜单。 */
-function renderDualActorDecisionLens(decision: DecisionTraceStep): string {
-  const groupsByActor = new Map(
-    decision.candidateGroups.map(group => [group.actor, group]),
-  );
-  const groups = [
-    { actor: "atmosphere", label: "大气端 Actor", hint: "LoadPort ↔ LoadLock" },
-    { actor: "vacuum", label: "真空端 Actor", hint: "LoadLock ↔ 工艺腔" },
-  ].map(definition => ({
-    ...definition,
-    group: groupsByActor.get(definition.actor) ?? null,
-  }));
-  const groupMarkup = groups.map(({ actor, label, hint, group }) => {
-    const rankedCandidates = [...(group?.candidates ?? [])].sort((left, right) =>
-      right.policyPreference - left.policyPreference
-        || left.rank - right.rank
-        || left.actionId.localeCompare(right.actionId));
-    const shownText = group?.candidatesTruncated
-      ? `Top ${group.shownCandidateCount} / ${group.candidateCount}`
-      : `${group?.candidateCount ?? 0} 个原子动作`;
-    const candidates = rankedCandidates.map((candidate, index) => {
-      const preference = modelPreference(candidate.policyPreference);
-      const isRecommendation = candidate.selected
-        || candidate.actionId === group?.selectedActionId
-        || (!group?.selectedActionId && index === 0);
-      const recommendationTag = isRecommendation
-        ? `<span class="decision-tag is-recommendation is-${actor}">${actor === "atmosphere" ? "大气端推荐" : "真空端推荐"}</span>`
-        : "";
-      const planTag = candidate.executed
-        ? '<span class="decision-tag is-plan">与计划一致</span>'
-        : "";
-      const remainingCost = candidate.expectedRemainingCost
-        ?? candidate.expectedRemainingMakespan;
-      const delta = isRecommendation
-        ? "Δ 基准"
-        : `Δ ${modelSeconds(candidate.makespanDelta, true)}`;
-      return `
-        <li class="decision-candidate">
-          <div class="decision-candidate-rank" aria-label="第 ${index + 1} 名">${index + 1}</div>
-          <div class="decision-candidate-main">
-            <div class="decision-candidate-title"><strong>${escapeHtml(decisionCandidatePath(candidate))}</strong>${recommendationTag}${planTag}</div>
-            <small>${escapeHtml(candidate.robot || "Robot")} · ${escapeHtml(candidate.kind || "原子动作")}</small>
-            <div class="decision-candidate-detail">
-              <span>剩余成本 <strong>${modelSeconds(remainingCost)}</strong></span>
-              <span>${delta}</span>
-            </div>
-          </div>
-          <strong class="decision-candidate-preference" aria-label="${escapeHtml(label)}偏好 ${preference}">${preference}</strong>
-        </li>`;
-    }).join("");
-    return `
-      <article class="dual-actor-recommendation is-${actor}" data-recommendation-actor="${actor}">
-        <header>
-          <div><strong>${label}</strong><small>${hint}</small></div>
-          <span>${shownText} · 独立排序</span>
-        </header>
-        ${candidates ? `<ol>${candidates}</ol>` : '<p class="decision-alternative-empty">当前控制域没有合法原子动作</p>'}
-      </article>`;
-  }).join("");
-  return `
-    <section class="dual-actor-decision" aria-labelledby="dualActorDecisionTitle">
-      <header class="dual-actor-decision-head">
-        <strong id="dualActorDecisionTitle">决策 #${decision.decisionIndex} <small>@ ${formatSeconds(decision.time)}s</small></strong>
-        <span>双 Actor · ${decision.replayEvaluated ? "回放重评估" : "原始模型决策"}</span>
-      </header>
-      <div class="dual-actor-recommendation-list">${groupMarkup}</div>
+    <section class="decision-candidate-section" aria-label="当前合法动作">
+      <p class="action-count-summary">使能 ${counts.enabled} · 物理拦截 ${counts["physical-blocked"]} · 死锁拦截 ${counts["deadlock-blocked"]}</p>
+      ${cards ? `<ul>${cards}</ul>` : '<p class="decision-alternative-empty">当前筛选条件下没有动作</p>'}
     </section>`;
 }
 
@@ -3047,7 +3366,8 @@ function renderBottleneckAnalysis(performance: SchedulePerformance): string {
     auxiliary: "辅助模块",
   };
 
-  const displayedResources = groupedBottleneckResources(performance);
+  // 表格聚焦最需要优先处理的三个资源；完整分组结果仍保留给既有数据逻辑使用。
+  const displayedResources = groupedBottleneckResources(performance).slice(0, 3);
   const resourceRows = (items: BottleneckResourceGroup[]): string => items.map((resource, index) => {
     const candidate = resource.candidate;
     const evidenceScore = candidate ? Math.round(candidate.score * 100) : null;
@@ -3057,32 +3377,30 @@ function renderBottleneckAnalysis(performance: SchedulePerformance): string {
       : resourceKindLabels[resource.kind];
     return `
       <li class="resource-utilization-row">
-        <div class="resource-utilization-name">
-          <span>${index + 1}</span>
-          <div><strong>${escapeHtml(resource.name)}</strong><small>${escapeHtml(resourceLabel)}</small></div>
+        <div class="resource-utilization-summary">
+          <div class="resource-utilization-name">
+            <span>${index + 1}</span>
+            <div><strong>${escapeHtml(resource.name)}</strong><small>${escapeHtml(resourceLabel)}</small></div>
+          </div>
+          <strong class="resource-utilization-percent">${formatPercent(resource.utilization)}</strong>
+          <div class="utilization-track" aria-label="${escapeHtml(resource.name)} 占用率 ${formatPercent(resource.utilization)}">${renderCategoryBars(resource, window.duration)}</div>
+          <div class="resource-evidence-score"><strong>${evidenceScore ?? "—"}</strong><small>${evidenceLabel}</small></div>
+          <span aria-hidden="true"></span>
         </div>
-        <strong class="resource-utilization-percent">${formatPercent(resource.utilization)}</strong>
-        <div class="utilization-track" aria-label="${escapeHtml(resource.name)} 占用率 ${formatPercent(resource.utilization)}">${renderCategoryBars(resource, window.duration)}</div>
-        <small class="resource-utilization-time">${formatSeconds(resource.busyTime)} s</small>
-        <div class="resource-evidence-score"><strong>${evidenceScore ?? "—"}</strong><small>${evidenceLabel}</small></div>
       </li>`;
   }).join("");
 
   const legend = ACTIVITY_CATEGORIES.map(category => (
     `<span><i class="performance-swatch category-${category}"></i>${ACTIVITY_CATEGORY_LABELS[category]}</span>`
   )).join("");
-
   return `
-    <header class="bottleneck-analysis-head">
-      <div>
-        <strong>瓶颈分析</strong>
-      </div>
+    <header class="analysis-section-head bottleneck-analysis-head">
+      <div class="analysis-section-title"><strong>瓶颈分析</strong></div>
       <div class="bottleneck-analysis-actions">
-        <button class="bottleneck-analysis-help" id="bottleneckAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="bottleneckAnalysisHelpDialog">瓶颈分析说明</button>
         <label class="bottleneck-window-control"><span class="visually-hidden">统计口径</span><div class="bottleneck-window-slot"></div></label>
+        <button class="analysis-secondary-button bottleneck-analysis-help" id="bottleneckAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="bottleneckAnalysisHelpDialog"><span aria-hidden="true">ⓘ</span> 说明</button>
       </div>
     </header>
-    <div class="resource-utilization-head" aria-hidden="true"><span>资源</span><span>利用率</span><span>占用组成</span><span>活跃时长</span><span>瓶颈证据得分</span></div>
     <ol class="resource-utilization-list">
       ${resourceRows(displayedResources)}
     </ol>
@@ -3092,7 +3410,7 @@ function renderBottleneckAnalysis(performance: SchedulePerformance): string {
 
 type ResidenceMetricKind = "system" | "chamber" | "robot";
 
-/** 渲染单一驻留口径的逐片柱状图，避免不同量级的时间互相遮蔽。 */
+/** 渲染单一驻留口径的逐片柱状图，保持三种口径的原有配色与平均线表达。 */
 function renderResidenceMetricChart(
   samples: WaferResidenceTime[],
   kind: ResidenceMetricKind,
@@ -3106,7 +3424,7 @@ function renderResidenceMetricChart(
   const values = samples.map(metric.value);
   const meanSeconds = values.reduce((sum, value) => sum + value, 0) / values.length;
   const maximumSeconds = Math.max(...values, 1);
-  const plotHeight = 120;
+  const plotHeight = 150;
   const scaleMaximum = maximumSeconds * 1.08;
   const meanHeight = Math.min(meanSeconds / scaleMaximum * plotHeight, plotHeight);
   const bars = samples.map(sample => {
@@ -3115,7 +3433,7 @@ function renderResidenceMetricChart(
     const wafer = escapeHtml(String(sample.wafer));
     const duration = formatSeconds(seconds);
     return `
-      <li class="residence-metric-bar-item" role="img" aria-label="晶圆 ${wafer}，${metric.label} ${duration} 秒" title="晶圆 ${wafer} · ${metric.label} ${duration} s">
+      <li class="residence-metric-bar-item" role="img" aria-label="晶圆 ${wafer}，${metric.label} ${duration} 秒">
         <strong>${duration}</strong>
         <span class="residence-metric-bar residence-bar-${kind}"><i style="height:${height.toFixed(2)}px"></i></span>
         <small>${wafer}</small>
@@ -3135,51 +3453,38 @@ function renderResidenceMetricChart(
 /** 渲染逐片晶圆的系统、腔室与机器手驻留时间图表。 */
 export function renderWaferResidenceChart(performance: SchedulePerformance): string {
   const samples = performance.waferSystemResidenceTimes ?? [];
-  const helpButton = `<button class="bottleneck-analysis-help residence-analysis-help" id="residenceAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="residenceAnalysisHelpDialog">说明</button>`;
+  const helpButton = `<button class="analysis-secondary-button residence-analysis-help" id="residenceAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="residenceAnalysisHelpDialog"><span aria-hidden="true">ⓘ</span> 说明</button>`;
   if (!samples.length) {
     return `
-      <header class="residence-chart-head"><strong>驻留时间分析</strong>${helpButton}</header>
-      <div class="residence-chart-empty">当前结果中没有完成往返 LoadPort 的晶圆。</div>`;
+      <header class="analysis-section-head residence-chart-head"><div class="analysis-section-title"><strong>驻留时间分析</strong></div>${helpButton}</header>
+      <div class="analysis-empty-state"><strong>暂无驻留数据</strong><span>当前结果中没有完成往返 LoadPort 的晶圆。</span></div>`;
   }
 
   const systemValues = samples.map(sample => sample.duration);
-  const systemMeanSeconds = systemValues.reduce((sum, value) => sum + value, 0) / systemValues.length;
-  const maximumSeconds = Math.max(...systemValues);
-  const minimumSeconds = Math.min(...systemValues);
-  const rangeToMinimumPercent = minimumSeconds > PERFORMANCE_DISPLAY_TOLERANCE
-    ? (maximumSeconds - minimumSeconds) / minimumSeconds * 100
-    : null;
-  const chamberMeanSeconds = samples.reduce((sum, sample) => sum + (sample.chamberDwellSeconds ?? 0), 0) / samples.length;
-  const robotMeanSeconds = samples.reduce((sum, sample) => sum + (sample.robotDwellSeconds ?? 0), 0) / samples.length;
   const chamberValues = samples.map(sample => sample.chamberDwellSeconds ?? 0);
   const robotValues = samples.map(sample => sample.robotDwellSeconds ?? 0);
+  const metricSummary = (values: number[], label: string): string => {
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const deviation = Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+    const upperControlLimit = mean + deviation * 2;
+    const abnormalCount = values.filter(value => value > upperControlLimit).length;
+    return `<span><small>平均</small><b>${formatSeconds(mean)}</b><em>s</em></span><span><small>最大</small><b>${formatSeconds(Math.max(...values))}</b><em>s</em></span><span class="${abnormalCount ? "is-warning" : ""}"><small>偏高比例</small><b>${(abnormalCount / values.length * 100).toFixed(1)}</b><em>%</em></span><span><small>样本</small><b>${values.length}</b><em>片</em></span><span class="visually-hidden">${label}</span>`;
+  };
   const summary = (kind: ResidenceMetricKind, content: string): string => (
-    `<div class="residence-chart-summary" data-residence-summary="${kind}"${kind === "system" ? "" : " hidden"}>${content}</div>`
+    `<div class="analysis-compact-stats residence-chart-summary" data-residence-summary="${kind}"${kind === "system" ? "" : " hidden"}>${content}</div>`
   );
 
   return `
-    <header class="residence-chart-head">
-      <strong>驻留时间分析</strong>
-      <label class="residence-metric-control"><span class="visually-hidden">选择驻留时间图表</span><select id="residenceMetricSelect" aria-label="选择驻留时间图表">
+    <header class="analysis-section-head residence-chart-head">
+      <div class="analysis-section-title"><strong>驻留时间分析</strong></div>
+      <label class="analysis-filter residence-metric-control"><select id="residenceMetricSelect" aria-label="选择驻留时间图表">
         <option value="system">系统驻留时间</option>
         <option value="chamber">腔室驻留时间</option>
         <option value="robot">机器手驻留时间</option>
       </select></label>
-      ${summary("system", `
-        <span>系统平均 <b>${formatSeconds(systemMeanSeconds)} s</b></span>
-        <span>系统最大 <b>${formatSeconds(maximumSeconds)} s</b></span>
-        <span>极差/最小值 <b>${rangeToMinimumPercent === null ? "—" : `${rangeToMinimumPercent.toFixed(1)}%`}</b></span>
-        <span>样本 <b>${samples.length} 片</b></span>`)}
-      ${summary("chamber", `
-        <span>腔室平均 <b>${formatSeconds(chamberMeanSeconds)} s</b></span>
-        <span>腔室最大 <b>${formatSeconds(Math.max(...chamberValues))} s</b></span>
-        <span>腔室累计 <b>${formatSeconds(chamberValues.reduce((sum, value) => sum + value, 0))} s</b></span>
-        <span>样本 <b>${samples.length} 片</b></span>`)}
-      ${summary("robot", `
-        <span>机器手平均 <b>${formatSeconds(robotMeanSeconds)} s</b></span>
-        <span>机器手最大 <b>${formatSeconds(Math.max(...robotValues))} s</b></span>
-        <span>机器手累计 <b>${formatSeconds(robotValues.reduce((sum, value) => sum + value, 0))} s</b></span>
-        <span>样本 <b>${samples.length} 片</b></span>`)}
+      ${summary("system", metricSummary(systemValues, "系统驻留"))}
+      ${summary("chamber", metricSummary(chamberValues, "腔室驻留"))}
+      ${summary("robot", metricSummary(robotValues, "机器手驻留"))}
       ${helpButton}
     </header>
     <div class="residence-chart-body">
@@ -3189,9 +3494,208 @@ export function renderWaferResidenceChart(performance: SchedulePerformance): str
     </div>`;
 }
 
+/** 根据用户选择的晶圆数或时间范围裁剪产能点。 */
+function filterThroughputPoints(points: ThroughputTimelinePoint[], range: string): ThroughputTimelinePoint[] {
+  if (!points.length || range === "all") return points;
+  const [kind, rawAmount] = range.split(":");
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount) || amount <= 0) return points;
+  if (kind === "wafer") return points.slice(-Math.floor(amount));
+  if (kind === "time") {
+    const cutoff = points[points.length - 1].completedAt - amount;
+    const filtered = points.filter(point => point.completedAt >= cutoff);
+    return filtered.length ? filtered : points.slice(-1);
+  }
+  return points;
+}
+
+const MAXIMUM_THROUGHPUT_DRAW_POINTS = 72;
+const MAXIMUM_THROUGHPUT_VALUE_LABELS = 12;
+
+/** 按区间保留高低点，避免大批量结果生成数百个重叠节点，同时保住曲线尖峰。 */
+export function simplifyThroughputPoints(points: ThroughputTimelinePoint[]): ThroughputTimelinePoint[] {
+  if (points.length <= MAXIMUM_THROUGHPUT_DRAW_POINTS) return points;
+  const interior = points.slice(1, -1);
+  const bucketCount = Math.max(1, Math.floor((MAXIMUM_THROUGHPUT_DRAW_POINTS - 2) / 2));
+  const selected = [points[0]];
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const start = Math.floor(bucket * interior.length / bucketCount);
+    const end = Math.max(start + 1, Math.floor((bucket + 1) * interior.length / bucketCount));
+    const rows = interior.slice(start, end).map((point, index) => ({ point, index: start + index }));
+    const minimum = rows.reduce((best, row) => row.point.throughputPerHour < best.point.throughputPerHour ? row : best);
+    const maximum = rows.reduce((best, row) => row.point.throughputPerHour > best.point.throughputPerHour ? row : best);
+    [minimum, maximum].sort((left, right) => left.index - right.index).forEach(row => {
+      if (selected[selected.length - 1] !== row.point) selected.push(row.point);
+    });
+  }
+  selected.push(points[points.length - 1]);
+  return selected;
+}
+
+/** 生成自适应坐标轴、参考线、异常点和悬停命中区域。 */
+function renderThroughputSvg(
+  points: ThroughputTimelinePoint[],
+  title: string,
+): string {
+  const width = 760;
+  const height = 174;
+  const left = 12;
+  const right = 12;
+  const top = 12;
+  const bottom = 12;
+  const usableWidth = width - left - right;
+  const usableHeight = height - top - bottom;
+  const allValues = points.map(point => Math.max(0, Number(point.throughputPerHour) || 0));
+  const mean = allValues.reduce((sum, value) => sum + value, 0) / allValues.length;
+  const displayPoints = simplifyThroughputPoints(points);
+  const values = displayPoints.map(point => Math.max(0, Number(point.throughputPerHour) || 0));
+  const observedMinimum = Math.min(...values);
+  const observedMaximum = Math.max(...values);
+  const spread = Math.max(observedMaximum - observedMinimum, Math.max(mean * .04, 1));
+  const padding = Math.max(1, spread * .18);
+  const step = spread > 20 ? 5 : spread > 8 ? 2 : 1;
+  const minimum = Math.max(0, Math.floor((observedMinimum - padding) / step) * step);
+  const maximum = Math.max(minimum + step * 3, Math.ceil((observedMaximum + padding) / step) * step);
+  const yRange = maximum - minimum;
+  const firstIndex = displayPoints[0].completedWaferIndex;
+  const lastIndex = displayPoints[displayPoints.length - 1].completedWaferIndex;
+  const indexRange = Math.max(1, lastIndex - firstIndex);
+  const coordinates = displayPoints.map((point, index) => ({
+    x: left + (point.completedWaferIndex - firstIndex) / indexRange * usableWidth,
+    y: top + (1 - (values[index] - minimum) / yRange) * usableHeight,
+  }));
+  const linePath = coordinates.length === 1
+    ? `M ${coordinates[0].x.toFixed(2)} ${coordinates[0].y.toFixed(2)}`
+    : coordinates.reduce((path, point, index) => {
+      if (index === 0) return `M ${point.x.toFixed(2)} ${point.y.toFixed(2)}`;
+      return `${path} L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`;
+    }, "");
+  const latest = displayPoints[displayPoints.length - 1];
+  const yForValue = (value: number): number => top + (1 - (value - minimum) / yRange) * usableHeight;
+  const meanY = yForValue(mean);
+  const labelStride = Math.max(1, Math.ceil(displayPoints.length / MAXIMUM_THROUGHPUT_VALUE_LABELS));
+  const pointTargets = displayPoints.map((point, index) => {
+    const coordinate = coordinates[index];
+    const value = values[index];
+    const previousValue = values[index - 1] ?? value;
+    const nextValue = values[index + 1] ?? value;
+    const isLocalMinimum = index > 0 && index < values.length - 1 && value <= previousValue && value <= nextValue;
+    const labelY = isLocalMinimum
+      ? Math.min(top + usableHeight - 4, coordinate.y + 17)
+      : Math.max(top + 10, coordinate.y - 9);
+    const labelClass = isLocalMinimum ? "throughput-chart-value is-below" : "throughput-chart-value";
+    const showLabel = index === 0 || index === displayPoints.length - 1 || index % labelStride === 0;
+    return `${showLabel ? `<text class="${labelClass}" x="${coordinate.x.toFixed(2)}" y="${labelY.toFixed(2)}" text-anchor="middle">${value.toFixed(1)}</text>` : ""}<circle class="throughput-chart-point" cx="${coordinate.x.toFixed(2)}" cy="${coordinate.y.toFixed(2)}" r="${displayPoints.length > 36 ? "1.8" : "2.6"}"/>`;
+  }).join("");
+
+  return `
+        <svg class="throughput-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${title}，最新为第 ${latest.completedWaferIndex} 片，每小时 ${latest.throughputPerHour.toFixed(1)} 片">
+          <g class="throughput-control-lines">
+            <line class="throughput-mean-line" x1="${left}" y1="${meanY.toFixed(2)}" x2="${width - right}" y2="${meanY.toFixed(2)}"/>
+          </g>
+          <path class="throughput-chart-line" d="${linePath}"/>
+          ${pointTargets}
+          <circle class="throughput-chart-latest" cx="${coordinates[coordinates.length - 1].x.toFixed(2)}" cy="${coordinates[coordinates.length - 1].y.toFixed(2)}" r="4"/>
+        </svg>`;
+}
+
+/** 将逐片产能点绘制为可切换范围的交互式 SVG 曲线。 */
+function renderThroughputLine(
+  points: ThroughputTimelinePoint[],
+  chartKey: string,
+  title: string,
+  visible: boolean,
+  initialRange = "wafer:30",
+): string {
+  const serializedPoints = escapeHtml(JSON.stringify(points));
+  const visiblePoints = filterThroughputPoints(points, initialRange);
+  return `
+    <div class="throughput-chart" data-throughput-chart="${chartKey}" data-throughput-title="${escapeHtml(title)}" data-throughput-points="${serializedPoints}"${visible ? "" : " hidden"}>
+      <div class="throughput-chart-scroll" tabindex="0" aria-label="${escapeHtml(title)}，逐点展示产能数值">
+        <div class="throughput-chart-canvas">${renderThroughputSvg(visiblePoints, title)}</div>
+      </div>
+    </div>`;
+}
+
+/** 在不重新请求分析接口的情况下，按选择范围刷新当前产能图。 */
+export function updateThroughputChartRange(chart: HTMLElement, range: string): void {
+  const rawPoints = chart.dataset.throughputPoints;
+  const chartKey = chart.dataset.throughputChart ?? "throughput";
+  const title = chart.dataset.throughputTitle ?? "产能曲线";
+  if (!rawPoints) return;
+  const points = filterThroughputPoints(JSON.parse(rawPoints) as ThroughputTimelinePoint[], range);
+  const canvas = chart.querySelector<HTMLElement>(".throughput-chart-canvas");
+  if (!canvas || !points.length) return;
+  canvas.innerHTML = renderThroughputSvg(points, title);
+}
+
+/** 渲染从仿真零点累计或按用户选择的 2–10 片窗口计算的逐片产能趋势。 */
+export function renderThroughputChart(performance: SchedulePerformance): string {
+  const timeline = performance.throughputTimeline;
+  const helpButton = `<button class="analysis-secondary-button throughput-analysis-help" id="throughputAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="throughputAnalysisHelpDialog"><span aria-hidden="true">ⓘ</span> 说明</button>`;
+  if (!timeline?.cumulative?.length) {
+    return `
+      <header class="analysis-section-head throughput-chart-head"><div class="analysis-section-title"><strong>产能分析</strong></div>${helpButton}</header>
+      <div class="analysis-empty-state"><strong>暂无生产数据</strong><span>请等待新的晶圆完成后查看分析结果。</span></div>`;
+  }
+  const cumulative = timeline.cumulative;
+  const minimumWindow = timeline.rollingWindowMinimum;
+  const maximumWindow = timeline.rollingWindowMaximum;
+  const defaultWindow = Math.min(Math.max(5, minimumWindow), maximumWindow);
+  const windowOptions = Array.from(
+    { length: maximumWindow - minimumWindow + 1 },
+    (_, index) => minimumWindow + index,
+  );
+  const lastCumulative = cumulative[cumulative.length - 1];
+  const summary = (chartKey: string, content: string, visible: boolean): string => (
+    `<div class="analysis-compact-stats throughput-chart-summary" data-throughput-summary="${chartKey}"${visible ? "" : " hidden"}>${content}</div>`
+  );
+  const rollingContent = windowOptions.map(windowSize => {
+    const points = timeline.rollingByWindow[String(windowSize)] ?? [];
+    const latest = points[points.length - 1];
+    const average = points.length
+      ? points.reduce((sum, point) => sum + point.throughputPerHour, 0) / points.length
+      : 0;
+    return summary(
+      `rolling-${windowSize}`,
+      latest
+        ? `<span><small>最新</small><b>${latest.throughputPerHour.toFixed(1)}</b><em>片/h</em></span><span><small>平均</small><b>${average.toFixed(1)}</b><em>片/h</em></span>`
+        : `<span class="is-muted"><small>样本状态</small><b>不足</b><em>至少 ${windowSize + 1} 片</em></span>`,
+      windowSize === defaultWindow,
+    );
+  }).join("");
+  const rollingCharts = windowOptions.map(windowSize => {
+    const points = timeline.rollingByWindow[String(windowSize)] ?? [];
+    const chartKey = `rolling-${windowSize}`;
+    return points.length
+      ? renderThroughputLine(points, chartKey, `${windowSize} 片滑动窗口产能曲线`, windowSize === defaultWindow)
+      : `<div class="throughput-chart-empty" data-throughput-chart="${chartKey}" hidden>尚未形成完整 ${windowSize} 片滑动窗口。</div>`;
+  }).join("");
+  const cumulativeAverage = cumulative.reduce((sum, point) => sum + point.throughputPerHour, 0) / cumulative.length;
+  return `
+    <header class="analysis-section-head throughput-chart-head">
+      <div class="analysis-section-title"><strong>产能分析</strong></div>
+      <div class="analysis-filter-group">
+      <label class="analysis-filter throughput-metric-control"><select id="throughputMetricSelect" aria-label="选择产能口径">
+        <option value="cumulative">累计产能（公司口径）</option>
+        <option value="rolling" selected>滑动窗口</option>
+      </select></label>
+      <label class="analysis-filter throughput-window-control" data-throughput-window-control><select id="throughputWindowSize" aria-label="滑动窗口大小">${windowOptions.map(windowSize => `<option value="${windowSize}"${windowSize === defaultWindow ? " selected" : ""}>${windowSize} 片</option>`).join("")}</select></label>
+      <label class="analysis-filter throughput-range-control"><select id="throughputRangeSelect" aria-label="选择产能图显示范围"><option value="wafer:30" selected>最近 30 片</option><option value="wafer:60">最近 60 片</option><option value="wafer:120">最近 120 片</option><option value="time:600">最近 10 分钟</option><option value="time:1800">最近 30 分钟</option><option value="all">全部</option></select></label>
+      </div>
+      ${summary("cumulative", `<span><small>最新</small><b>${lastCumulative.throughputPerHour.toFixed(1)}</b><em>片/h</em></span><span><small>平均</small><b>${cumulativeAverage.toFixed(1)}</b><em>片/h</em></span><span><small>时刻</small><b>${formatSeconds(lastCumulative.completedAt)}</b><em>s</em></span>`, false)}
+      ${rollingContent}
+      ${helpButton}
+    </header>
+    <div class="throughput-chart-body">
+      <div class="analysis-chart-legend" aria-label="产能图图例"><span><i class="legend-current"></i>当前产能</span><span><i class="legend-average"></i>显示范围平均</span></div>
+      ${renderThroughputLine(cumulative, "cumulative", "累计产能曲线", false)}
+      ${rollingCharts}
+    </div>`;
+}
+
 /** 绘制排程诊断面板 —— 总览、逐片驻留与瓶颈分析。 */
 export function renderSchedulePerformance(performance: SchedulePerformance): string {
-  const window = performance.window;
   // 兼容缓存的旧分析响应：服务端升级前的结果没有这个字段，也应能打开结果页。
   const loadLockEfficiency = performance.loadLockEfficiency ?? {
     cycleCount: 0,
@@ -3202,48 +3706,47 @@ export function renderSchedulePerformance(performance: SchedulePerformance): str
     fullLoadCycleRatio: 0,
     emptyLoadCycleRatio: 0,
   };
+  const kpiCard = (
+    label: string,
+    value: string,
+    unit: string,
+    detail: string,
+    cardClass = "",
+  ): string => `
+    <article class="performance-kpi-card ${cardClass}">
+      <div class="performance-kpi-label">
+        <span>${label}</span>
+        <span class="performance-kpi-help" tabindex="0" aria-label="${escapeHtml(detail)}">
+          <i aria-hidden="true">i</i><span class="performance-kpi-tooltip" role="tooltip">${detail}</span>
+        </span>
+      </div>
+      <div class="performance-kpi-value"><strong>${value}</strong>${unit ? `<small>${unit}</small>` : ""}</div>
+    </article>`;
+  const primaryBottleneck = performance.primaryBottleneck;
+  const bottleneckUtilization = primaryBottleneck?.utilization ?? performance.bottleneck?.utilization ?? null;
+  const bottleneckDetail = bottleneckUtilization !== null
+    ? "当前统计窗口内最高的资源利用率"
+    : "当前统计窗口内未形成明确瓶颈";
   return `
     <section class="result-card overview-card">
-      <header class="overview-head"><strong>KPI 总览</strong></header>
       <div class="performance-summary">
-        <div>
-          <span>统计窗口</span>
-          <strong>${escapeHtml(window.label)} · ${formatSeconds(window.duration)} s</strong>
-          <small>剔除开头 ${formatSeconds(window.trimmedStart)} s / 结尾 ${formatSeconds(window.trimmedEnd)} s</small>
-        </div>
-        <div>
-          <span>产能</span>
-          <strong>${performance.throughputPerHour > 0 ? `${performance.throughputPerHour.toFixed(1)} 片/h` : "—"}</strong>
-          <small>${performance.throughputSampleCount
-            ? `固定 ${performance.throughputSampleCount} 片样本 · 剔除前 15 片 · 完工片数严格大于 150`
-            : escapeHtml(performance.throughputReason || "样本不足，完工片数必须大于 150")}</small>
-        </div>
-        <div>
-          <span>LoadLock 利用效率</span>
-          <strong>${loadLockEfficiency.cycleCount ? `${loadLockEfficiency.wafersPerCycle.toFixed(2)} 片/周期` : "—"}</strong>
-          <small>${loadLockEfficiency.cycleCount
-            ? `${loadLockEfficiency.waferCycleCount} 片·周期 / ${loadLockEfficiency.cycleCount} 个完整抽充气周期 · 满载 ${formatPercent(loadLockEfficiency.fullLoadCycleRatio)}（${loadLockEfficiency.fullLoadCycleCount}/${loadLockEfficiency.cycleCount}）· 空载 ${formatPercent(loadLockEfficiency.emptyLoadCycleRatio)}（${loadLockEfficiency.emptyLoadCycleCount}/${loadLockEfficiency.cycleCount}）`
-            : "没有完整的抽气—充气周期"}</small>
-        </div>
-        <div>
-          <span>CPU Time</span>
-          <strong>${Number.isFinite(performance.cpuTimeMs) ? `${Number(performance.cpuTimeMs).toFixed(1)} ms` : "—"}</strong>
-          <small>本次运行累计 CPU 时间</small>
-        </div>
-        <div>
-          <span>平均重算时间</span>
-          <strong>${Number.isFinite(performance.averageRecomputeTimeMs) ? `${Number(performance.averageRecomputeTimeMs).toFixed(1)} ms` : "—"}</strong>
-          <small>${performance.recomputeCount ? `CPU Time / ${performance.recomputeCount} 次重算` : "没有重算轮次"}</small>
-        </div>
+        ${kpiCard("产能", performance.throughputPerHour > 0 ? performance.throughputPerHour.toFixed(1) : "—", performance.throughputPerHour > 0 ? "片/h" : "", performance.throughputSampleCount ? `居中 ${performance.throughputSampleCount} 片稳态样本` : escapeHtml(performance.throughputReason || "样本不足，完工片数必须大于 150"), "is-primary")}
+        ${kpiCard("平均重算时间", Number.isFinite(performance.averageRecomputeTimeMs) ? Number(performance.averageRecomputeTimeMs).toFixed(1) : "—", Number.isFinite(performance.averageRecomputeTimeMs) ? "ms" : "", performance.recomputeCount ? `CPU Time / ${performance.recomputeCount} 次重算` : "没有重算轮次")}
+        ${kpiCard("瓶颈利用率", bottleneckUtilization !== null ? formatPercent(bottleneckUtilization) : "—", "", bottleneckDetail)}
+        ${kpiCard("LoadLock 利用效率", loadLockEfficiency.cycleCount ? loadLockEfficiency.wafersPerCycle.toFixed(2) : "—", loadLockEfficiency.cycleCount ? "片/周期" : "", loadLockEfficiency.cycleCount ? `${loadLockEfficiency.cycleCount} 个完整周期 · 满载 ${formatPercent(loadLockEfficiency.fullLoadCycleRatio)} · 空载 ${formatPercent(loadLockEfficiency.emptyLoadCycleRatio)}` : "没有完整的抽气—充气周期")}
       </div>
     </section>
 
-    <section class="result-card wafer-residence-card">
-      ${renderWaferResidenceChart(performance)}
+    <section class="result-card throughput-analysis-card">
+      ${renderThroughputChart(performance)}
     </section>
 
     <section class="result-card bottleneck-analysis-card">
       ${renderBottleneckAnalysis(performance)}
+    </section>
+
+    <section class="result-card wafer-residence-card">
+      ${renderWaferResidenceChart(performance)}
     </section>
 
     `;
@@ -3257,15 +3760,11 @@ export class VisualizationWorkspace {
   private analysisRoutes: Array<Record<string, any>> = [];
   private analysisRounds: Array<Record<string, any>> = [];
   private moves: MoveRecord[] = [];
-  private decisionTrace: DecisionTraceStep[] = [];
   private replayPlan: Record<string, any> | null = null;
-  private recommendationModel: RecommendationModel = "e2e-ctq";
+  private actionStatusFilters: ActionDiagnosticStatus[] = ["enabled"];
   private liveDecision: DecisionTraceStep | null = null;
   private liveDecisionKey = "";
-  private decisionBoundaries: number[] = [];
   private primitiveDecisionBoundaries: number[] = [];
-  private pauseOnDecisionChange = false;
-  private pauseTriggeredByDecisionChange = false;
   private readonly replayDecisionCache = new Map<string, DecisionTraceStep>();
   private readonly pendingReplayDecisionKeys = new Set<string>();
   private replayDecisionErrorKey = "";
@@ -3282,8 +3781,6 @@ export class VisualizationWorkspace {
   private time = 0;
   private playing = false;
   private liveSolving = false;
-  /** 外部（Schedule-AlphaGo 搜索面板）接管右侧决策镜头时跳过本类每帧覆盖。 */
-  private externalDecisionLensOwner = false;
   private playbackSpeed = DEFAULT_PLAYBACK_SPEED;
   private performanceWindowMode: PerformanceWindowMode = "steady";
   private animationFrame = 0;
@@ -3295,8 +3792,6 @@ export class VisualizationWorkspace {
     this.elements = collectElements(root);
     this.bindEvents();
     this.updatePlayButton();
-    this.updatePauseOnDecisionChangeButton();
-    this.updateRecommendationModelControl();
     this.setTopologyVisible(false);
   }
 
@@ -3402,26 +3897,19 @@ export class VisualizationWorkspace {
     this.replayDecisionErrorMessage = "";
     this.liveDecision = null;
     this.liveDecisionKey = "";
-    this.decisionBoundaries = decisionBoundaryTimes(this.moves);
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     this.replayDecisionRequestVersion += 1;
     if (this.moves.length) this.render();
   }
 
-  /** 让 Schedule-AlphaGo 搜索面板接管右侧“合法动作空间”的渲染。 */
-  setExternalDecisionLensOwner(owner: boolean): void {
-    this.externalDecisionLensOwner = owner;
-  }
-
   /** 在完整 MoveList 返回前显示初始拓扑，并进入增量求解状态。 */
   beginLiveSolve(
     plan: Record<string, any>,
-    sourceName = "Schedule-AlphaGo 实时求解",
+    sourceName = "Search Tree 实时求解",
   ): void {
     this.pause();
     this.liveSolving = true;
     this.moves = [];
-    this.decisionTrace = [];
     this.sourceName = sourceName;
     this.resultUrl = "";
     this.analysisResultId = "";
@@ -3453,7 +3941,6 @@ export class VisualizationWorkspace {
     const previousTime = this.time;
     this.pause();
     this.moves = normalizeMovePayload({ MoveList: rawMoves });
-    this.decisionBoundaries = decisionBoundaryTimes(this.moves);
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     const latestSnapshot = buildWorkspaceSnapshot(
       this.moves,
@@ -3534,10 +4021,8 @@ export class VisualizationWorkspace {
     this.pause();
     this.liveSolving = false;
     this.moves = [];
-    this.decisionTrace = [];
     this.liveDecision = null;
     this.liveDecisionKey = "";
-    this.decisionBoundaries = [];
     this.primitiveDecisionBoundaries = [];
     this.replayDecisionCache.clear();
     this.pendingReplayDecisionKeys.clear();
@@ -3580,7 +4065,7 @@ export class VisualizationWorkspace {
   /** 接收规范化后的 MoveList 并重置时间轴。 */
   private async loadMoves(
     moves: MoveRecord[],
-    decisionTrace: DecisionTraceStep[],
+    _decisionTrace: DecisionTraceStep[],
     sourceName: string,
     resultUrl: string,
     analysisResultId: string,
@@ -3591,9 +4076,7 @@ export class VisualizationWorkspace {
     this.pause();
     this.liveSolving = false;
     this.moves = moves;
-    this.decisionBoundaries = decisionBoundaryTimes(moves);
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(moves);
-    this.decisionTrace = alignOriginalDecisionTraceToMoves(decisionTrace, moves);
     this.liveDecision = null;
     this.liveDecisionKey = "";
     this.replayDecisionCache.clear();
@@ -3623,7 +4106,6 @@ export class VisualizationWorkspace {
     this.elements.resultButton.disabled = false;
     this.showSingleResult();
     this.setTopologyVisible(true);
-    this.updateRecommendationModelControl();
     this.render(snapshot);
     await this.renderPerformance();
   }
@@ -3646,25 +4128,12 @@ export class VisualizationWorkspace {
       if (this.playing) this.pause();
       else this.play();
     });
-    this.elements.pauseOnDecisionChangeButton.addEventListener("click", () => {
-      this.pauseOnDecisionChange = !this.pauseOnDecisionChange;
-      this.pauseTriggeredByDecisionChange = false;
-      this.updatePauseOnDecisionChangeButton();
-    });
-    this.elements.recommendationModel.addEventListener("change", () => {
-      this.recommendationModel = this.elements.recommendationModel.value === "dual-actor-e2e"
-        ? "dual-actor-e2e"
-        : "e2e-ctq";
-      this.liveDecision = null;
-      this.liveDecisionKey = "";
-      this.pendingReplayDecisionKeys.clear();
-      this.replayDecisionErrorKey = "";
-      this.replayDecisionErrorMessage = "";
-      this.replayDecisionRequestVersion += 1;
-      this.updateRecommendationModelControl();
-      this.updatePauseOnDecisionChangeButton();
+    this.elements.actionStatusFilters.forEach(filter => filter.addEventListener("change", () => {
+      this.actionStatusFilters = this.elements.actionStatusFilters
+        .filter(item => item.checked)
+        .map(item => item.value as ActionDiagnosticStatus);
       this.render();
-    });
+    }));
     this.elements.speed.addEventListener("change", () => {
       this.playbackSpeed = Math.max(0.25, finiteNumber(this.elements.speed.value, DEFAULT_PLAYBACK_SPEED));
     });
@@ -3687,7 +4156,6 @@ export class VisualizationWorkspace {
       this.elements.range.value = "0";
     }
     this.playing = true;
-    this.pauseTriggeredByDecisionChange = false;
     this.previousFrameTime = performance.now();
     this.previousRenderTime = 0;
     this.updatePlayButton();
@@ -3695,13 +4163,11 @@ export class VisualizationWorkspace {
   }
 
   /** 暂停回放并保留当前时间。 */
-  private pause(triggeredByDecisionChange = false): void {
+  private pause(): void {
     this.playing = false;
-    this.pauseTriggeredByDecisionChange = triggeredByDecisionChange;
     if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
     this.animationFrame = 0;
     this.updatePlayButton();
-    this.updatePauseOnDecisionChangeButton();
   }
 
   /** 推进播放时钟，并按固定上限刷新 DOM。 */
@@ -3710,22 +4176,9 @@ export class VisualizationWorkspace {
     const elapsedSeconds = Math.max(0, timestamp - this.previousFrameTime) / 1000;
     this.previousFrameTime = timestamp;
     const endTime = finiteNumber(this.elements.range.max);
-    const previousTime = this.time;
-    const advancedTime = Math.min(endTime, previousTime + elapsedSeconds * this.playbackSpeed);
-    const nextDecisionBoundary = this.pauseOnDecisionChange
-      ? this.currentDecisionBoundaries().find(boundary => (
-          boundary > previousTime + PERFORMANCE_DISPLAY_TOLERANCE
-          && boundary <= advancedTime + PERFORMANCE_DISPLAY_TOLERANCE
-        ))
-      : undefined;
-    this.time = nextDecisionBoundary ?? advancedTime;
+    const advancedTime = Math.min(endTime, this.time + elapsedSeconds * this.playbackSpeed);
+    this.time = advancedTime;
     this.elements.range.value = String(this.time);
-    if (nextDecisionBoundary !== undefined) {
-      this.previousRenderTime = timestamp;
-      this.render();
-      this.pause(true);
-      return;
-    }
     if (timestamp - this.previousRenderTime >= PLAYBACK_FRAME_INTERVAL_MS || this.time >= endTime) {
       this.previousRenderTime = timestamp;
       this.render();
@@ -3745,29 +4198,6 @@ export class VisualizationWorkspace {
       : `${icon("play")}<span>播放</span>`;
     this.elements.playButton.setAttribute("aria-label", this.playing ? "暂停回放" : "播放回放");
     this.elements.playButton.classList.toggle("is-playing", this.playing);
-  }
-
-  /** 同步决策空间自动暂停按钮的开关、触发状态和无障碍文本。 */
-  private updatePauseOnDecisionChangeButton(): void {
-    const state = this.pauseTriggeredByDecisionChange
-      ? "已暂停"
-      : this.pauseOnDecisionChange ? "已开启" : "已关闭";
-    const decisionKind = this.recommendationModel === "dual-actor-e2e"
-      ? "原子动作决策"
-      : "完整事务决策";
-    this.elements.pauseOnDecisionChangeButton.innerHTML = `
-      <span class="decision-switch-copy"><span>下一决策时暂停</span><strong>${state}</strong></span>
-      <span class="decision-switch-track" aria-hidden="true"><i></i></span>`;
-    this.elements.pauseOnDecisionChangeButton.setAttribute("aria-pressed", String(this.pauseOnDecisionChange));
-    this.elements.pauseOnDecisionChangeButton.setAttribute("aria-checked", String(this.pauseOnDecisionChange));
-    this.elements.pauseOnDecisionChangeButton.setAttribute(
-      "aria-label",
-      this.pauseTriggeredByDecisionChange
-        ? `已到达下一个${decisionKind}，回放已暂停`
-        : `到下一个${decisionKind}时自动暂停：${this.pauseOnDecisionChange ? "已开启" : "已关闭"}`,
-    );
-    this.elements.pauseOnDecisionChangeButton.classList.toggle("is-active", this.pauseOnDecisionChange);
-    this.elements.pauseOnDecisionChangeButton.classList.toggle("is-triggered", this.pauseTriggeredByDecisionChange);
   }
 
   /** 切换单例分析模式，测试组统计与单例诊断不会同时出现。 */
@@ -3809,20 +4239,11 @@ export class VisualizationWorkspace {
       this.liveDecision = cachedDecision;
       this.liveDecisionKey = replayKey;
     }
-    const traceDecision = decisionAtTime(this.decisionTrace, snapshot.time);
-    const compatibleTraceDecision = traceDecision?.model === this.recommendationModel
-      ? traceDecision
-      : null;
-    const originalDecisionTraceAvailable = this.hasOriginalDecisionTrace();
-    const currentDecision = originalDecisionTraceAvailable
-      ? compatibleTraceDecision
-      : cachedDecision
-        ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null)
-        ?? compatibleTraceDecision;
+    const currentDecision = cachedDecision
+      ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null);
     if (
       this.replayPlan
       && !this.liveSolving
-      && !originalDecisionTraceAvailable
       && !cachedDecision
       && this.liveDecisionKey !== replayKey
       && !this.pendingReplayDecisionKeys.has(replayKey)
@@ -3840,16 +4261,19 @@ export class VisualizationWorkspace {
       undefined,
       this.device,
     );
-    if (!this.externalDecisionLensOwner) {
-      const requestState = this.pendingReplayDecisionKeys.has(replayKey)
-        ? "loading"
-        : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
-      this.elements.decisionLens.innerHTML = renderDecisionLens(
-        currentDecision,
-        requestState,
-        this.replayDecisionErrorMessage,
-      );
-    }
+    const topologyCanvas = this.elements.stage.querySelector<HTMLElement>(".reference-grid-canvas");
+    const canvasHeight = topologyCanvas?.style.getPropertyValue("--topology-canvas-height") ?? "";
+    this.elements.frontSlotOverview.style.setProperty("--topology-canvas-height", canvasHeight);
+    this.elements.frontSlotOverview.innerHTML = renderFrontSlotOverview(topologySnapshot.modules);
+    const requestState = this.pendingReplayDecisionKeys.has(replayKey)
+      ? "loading"
+      : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
+    this.elements.decisionLens.innerHTML = renderDecisionLens(
+      currentDecision,
+      requestState,
+      this.replayDecisionErrorMessage,
+      this.actionStatusFilters,
+    );
 
     this.elements.activeMoves.innerHTML = snapshot.activeMoves.length
       ? snapshot.activeMoves.map(move => `
@@ -3862,32 +4286,7 @@ export class VisualizationWorkspace {
       : '<li class="active-move-empty">当前时刻没有执行中的动作</li>';
   }
 
-  /** 同步推荐模型选择说明；双 Actor 明确提示两端互不混排。 */
-  private updateRecommendationModelControl(): void {
-    this.elements.recommendationModel.value = this.recommendationModel;
-    if (this.hasOriginalDecisionTrace()) {
-      this.elements.recommendationModelHint.textContent = this.recommendationModel === "dual-actor-e2e"
-        ? "显示本次调度保存的大气端、真空端原始提案和最终执行动作。"
-        : "显示本次调度保存的原始 E2E 联合动作决策。";
-      return;
-    }
-    this.elements.recommendationModelHint.textContent = this.recommendationModel === "dual-actor-e2e"
-      ? "按当前物理时刻重新评估两端原子动作；这是回放重评估，不代表原计划当时选择。"
-      : "按当前物理时刻重新评估完整 Pick + Place / Swap 事务。";
-  }
-
-  /** 当前结果是否保存了与所选策略一致、可审计的原始模型轨迹。 */
-  private hasOriginalDecisionTrace(): boolean {
-    const planStrategy = String(this.replayPlan?.strategy ?? "");
-    const strategyCompatible = !planStrategy
-      || planStrategy === this.recommendationModel;
-    return strategyCompatible && this.decisionTrace.some(step => (
-      step.model === this.recommendationModel
-      && !step.replayEvaluated
-    ));
-  }
-
-  /** 返回不晚于当前时刻、符合当前模型决策粒度的最近边界。 */
+  /** 返回不晚于当前时刻的最近原子动作边界。 */
   private replayDecisionTime(time: number): number {
     let decisionTime = 0;
     for (const boundary of this.currentDecisionBoundaries()) {
@@ -3897,16 +4296,14 @@ export class VisualizationWorkspace {
     return decisionTime;
   }
 
-  /** E2E 按完整事务，双 Actor 按原子机器人动作选择各自的回放边界。 */
+  /** 动作接口在每个 Pick、Place、Swap 完成边界更新。 */
   private currentDecisionBoundaries(): number[] {
-    return this.recommendationModel === "dual-actor-e2e"
-      ? this.primitiveDecisionBoundaries
-      : this.decisionBoundaries;
+    return this.primitiveDecisionBoundaries;
   }
 
-  /** 每个模型在自身决策边界只执行一次前向。 */
+  /** 每个原子动作边界只请求一次算法接口。 */
   private replayStateKey(replayTime: number): string {
-    return `${this.recommendationModel}@${replayTime.toFixed(6)}`;
+    return `actions@${replayTime.toFixed(6)}`;
   }
 
   /** 异步请求当前 Machine 候选；过期响应不会覆盖用户已经拖到的新时刻。 */
@@ -3923,7 +4320,6 @@ export class VisualizationWorkspace {
         resultId: this.analysisResultId || undefined,
         moves: this.analysisResultId ? undefined : this.moves,
         plan: this.replayPlan,
-        recommendationModel: this.recommendationModel,
         time: replayTime,
       });
       const decision = normalizeDecisionTrace({ DecisionTrace: [rawDecision] })[0] ?? null;
@@ -3957,7 +4353,11 @@ export class VisualizationWorkspace {
   private async renderPerformance(): Promise<void> {
     if (!this.moves.length) return;
     const requestVersion = ++this.analysisRequestVersion;
-    this.elements.performance.innerHTML = '<div class="visual-loader" aria-label="正在分析"></div>';
+    this.elements.performance.innerHTML = `
+      <section class="result-card analysis-skeleton" aria-label="正在加载结果分析">
+        <div class="analysis-skeleton-head"><i></i><span></span></div>
+        <div class="analysis-skeleton-grid">${Array.from({ length: 6 }, () => "<span></span>").join("")}</div>
+      </section>`;
     try {
       const result = await requestScheduleAnalysis({
         ...(this.analysisResultId
@@ -3980,15 +4380,22 @@ export class VisualizationWorkspace {
         this.elements.performanceWindow.tabIndex = 0;
         windowSlot.append(this.elements.performanceWindow);
       }
+      this.elements.performance.querySelectorAll<HTMLElement>(".residence-metric-scroll").forEach(scroller => {
+        scroller.scrollLeft = scroller.scrollWidth;
+      });
     } catch (error) {
       if (requestVersion !== this.analysisRequestVersion) return;
       this.analysis = null;
       this.bottleneckSummary = null;
       this.elements.performance.innerHTML = `
-        <div class="visual-empty is-error">
-          <strong>结果分析失败</strong>
+        <div class="analysis-error-state">
+          <strong>数据获取失败</strong>
           <span>${escapeHtml(error instanceof Error ? error.message : String(error))}</span>
+          <button class="analysis-secondary-button" type="button" data-performance-retry>重新加载</button>
         </div>`;
+      this.elements.performance.querySelector<HTMLButtonElement>("[data-performance-retry]")?.addEventListener("click", () => {
+        void this.renderPerformance();
+      });
     }
   }
 

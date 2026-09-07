@@ -43,8 +43,10 @@ ALGORITHM_ROOT = ROOT / "alg"
 DEVICE_PATH = ALGORITHM_ROOT / "dataset" / "input_data" / "s1-1c2p-reschedule.json"
 PSE300_PATH = ALGORITHM_ROOT / "dataset" / "input_data" / "PSE300.json"
 EDITOR_PATH = ROOT / "realtime_scheduler" / "frontend" / "config_editor.html"
+DOCUMENTATION_PAGE_PATH = ROOT / "realtime_scheduler" / "frontend" / "documentation.html"
 EDITOR_STYLE_PATH = ROOT / "realtime_scheduler" / "frontend" / "assets" / "config_editor.css"
 EDITOR_SCRIPT_PATH = ROOT / "realtime_scheduler" / "frontend" / "src" / "config_editor.ts"
+DOCUMENTATION_SCRIPT_PATH = ROOT / "realtime_scheduler" / "frontend" / "src" / "documentation_page.ts"
 
 
 def _editor_source() -> str:
@@ -100,6 +102,22 @@ def _job(name: str, route: str, load_port: str) -> dict:
 
 class FrontendTemplateTests(unittest.TestCase):
     """验证不依赖算法数据夹具的前端模板与样式约束。"""
+
+    def test_documentation_uses_a_standalone_page(self) -> None:
+        """使用文档应从主控制台页签迁移为可直接打开的独立页面。"""
+        editor_template = EDITOR_PATH.read_text(encoding="utf-8")
+        documentation_template = DOCUMENTATION_PAGE_PATH.read_text(encoding="utf-8")
+        editor_source = EDITOR_SCRIPT_PATH.read_text(encoding="utf-8")
+        documentation_source = DOCUMENTATION_SCRIPT_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('href="/documentation.html"', editor_template)
+        self.assertIn('target="_blank"', editor_template)
+        self.assertNotIn('data-tab-target="documentation"', editor_template)
+        self.assertNotIn('data-tab-view="documentation"', editor_template)
+        self.assertNotIn("createDocumentationView", editor_source)
+        self.assertIn('id="documentationRoot"', documentation_template)
+        self.assertIn('src="/assets/documentation_page.js?v=1.5.34"', documentation_template)
+        self.assertIn('createDocumentationView(documentationRoot).load()', documentation_source)
 
     def test_workspace_switches_do_not_enter_global_pending_lock(self) -> None:
         """设备和测试组切换不得用全局等待锁重绘并禁用自身选择器。"""
@@ -259,18 +277,19 @@ class FrontendTemplateTests(unittest.TestCase):
         self.assertIn("if (testSaveInFlight)", script)
         self.assertIn("revision === testEditRevision", script)
 
-    def test_groups_alphago_options_without_external_summary(self) -> None:
-        """AlphaGo 参数应在弹窗内分组展示，外层入口不再渲染配置摘要。"""
+    def test_groups_search_tree_options_without_external_summary(self) -> None:
+        """Search Tree 外层只保留模型入口，搜索预算由生产后端统一管理。"""
         template = EDITOR_PATH.read_text(encoding="utf-8")
         style = EDITOR_STYLE_PATH.read_text(encoding="utf-8")
         script = EDITOR_SCRIPT_PATH.read_text(encoding="utf-8")
 
-        for heading in ("搜索预算", "搜索行为", "策略价值模型"):
-            self.assertIn(heading, template)
-        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", style)
-        self.assertIn("@media (max-width: 620px)", style)
-        self.assertNotIn("alphagoSettingsSummary", template)
-        self.assertNotIn("renderAlphaGoSettingsSummary", script)
+        self.assertIn("策略价值模型", template)
+        self.assertIn("选择 Search Tree 模型", template)
+        self.assertIn("search-tree-settings-card", style)
+        self.assertNotIn("searchTreeBeamWidth", template)
+        self.assertNotIn("searchTreeDecisionSeconds", template)
+        self.assertNotIn("search-treeSettingsSummary", template)
+        self.assertNotIn("renderSearchTreeSettingsSummary", script)
 
     def test_keeps_scheduling_configuration_while_switching_tests(self) -> None:
         """同一页面会话切换测试时，策略与 checkpoint 不应被测试集默认值覆盖。"""
@@ -547,19 +566,19 @@ class RecomputeFailureOutputTests(unittest.TestCase):
         self.assertIn("!rec.removedByRecompute", viewer)
         self.assertIn('fillOpacity = bar.rec.removedByRecompute ? "0.24" : "1"', viewer)
 
-    def test_frontend_version_and_cache_keys_are_1_5_27(self) -> None:
+    def test_frontend_version_and_cache_keys_are_1_5_40(self) -> None:
         """前端显示版本、包版本和主资源缓存键必须同步。"""
         frontend_root = ROOT / "realtime_scheduler" / "frontend"
         template = (frontend_root / "config_editor.html").read_text(encoding="utf-8")
         package = json.loads((frontend_root / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((frontend_root / "package-lock.json").read_text(encoding="utf-8"))
 
-        self.assertEqual("1.5.29", package["version"])
-        self.assertEqual("1.5.29", package_lock["version"])
-        self.assertEqual("1.5.29", package_lock["packages"][""]["version"])
-        self.assertIn('class="frontend-version">V1.5.29</span>', template)
-        self.assertIn('/assets/config_editor.css?v=1.5.29', template)
-        self.assertIn('/assets/config_editor.js?v=1.5.29', template)
+        self.assertEqual("1.5.40", package["version"])
+        self.assertEqual("1.5.40", package_lock["version"])
+        self.assertEqual("1.5.40", package_lock["packages"][""]["version"])
+        self.assertIn('class="frontend-version">V1.5.40</span>', template)
+        self.assertIn('/assets/config_editor.css?v=1.5.40', template)
+        self.assertIn('/assets/config_editor.js?v=1.5.40', template)
 
     def test_single_run_failure_card_does_not_duplicate_validation_issue(self) -> None:
         """状态推进校验失败只展示一条完整错误，不再重复渲染问题列表。"""
@@ -1893,6 +1912,23 @@ class ConfigEditorServerTests(unittest.TestCase):
         self.assertEqual(12, process_visit["QTimeLimit"])
         self.assertEqual(34, process_visit["ResidencyConstraint"])
 
+    def test_aligner_route_step_always_requires_process(self) -> None:
+        """AlgSchedule 中包含 Aligner 的 Step 必须下发 NeedProcess。"""
+        route = {
+            "name": "AlignRoute",
+            "stages": [
+                {"needProcess": False, "visits": [{"stationName": "LP1", "slotIds": "1"}]},
+                {"needProcess": False, "visits": [{"stationName": "ATR", "slotIds": "1"}]},
+                {"needProcess": False, "visits": [{"stationName": "Aligner1", "slotIds": "1"}]},
+                {"needProcess": False, "visits": [{"stationName": "ATR", "slotIds": "1"}]},
+                {"needProcess": False, "visits": [{"stationName": "LP1", "slotIds": "1"}]},
+            ],
+        }
+
+        built = build_route(route, {}, {}, {"ATR"})
+
+        self.assertTrue(built["RouteSteps"][2]["NeedProcess"])
+
     def test_route_default_slot_expands_for_dual_chamber_and_multi_slot_robot(self) -> None:
         """手动 Route 的默认槽位应按 PM 容量和 Arm 手槽容量一并展开。"""
         route = {
@@ -2298,7 +2334,7 @@ class ConfigEditorServerTests(unittest.TestCase):
         self.assertIn("<span>结果分析</span>", html)
         self.assertIn("<span>路径配置</span>", html)
         self.assertNotIn('data-tab-view="clean"', html)
-        self.assertIn('class="frontend-version">V1.5.29</span>', html)
+        self.assertIn('class="frontend-version">V1.5.40</span>', html)
         self.assertIn('data-option="residencyGuardSeconds"', html)
         self.assertIn('data-option="maximumRobotHoldingSeconds"', html)
         self.assertIn('data-option="maximumSystemResidenceCv"', html)
@@ -2624,6 +2660,11 @@ class ConfigEditorServerTests(unittest.TestCase):
             '<span class="eyebrow">测试组结果分析</span>',
         ):
             self.assertNotIn(removed_content, group_view_source)
+        self.assertIn("产能中位数", group_view_source)
+        self.assertIn("function throughputChart", group_view_source)
+        self.assertIn("<th>产能</th>", group_view_source)
+        self.assertNotIn("<th>吞吐</th>", group_view_source)
+        self.assertNotIn("出站表现中位数", group_view_source)
 
     def test_schedule_analysis_is_server_owned_without_frontend_dependencies(self) -> None:
         """MoveList 与测试组统计应由后端统一计算，页面只能请求 API。"""
@@ -4499,12 +4540,11 @@ class ConfigEditorServerTests(unittest.TestCase):
 
         self.assertIn("renderOtherAlgorithmOptions(status.algorithms", html)
         self.assertIn("algorithm.strategy", html)
-        self.assertIn('status.strategies?.["dual-actor-e2e"]', html)
         self.assertIn('"Validation / Dual Actor"', html)
-        self.assertIn('id="visualRecommendationModel"', html)
-        self.assertIn('双 Actor · 分域原子动作', html)
-        self.assertIn('candidateGroups', workspace_source)
-        self.assertIn('双 Actor · ${decision.replayEvaluated ? "回放重评估" : "原始模型决策"}', workspace_source)
+        self.assertIn('id="visualActionStatusFilter"', html)
+        self.assertIn('id="visualActionKindFilter"', html)
+        self.assertNotIn('id="visualRecommendationModel"', html)
+        self.assertIn('actionDiagnostics', workspace_source)
         self.assertIn("Pick、Place、Swap", metadata["dual-actor-e2e"]["introduction"])
         self.assertEqual(
             {"name", "introduction"},

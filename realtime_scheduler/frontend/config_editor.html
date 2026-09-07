@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>调度平台</title>
   <link rel="stylesheet" href="/assets/katex.min.css?v=1.4.4">
-  <link rel="stylesheet" href="/assets/config_editor.css?v=1.5.29">
+  <link rel="stylesheet" href="/assets/config_editor.css?v=1.5.40">
 </head>
 <body>
   <a class="skip-link" href="#mainContent">跳到主要内容</a>
@@ -33,14 +33,14 @@
         <button class="tab" data-tab-target="route" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h4a4 4 0 0 1 4 4v4"/></svg><span>路径配置</span>
         </button>
-        <button class="tab" data-tab-target="documentation" type="button">
+        <a class="tab" href="/documentation.html" target="_blank" rel="noopener">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h10l4 4v12H5z"/><path d="M15 4v4h4M8 12h8M8 16h6"/></svg><span>使用文档</span>
-        </button>
+        </a>
       </nav>
       <div class="sidebar-footer">
         <span class="sidebar-footer-label">系统状态</span>
         <div class="service-pill" id="serviceState">本地服务</div>
-        <span class="frontend-version">V1.5.29</span>
+        <span class="frontend-version">V1.5.40</span>
       </div>
     </aside>
 
@@ -227,10 +227,6 @@
                     </select>
                   </label>
                   <div class="topology-toolbar-actions" aria-label="回放工具">
-                    <div class="playback-mode-switch" role="group" aria-label="搜索求解模式">
-                      <button class="btn small is-active" id="playbackModeReplayButton" type="button" aria-pressed="true">回放模式</button>
-                      <button class="btn small" id="playbackModeStepButton" type="button" aria-pressed="false">步进模式</button>
-                    </div>
                     <button class="btn toolbar-import" id="visualImportButton" type="button" aria-label="导入 MoveList">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 15v5h14v-5"/></svg>
                       <span class="toolbar-label-full">导入 MoveList</span><span class="toolbar-label-compact">导入</span>
@@ -244,42 +240,21 @@
               </section>
 
               <div class="petri-console-layout">
+                <aside class="topology-front-slot-card" id="visualFrontSlotOverview" aria-label="设备正视槽位"></aside>
                 <main class="petri-center-column">
                   <section class="device-stage" id="visualDeviceStage" aria-label="设备拓扑状态"></section>
                 </main>
 
                 <aside class="petri-control-panel" aria-label="拓扑回放控制面板">
                   <section class="petri-control-section model-evaluation-section">
-                    <div class="decision-panel-toolbar">
-                      <h2 class="petri-panel-title">合法动作空间</h2>
-                      <button class="decision-auto-pause" id="visualPauseOnDecisionChangeButton" type="button" role="switch" aria-checked="false" aria-pressed="false"></button>
-                    </div>
-                    <label class="decision-model-control" id="visualRecommendationModelControl" for="visualRecommendationModel">
-                      <span>推荐模型</span>
-                      <select id="visualRecommendationModel" aria-describedby="visualRecommendationModelHint">
-                        <option value="e2e-ctq">E2E-CTQ · 联合动作</option>
-                        <option value="dual-actor-e2e">双 Actor · 分域原子动作</option>
-                      </select>
-                      <small id="visualRecommendationModelHint">对完整 Pick + Place / Swap 事务统一排序。</small>
-                    </label>
-                    <div class="search-telemetry-panel" id="searchTelemetryPanel" hidden aria-live="polite">
-                      <div class="search-telemetry-head">
-                        <p id="searchTelemetryStatus">等待搜索开始</p>
-                        <div class="search-telemetry-controls">
-                          <button class="btn small" id="searchTelemetryPauseButton" type="button">暂停</button>
-                          <button class="btn small" id="searchTelemetryStepButton" type="button">单步求解</button>
-                          <button class="btn primary small" id="searchTelemetryContinueButton" type="button">连续求解</button>
-                          <button class="btn primary small is-recommendation" id="searchTelemetryFollowRecommendationButton" type="button" hidden>执行模型推荐</button>
-                          <button class="btn small is-continuous-decision" id="searchTelemetryContinuousDecisionButton" type="button" aria-pressed="false" title="持续执行每一轮搜索的模型推荐动作" hidden>持续决策</button>
-                          <label>根决策<select id="searchTelemetryDecisionSelect" aria-label="选择要查看的根决策"></select></label>
-                        </div>
-                      </div>
+                    <h2 class="petri-panel-title">合法动作空间</h2>
+                    <div class="action-filter-controls" aria-label="动作筛选">
+                      <span class="action-filter-label">显示</span>
+                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="enabled" checked>使能动作</label>
+                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="physical-blocked">物理拦截</label>
+                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="deadlock-blocked">死锁规则拦截</label>
                     </div>
                     <div class="decision-lens-panel" id="visualDecisionLens" aria-live="polite"></div>
-                    <details class="search-variation-panel" id="searchTelemetryVariationPanel" hidden>
-                      <summary>当前主变化</summary>
-                      <div class="search-principal-variation" id="searchTelemetryVariation"></div>
-                    </details>
                     <ul id="visualActiveMoves" hidden></ul>
                   </section>
                 </aside>
@@ -346,6 +321,10 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="11" rx="3"/><path d="M12 3v4M8 12h.01M16 12h.01M8 18v3m8-3v3"/></svg>
                 <span><strong>机器手槽位</strong></span>
               </button>
+              <button class="device-config-nav-item" type="button" data-device-config-section="execution-time">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h3l2-6 4 12 2-6h5"/><path d="M4 20h16"/></svg>
+                <span><strong>执行时间</strong></span>
+              </button>
             </nav>
             <div class="device-config-content">
               <article class="panel device-timing-panel active" data-device-config-view="station-time">
@@ -396,15 +375,15 @@
                   <div class="robot-slot-grid" id="robotSlotList"></div>
                 </div>
               </article>
-            </div>
-          </div>
-        </div>
 
-        <div class="tab-view" data-tab-view="documentation">
-          <div class="documentation-root" id="documentationRoot">
-            <div class="documentation-state" role="status">
-              <strong>文档将在首次打开时加载</strong>
-              <p>正文只保存在本机 data 目录。</p>
+              <article class="panel device-timing-panel" data-device-config-view="execution-time" hidden>
+                <div class="panel-head device-timing-panel-head">
+                  <div><h2>实际执行时间</h2><p>配置固定值，或让实际时长围绕理论值波动。</p></div>
+                </div>
+                <div class="panel-body device-timing-body">
+                  <div id="deviceExecutionTimingEditor"></div>
+                </div>
+              </article>
             </div>
           </div>
         </div>
@@ -428,10 +407,10 @@
               <div class="field span-4"><label>系统停留时间 CV 上限</label><input data-option="maximumSystemResidenceCv" type="number" min="0" step="0.01" value="0"><div class="hint">CV = 标准差 ÷ 均值；例如 0.10 表示目标波动约 10%，0 表示不限制。</div></div>
               <div class="field span-12"><div class="hint">多指标模式会比较多套可执行启发式方案：优先减少驻留超限，再尽量达到持片和 CV 目标，最后比较 makespan。目标用于探索选优，不保证一定满足；运行时间也会比默认模式更长。</div></div>
             </div>
-            <div id="scheduleAlphaGoOptions" class="is-hidden" style="margin-top:14px">
-              <section class="alphago-settings-card" aria-labelledby="alphagoSettingsTitle">
-                <strong id="alphagoSettingsTitle">AlphaGo 策略价值模型</strong>
-                <button class="btn small" id="openScheduleAlphaGoOptionsDialogButton" type="button">选择模型</button>
+            <div id="searchTreeOptions" class="is-hidden" style="margin-top:14px">
+              <section class="search-tree-settings-card" aria-labelledby="search-treeSettingsTitle">
+                <strong id="search-treeSettingsTitle">Search Tree 策略价值模型</strong>
+                <button class="btn small" id="openSearchTreeOptionsDialogButton" type="button">选择模型</button>
               </section>
             </div>
           </div>
@@ -442,7 +421,7 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 8.97 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.52-1.03H3v-4h.08A1.7 1.7 0 0 0 4.6 8.94a1.7 1.7 0 0 0-.34-1.88L4.2 7l2.83-2.83.06.06a1.7 1.7 0 0 0 1.88.34A1.7 1.7 0 0 0 10 3.05V3h4v.05a1.7 1.7 0 0 0 1.03 1.52 1.7 1.7 0 0 0 1.88-.34l.06-.06L19.8 7l-.06.06a1.7 1.7 0 0 0-.34 1.88A1.7 1.7 0 0 0 20.92 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
               </button>
             </div>
-            <div class="run-actions"><button class="btn" id="runButton">▶ 运行当前测试</button><button class="btn" id="stepRunButton" title="以步进模式运行 Schedule-AlphaGo：每次决策完成后从 3 条稳定动作链中选择一条整体提交">⟳ 运行模型步进</button><button class="btn batch" id="batchRunButton">▦ 运行当前测试组</button></div>
+            <div class="run-actions"><button class="btn" id="runButton">▶ 运行当前测试</button><button class="btn batch" id="batchRunButton">▦ 运行当前测试组</button></div>
             <section class="run-status-card" id="runStatusCard" aria-labelledby="runStatusTitle">
               <div class="run-status-head">
                 <span class="run-status-indicator" id="runStatusIndicator" aria-hidden="true"></span>
@@ -491,29 +470,29 @@
     </section>
   </dialog>
 
-  <dialog id="scheduleAlphaGoOptionsDialog" aria-labelledby="scheduleAlphaGoOptionsDialogTitle">
-    <form class="dialog-body alphago-options-dialog-body" id="scheduleAlphaGoOptionsForm">
-      <header class="alphago-dialog-header">
+  <dialog id="searchTreeOptionsDialog" aria-labelledby="searchTreeOptionsDialogTitle">
+    <form class="dialog-body search-tree-options-dialog-body" id="searchTreeOptionsForm">
+      <header class="search-tree-dialog-header">
         <div>
-          <h3 id="scheduleAlphaGoOptionsDialogTitle">选择 AlphaGo 模型</h3>
+          <h3 id="searchTreeOptionsDialogTitle">选择 Search Tree 模型</h3>
           <p>前端只选择 checkpoint；搜索预算、动作数和 50 层稳定链上限由生产后端统一管理。</p>
         </div>
-        <span class="alphago-dialog-tag">模型</span>
+        <span class="search-tree-dialog-tag">模型</span>
       </header>
-      <div class="alphago-options-content">
-        <section class="alphago-option-group alphago-model-group" aria-labelledby="alphaGoModelGroupTitle">
-          <div class="alphago-option-group-head">
-            <h4 id="alphaGoModelGroupTitle">策略价值模型</h4>
+      <div class="search-tree-options-content">
+        <section class="search-tree-option-group search-tree-model-group" aria-labelledby="searchTreeModelGroupTitle">
+          <div class="search-tree-option-group-head">
+            <h4 id="searchTreeModelGroupTitle">策略价值模型</h4>
             <p>未选择 checkpoint 时使用默认模型或冷启动模型。</p>
           </div>
           <div class="field">
-            <label for="alphaGoCheckpointPath">Checkpoint 文件</label>
-            <div class="checkpoint-picker"><input id="alphaGoCheckpointPath" type="text" readonly placeholder="未选择，使用默认模型"><label class="btn small" for="alphaGoCheckpointFile">选择文件</label><input id="alphaGoCheckpointFile" type="file" accept=".npz,.pt,.pth,.ckpt,application/octet-stream"></div>
-            <div class="alphago-checkpoint-meta"><div class="hint" id="alphaGoCheckpointHint">选择本机 checkpoint 后将上传到本地服务，并用于后续运行。</div><button class="text-button" id="clearAlphaGoCheckpointButton" type="button">恢复默认模型</button></div>
+            <label for="searchTreeCheckpointPath">Checkpoint 文件</label>
+            <div class="checkpoint-picker"><input id="searchTreeCheckpointPath" type="text" readonly placeholder="未选择，使用默认模型"><label class="btn small" for="searchTreeCheckpointFile">选择文件</label><input id="searchTreeCheckpointFile" type="file" accept=".npz,.pt,.pth,.ckpt,application/octet-stream"></div>
+            <div class="search-tree-checkpoint-meta"><div class="hint" id="searchTreeCheckpointHint">选择本机 checkpoint 后将上传到本地服务，并用于后续运行。</div><button class="text-button" id="clearSearchTreeCheckpointButton" type="button">恢复默认模型</button></div>
           </div>
         </section>
       </div>
-      <div class="dialog-actions"><button class="btn small" type="button" id="scheduleAlphaGoOptionsDialogCancel">取消</button><button class="btn primary small" id="saveScheduleAlphaGoOptionsButton" type="submit">保存模型</button></div>
+      <div class="dialog-actions"><button class="btn small" type="button" id="searchTreeOptionsDialogCancel">取消</button><button class="btn primary small" id="saveSearchTreeOptionsButton" type="submit">保存模型</button></div>
     </form>
   </dialog>
 
@@ -552,6 +531,10 @@
             <label class="run-setting-option" for="skipBaselineInput">
               <span class="run-setting-option-main"><input id="skipBaselineInput" type="checkbox" checked><span>跳过 Baseline</span></span>
               <small>不计算 Heuristic 性能基线，可更快得到本次批量结果。</small>
+            </label>
+            <label class="run-setting-option" for="executionTimingEnabledInput">
+              <span class="run-setting-option-main"><input id="executionTimingEnabledInput" type="checkbox"><span>设备执行时间模拟</span></span>
+              <small>按设备“执行时间”修正实际 Move 时刻；仅在兼容模式下生效。</small>
             </label>
           </div>
         </section>
@@ -693,13 +676,44 @@
         </section>
         <section>
           <h4>如何阅读柱状图？</h4>
-          <p>图表按口径拆分为三张：蓝色为系统驻留、紫色为腔室驻留、绿色为机器手驻留。每张图只比较同一种时间，柱上方和悬停提示都显示对应晶圆的准确秒数。</p>
+          <p>图表按口径拆分为三张：蓝色为系统驻留、紫色为腔室驻留、绿色为机器手驻留。每张图只比较同一种时间，柱上方和悬停提示都显示对应晶圆的准确秒数，橙色虚线表示当前口径平均值。</p>
         </section>
         <section>
           <h4>如何用于优化？</h4>
           <p>优先关注明显高于同批次其他晶圆的柱。腔室驻留偏高通常表示取片或下游资源衔接不足；机器手驻留偏高表示持片等待或搬运调度需要检查；系统驻留偏高则需要结合前两者及 LoadLock 时序查看全流程原因。</p>
         </section>
         <p class="bottleneck-analysis-help-footnote">腔室和机器手值是对应驻留段的累计时间，不应与系统驻留简单相加；系统驻留还包含加工、LoadLock 和其他搬运环节。</p>
+      </div>
+    </section>
+  </dialog>
+
+  <dialog class="bottleneck-analysis-help-dialog" id="throughputAnalysisHelpDialog" aria-labelledby="throughputAnalysisHelpDialogTitle">
+    <section class="bottleneck-analysis-help-body">
+      <header class="bottleneck-analysis-help-head">
+        <div>
+          <h3 id="throughputAnalysisHelpDialogTitle">产能分析说明</h3>
+          <p>观察晶圆持续回片时的产能建立过程与短期波动。</p>
+        </div>
+        <button class="btn icon" type="button" id="throughputAnalysisHelpDialogClose" aria-label="关闭产能分析说明">×</button>
+      </header>
+      <div class="bottleneck-analysis-help-content">
+        <section>
+          <h4>累计产能（公司口径）</h4>
+          <p>每有一片晶圆到达终点，就用“截至当前的完成片数 ÷ 当前仿真秒数 × 3600”计算一次。它展示从启动到当前时刻的整体平均产能，因此曲线通常会逐步收敛。</p>
+        </section>
+        <section>
+          <h4>滑动窗口（2–10 片）</h4>
+          <p>选择 2 至 10 片的窗口大小后，每次以相隔该数量出片事件的两个终点时间计算产能。窗口越小，越能观察短期节拍变化，也越容易出现波动；至少需要“窗口大小加一”片完工后才会出现曲线。</p>
+        </section>
+        <section>
+          <h4>如何阅读曲线？</h4>
+          <p>趋势图刻意不显示坐标轴，减少实时监控时的视觉干扰。图形使用直线连接各晶圆的产能点，每个点上方显示真实片/h；灰蓝虚线为当前显示范围平均值。悬停或键盘聚焦数据点可查看完整片序号、平均差异和完成时间。</p>
+        </section>
+        <section>
+          <h4>显示范围与交互</h4>
+          <p>可按最近 30、60、120 片，最近 10、30 分钟或全部数据切换。默认显示最近 30 片，以提高实时判断效率；悬停或键盘聚焦数据点可查看当前产能、显示范围平均值、差值和完成时间。</p>
+        </section>
+        <p class="bottleneck-analysis-help-footnote">图表使用所有已完成晶圆绘制趋势；KPI 总览中的固定样本产能仍按居中 120 片的独立口径计算。</p>
       </div>
     </section>
   </dialog>
@@ -764,6 +778,6 @@
     </aside>
   </dialog>
 
-  <script type="module" src="/assets/config_editor.js?v=1.5.29"></script>
+  <script type="module" src="/assets/config_editor.js?v=1.5.40"></script>
 </body>
 </html>

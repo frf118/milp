@@ -32,9 +32,13 @@ __export(workspace_visualizer_test_entry_exports, {
   normalizeDecisionTrace: () => normalizeDecisionTrace,
   normalizeMovePayload: () => normalizeMovePayload,
   primitiveDecisionBoundaryTimes: () => primitiveDecisionBoundaryTimes,
+  renderDecisionLens: () => renderDecisionLens,
   renderEquipmentTopology: () => renderEquipmentTopology,
+  renderFrontSlotOverview: () => renderFrontSlotOverview,
   renderSchedulePerformance: () => renderSchedulePerformance,
+  renderThroughputChart: () => renderThroughputChart,
   renderWaferResidenceChart: () => renderWaferResidenceChart,
+  simplifyThroughputPoints: () => simplifyThroughputPoints,
   snapshotWithFullDeviceModules: () => snapshotWithFullDeviceModules
 });
 module.exports = __toCommonJS(workspace_visualizer_test_entry_exports);
@@ -188,6 +192,27 @@ function normalizeDecisionCandidate(candidate, actor = "") {
     makespanDelta: nullableFiniteNumber(candidate.makespanDelta)
   };
 }
+function normalizeReplayActionDiagnostic(value) {
+  const kind = String(value.kind ?? "").toLowerCase();
+  const status = String(value.status ?? "").toLowerCase();
+  if (!["pick", "place", "swap"].includes(kind)) return null;
+  if (!["enabled", "physical-blocked", "deadlock-blocked"].includes(status)) return null;
+  return {
+    actionId: String(value.actionId ?? ""),
+    kind,
+    status,
+    reason: String(value.reason ?? ""),
+    actor: String(value.actor ?? ""),
+    robot: String(value.robot ?? ""),
+    materialIds: listValue(value.materialIds).map(String),
+    source: String(value.source ?? ""),
+    sourceSlot: finiteNumber(value.sourceSlot),
+    destination: String(value.destination ?? ""),
+    destinationSlot: finiteNumber(value.destinationSlot),
+    earliestStart: finiteNumber(value.earliestStart),
+    finishTime: finiteNumber(value.finishTime)
+  };
+}
 function normalizeDecisionTrace(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
   const record = payload;
@@ -197,7 +222,7 @@ function normalizeDecisionTrace(payload) {
   const meta = traceMeta && typeof traceMeta === "object" && !Array.isArray(traceMeta) ? traceMeta : {};
   return rawTrace.filter((step) => Boolean(step) && typeof step === "object" && !Array.isArray(step)).map((step) => {
     const modelSignature = `${String(step.model ?? "")} ${String(meta.schema ?? "")} ${String(meta.model ?? "")}`.toLowerCase();
-    const model = modelSignature.includes("dual-actor") || modelSignature.includes("\u53CC actor") ? "dual-actor-e2e" : "e2e-ctq";
+    const model = modelSignature.includes("actions") ? "actions" : modelSignature.includes("dual-actor") || modelSignature.includes("\u53CC actor") ? "dual-actor-e2e" : "e2e-ctq";
     const rawCandidates = Array.isArray(step.candidates) ? step.candidates : model === "dual-actor-e2e" && Array.isArray(step.proposals) ? step.proposals : [];
     let candidates = rawCandidates.filter((candidate) => Boolean(candidate) && typeof candidate === "object" && !Array.isArray(candidate)).map((candidate) => normalizeDecisionCandidate(candidate)).sort((left, right) => left.rank - right.rank || right.policyPreference - left.policyPreference);
     const rawGroups = Array.isArray(step.candidateGroups) ? step.candidateGroups : [];
@@ -239,6 +264,8 @@ function normalizeDecisionTrace(payload) {
       }).filter((group) => group.candidates.length);
     }
     if (candidateGroups.length) candidates = candidateGroups.flatMap((group) => group.candidates);
+    const actionDiagnostics = listValue(step.actionDiagnostics).filter((action) => Boolean(action) && typeof action === "object" && !Array.isArray(action)).map(normalizeReplayActionDiagnostic).filter((action) => Boolean(action));
+    const rawActionCounts = step.actionCounts && typeof step.actionCounts === "object" ? step.actionCounts : {};
     return {
       model,
       modelLabel: String(step.modelLabel ?? (model === "dual-actor-e2e" ? "\u53CC Actor \u539F\u5B50\u8C03\u5EA6" : "E2E-CTQ")),
@@ -255,7 +282,15 @@ function normalizeDecisionTrace(payload) {
       modelEvaluated: Boolean(step.modelEvaluated),
       replayEvaluated: Boolean(step.replayEvaluated),
       candidates,
-      candidateGroups
+      candidateGroups,
+      actionDiagnosticsSource: String(step.actionDiagnosticsSource ?? ""),
+      actionDiagnosticsProvider: String(step.actionDiagnosticsProvider ?? ""),
+      actionCounts: {
+        enabled: finiteNumber(rawActionCounts.enabled),
+        "physical-blocked": finiteNumber(rawActionCounts["physical-blocked"]),
+        "deadlock-blocked": finiteNumber(rawActionCounts["deadlock-blocked"])
+      },
+      actionDiagnostics
     };
   }).sort((left, right) => left.time - right.time || left.decisionIndex - right.decisionIndex);
 }
@@ -394,10 +429,13 @@ function isCoolerModule(name, type = "") {
 function isAlignerModule(name, type = "") {
   return type.trim().toLowerCase() === "aligner" || /^(AL|ALIGNER)$/i.test(name.trim());
 }
+function isHeaterModule(name, type = "") {
+  return type.trim().toLowerCase() === "heater" || /^HEATER$/i.test(name.trim());
+}
 function isTopologyHiddenModule(module2) {
   const name = module2.name.trim();
   const type = module2.type.trim().toLowerCase();
-  return /^HEATER$/i.test(name) || type === "heater";
+  return isBufferModule(name, type) || /^LP4$/i.test(name);
 }
 function isLoadPortName(name, type = "") {
   const normalizedType = type.trim().toLowerCase();
@@ -1101,6 +1139,7 @@ function collectElements(root) {
     if (!element) throw new Error(`\u7ED3\u679C\u5206\u6790\u9875\u9762\u7F3A\u5C11\u9875\u9762\u8282\u70B9\uFF1A${id}`);
     return element;
   };
+  const optionalSelect = (id, value) => root.getElementById(id) ?? { value, addEventListener: () => void 0 };
   return {
     toolbar: required("visualToolbar"),
     groupAnalysis: required("testGroupAnalysisPanel"),
@@ -1109,10 +1148,10 @@ function collectElements(root) {
     content: required("visualContent"),
     topologyPlayback: required("visualTopologyPlayback"),
     stage: required("visualDeviceStage"),
+    /* 独立逻辑测试可使用精简页面夹具；真实页面始终提供该节点。 */
+    frontSlotOverview: root.getElementById("visualFrontSlotOverview") ?? { innerHTML: "" },
     decisionLens: required("visualDecisionLens"),
-    recommendationModel: required("visualRecommendationModel"),
-    recommendationModelHint: required("visualRecommendationModelHint"),
-    pauseOnDecisionChangeButton: required("visualPauseOnDecisionChangeButton"),
+    actionStatusFilters: Array.from(root.querySelectorAll("[data-action-status-filter]")),
     activeMoves: required("visualActiveMoves"),
     source: required("visualSource"),
     currentTime: required("visualCurrentTime"),
@@ -1227,7 +1266,7 @@ function snapshotWithFullDeviceModules(snapshot, device) {
 function topologyGroups(modules) {
   const loadLocks = modules.filter((module2) => isLoadLockName(module2.name, module2.type));
   const loadPorts = modules.filter((module2) => isLoadPortName(module2.name, module2.type));
-  const processModules = modules.filter((module2) => isProcessModule(module2.name, module2.type));
+  const processModules = modules.filter((module2) => isProcessModule(module2.name, module2.type) || isHeaterModule(module2.name, module2.type));
   const assignedNames = new Set([...loadLocks, ...loadPorts, ...processModules].map((module2) => module2.name));
   return {
     processModules,
@@ -1265,11 +1304,17 @@ function renderWaferToken(wafer, origin, progress, processed = false) {
   const originLabel = origin || "\u6765\u6E90\u672A\u77E5";
   return `<span class="wafer-token wafer-${state}" style="--wafer-progress:${normalizedProgress * 360}deg" title="\u6676\u5706 ${escapeHtml(wafer)}\uFF0C\u6765\u6E90 ${escapeHtml(originLabel)}\uFF0C${processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}"><span><b class="wafer-origin-label">${escapeHtml(originLabel)}</b></span></span>`;
 }
-function moduleDoorSides(module2, role, layout = "single", roleIndex = 0) {
+function moduleDoorSides(module2, role, layout = "single", roleIndex = 0, attachmentId = "") {
   if (module2.door === "doorless") return [];
   if (role === "lock") return [];
   if (role === "port") return ["top"];
   const name = module2.name.trim().toUpperCase();
+  if (role === "process" && attachmentId) {
+    if (attachmentId.endsWith("@left")) return ["right"];
+    if (attachmentId.endsWith("@right")) return ["left"];
+    if (attachmentId.endsWith("@top")) return ["bottom"];
+    if (attachmentId.endsWith("@bottom")) return ["top"];
+  }
   if (layout === "cascade" && role === "process") {
     const cascadeDoorSides = [
       ["right"],
@@ -1281,10 +1326,21 @@ function moduleDoorSides(module2, role, layout = "single", roleIndex = 0) {
     ];
     return cascadeDoorSides[roleIndex] ?? ["top"];
   }
+  if (layout === "dual" && role === "process") {
+    const dualDoorSides = [
+      ["right"],
+      ["right"],
+      ["bottom"],
+      ["bottom"],
+      ["left"],
+      ["left"]
+    ];
+    return dualDoorSides[roleIndex] ?? ["top"];
+  }
   if (role === "process") {
     const standardDoorSides = [
       ["right"],
-      ["right"],
+      ["left"],
       ["bottom"],
       ["bottom"],
       ["left"],
@@ -1297,79 +1353,121 @@ function moduleDoorSides(module2, role, layout = "single", roleIndex = 0) {
   if (["CL", "COOLER"].includes(name)) return ["left"];
   return ["top"];
 }
-function renderLoadPortCassette(module2) {
-  const slots = module2.loadPortSlots.length ? module2.loadPortSlots : module2.wafers.map((wafer, index) => ({
+function visibleModuleSlots(module2, kind) {
+  const recordedSlots = kind === "port" ? module2.loadPortSlots : kind === "lock" ? module2.loadLockSlots : [];
+  if (recordedSlots.length) return recordedSlots;
+  const slotCount = Math.max(kind === "lock" ? 2 : 1, module2.slotCapacity, module2.wafers.length);
+  return Array.from({ length: slotCount }, (_, index) => ({
     slot: index + 1,
-    wafer,
-    processed: module2.processedWafers.includes(wafer)
+    wafer: module2.wafers[index] ?? "",
+    processed: module2.processedWafers.includes(module2.wafers[index] ?? "")
   }));
+}
+function renderFrontSlotOverview(modules) {
+  const visibleModules = modules.filter((module2) => !isTopologyHiddenModule(module2));
+  const moduleNameOrder = (left, right) => {
+    const leftName = left.module.name.trim();
+    const rightName = right.module.name.trim();
+    const leftPort = /^LP(\d+)$/i.exec(leftName);
+    const rightPort = /^LP(\d+)$/i.exec(rightName);
+    if (leftPort && rightPort) return Number(leftPort[1]) - Number(rightPort[1]);
+    if (leftPort) return -1;
+    if (rightPort) return 1;
+    return leftName.localeCompare(rightName, void 0, { numeric: true });
+  };
+  const loadPorts = visibleModules.filter((module2) => isLoadPortName(module2.name, module2.type)).map((module2) => ({ module: module2, kind: "port" })).sort(moduleNameOrder);
+  const coolers = visibleModules.filter((module2) => isCoolerModule(module2.name, module2.type)).map((module2) => ({ module: module2, kind: "cooler" })).sort(moduleNameOrder);
+  const loadLocks = visibleModules.filter((module2) => isLoadLockName(module2.name, module2.type)).map((module2) => ({ module: module2, kind: "lock" })).sort(moduleNameOrder);
+  const splitRows = (items, columns) => Array.from({ length: Math.ceil(items.length / columns) }, (_, index) => items.slice(index * columns, (index + 1) * columns));
+  const slotRows = [
+    ...splitRows(loadLocks, 2),
+    ...splitRows(loadPorts, 2),
+    ...splitRows(coolers, 2)
+  ].filter((row) => row.length);
+  const renderSlots = (slots, module2) => slots.map((slot) => {
+    const state = !slot.wafer ? "empty" : slot.processed ? "processed" : "unprocessed";
+    const identity = `${module2.name}.${slot.slot}`;
+    const detail = slot.wafer ? `${identity} \xB7 \u6676\u5706 ${slot.wafer}\uFF0C${slot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `${identity} \xB7 \u7A7A\u69FD`;
+    return `<span class="front-slot is-${state}" tabindex="0" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}"></span>`;
+  }).join("");
+  if (!slotRows.length) return "";
+  const renderModule2 = ({ module: module2, kind }) => {
+    const slots = visibleModuleSlots(module2, kind);
+    return `<div class="front-module">
+      <strong title="${escapeHtml(module2.name)}">${escapeHtml(module2.name)}</strong>
+      <div class="front-slot-board" style="--front-slot-count:${slots.length}" role="group" aria-label="${escapeHtml(`${module2.name} \u6B63\u89C6\u69FD\u4F4D`)}">${renderSlots(slots, module2)}</div>
+    </div>`;
+  };
+  const content = slotRows.map((row) => `<div class="front-slot-row front-slot-row-${row[0].kind}" style="--front-row-module-count:${row.length}">${row.map(renderModule2).join("")}</div>`).join("");
+  return `<div class="topology-front-content" role="group" aria-label="\u8BBE\u5907\u6B63\u89C6\u69FD\u4F4D">${content}</div>`;
+}
+function renderLoadPortTopView(module2, wafers, accessibleStatus, candidate) {
+  const slots = visibleModuleSlots(module2, "port");
   const processed = slots.filter((slot) => slot.wafer && slot.processed).length;
   const unprocessed = slots.filter((slot) => slot.wafer && !slot.processed).length;
-  const slotMarkup = slots.map((slot) => {
-    const state = !slot.wafer ? "empty" : slot.processed ? "processed" : "unprocessed";
-    const label = slot.wafer ? `\u69FD\u4F4D ${slot.slot}\uFF0C\u6676\u5706 ${slot.wafer}\uFF0C${slot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `\u69FD\u4F4D ${slot.slot}\uFF0C\u7A7A`;
-    return `<span class="load-port-slot is-${state}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></span>`;
-  }).join("");
-  return `<div class="load-port-cassette" role="group" aria-label="${escapeHtml(`${module2.name} \u6B63\u89C6\u6676\u5706\u76D2\uFF0C\u5171 ${slots.length} \u4E2A\u69FD\u4F4D\uFF0C\u672A\u52A0\u5DE5 ${unprocessed}\uFF0C\u5DF2\u52A0\u5DE5 ${processed}`)}">
-    <span class="load-port-cassette-handle" aria-hidden="true"></span>
-    <div class="load-port-slot-bank" style="--load-port-slot-count:${slots.length}">${slotMarkup}</div>
-  </div>`;
+  const candidateLabel = candidate ? `\uFF0C${candidate.count} \u4E2A\u53EF\u884C\u52A8\u4F5C` : "";
+  const isDummy = isDummyPortName(module2.name) || module2.type.trim().toLowerCase() === "dummyport";
+  return `<strong class="equipment-external-name equipment-external-name-port">${escapeHtml(module2.name)}</strong>
+    <article class="equipment-card equipment-port-top-view status-${module2.status} door-${module2.door} ${isDummy ? "is-dummy-port" : ""} ${module2.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""}" aria-label="${escapeHtml(`${accessibleStatus}\uFF0C\u4FEF\u89C6\u88C5\u8F7D\u53F0\uFF0C\u5171 ${slots.length} \u4E2A\u69FD\u4F4D\uFF0C\u672A\u52A0\u5DE5 ${unprocessed}\uFF0C\u5DF2\u52A0\u5DE5 ${processed}${candidateLabel}`)}">
+      <span class="port-top-gate" aria-hidden="true"></span>
+      <span class="port-top-cassette ${wafers ? "is-occupied" : "is-empty"}">${wafers || "<i></i>"}</span>
+    </article>`;
 }
-function renderModule(module2, waferOrigins, role, candidate, layout = "single", roleIndex = 0) {
+function renderModule(module2, waferOrigins, role, candidate, layout = "single", roleIndex = 0, attachmentId = "") {
   const waferProgress = module2.status === "processing" ? module2.progress : 0;
   const visibleWaferCount = role === "lock" ? 2 : 1;
   const processedWafers = new Set(module2.processedWafers ?? []);
   const wafers = module2.wafers.slice(0, visibleWaferCount).map((wafer) => renderWaferToken(wafer, waferOrigins[wafer] ?? "", waferProgress, processedWafers.has(wafer))).join("");
   const layerCount = role === "lock" && module2.loadLockSlots.length ? module2.loadLockSlots.filter((slot) => slot.wafer).length : module2.wafers.length;
   const overflow = layerCount > visibleWaferCount ? `<span class="wafer-more">+ ${layerCount - visibleWaferCount}</span>` : "";
-  const doors = moduleDoorSides(module2, role, layout, roleIndex).map((side) => `<i class="chamber-door chamber-door-${side}"></i>`).join("");
+  const doors = moduleDoorSides(module2, role, layout, roleIndex, attachmentId).map((side) => `<i class="chamber-door chamber-door-${side}"></i>`).join("");
   const accessibleStatus = `${module2.name}\uFF0C${STATUS_LABELS[module2.status]}\uFF0C${DOOR_LABELS[module2.door]}`;
   const candidateLabel = candidate ? `${candidate.count} \u4E2A\u53EF\u884C\u52A8\u4F5C\uFF0C\u6700\u9AD8\u6A21\u578B\u504F\u597D ${(candidate.preference * 100).toFixed(0)}%` : "";
+  if (role === "port") return renderLoadPortTopView(module2, wafers, accessibleStatus, candidate);
   if (role === "auxiliary" && isAlignerModule(module2.name, module2.type)) {
     return `<strong class="equipment-external-name equipment-external-name-aligner">${escapeHtml(module2.name)}</strong>
       <article class="equipment-utility equipment-aligner status-${module2.status} ${module2.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
         <div class="aligner-cross ${wafers ? "is-occupied" : "is-empty"}" aria-hidden="true"><i></i><i></i>${wafers}</div>
       </article>`;
   }
-  if (role === "auxiliary" && (isBufferModule(module2.name, module2.type) || isCoolerModule(module2.name, module2.type))) {
-    const utilityKind = isBufferModule(module2.name, module2.type) ? "buffer" : "cooler";
-    const coolerSlotCount = Math.max(2, Math.min(8, module2.slotCapacity || module2.wafers.length || 3));
-    const coolerSlots = Array.from({ length: coolerSlotCount }, (_, index) => {
-      const wafer = module2.wafers[index] ?? "";
-      const processed = wafer && processedWafers.has(wafer);
-      const label = wafer ? `\u69FD\u4F4D ${index + 1}\uFF0C\u6676\u5706 ${wafer}\uFF0C${processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `\u69FD\u4F4D ${index + 1}\uFF0C\u7A7A`;
-      return `<span class="cooler-slot ${wafer ? `is-occupied wafer-${processed ? "processed" : "unprocessed"}` : "is-empty"}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></span>`;
-    }).join("");
-    const utilityBody = utilityKind === "buffer" ? `<div class="buffer-tray ${wafers ? "is-occupied" : "is-empty"}" aria-hidden="true"><span></span><span></span><span></span>${wafers}</div>` : `<div class="cooler-slot-bank ${wafers ? "is-occupied" : "is-empty"}" role="group" aria-label="${escapeHtml(`${module2.name} \u6B63\u89C6\u51B7\u5374\u69FD\uFF0C\u5171 ${coolerSlotCount} \u4E2A\u69FD\u4F4D`)}">${coolerSlots}</div>`;
-    return `<strong class="equipment-external-name equipment-external-name-${utilityKind}">${escapeHtml(module2.name)}</strong>
-      <article class="equipment-utility equipment-${utilityKind} status-${module2.status} ${module2.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
-        ${utilityBody}
+  if (role === "auxiliary" && isCoolerModule(module2.name, module2.type)) {
+    const coolerSlots = visibleModuleSlots(module2, "cooler");
+    const visibleSlot = coolerSlots.find((slot) => slot.wafer) ?? coolerSlots[0];
+    const state = !visibleSlot?.wafer ? "empty" : visibleSlot.processed ? "processed" : "unprocessed";
+    const label = visibleSlot?.wafer ? `${module2.name}.${visibleSlot.slot}\uFF0C\u6676\u5706 ${visibleSlot.wafer}\uFF0C${visibleSlot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `${module2.name}.${visibleSlot?.slot ?? 1}\uFF0C\u7A7A\u69FD`;
+    const visibleWafer = visibleSlot?.wafer ? renderWaferToken(
+      visibleSlot.wafer,
+      waferOrigins[visibleSlot.wafer] ?? "",
+      waferProgress,
+      visibleSlot.processed
+    ) : "";
+    return `<strong class="equipment-external-name equipment-external-name-cooler">${escapeHtml(module2.name)}</strong>
+      <article class="equipment-utility equipment-cooler-top-view status-${module2.status} ${module2.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}\uFF0C\u4FEF\u89C6\u51B7\u5374\u76D8${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
+        <div class="cooler-top-plate" role="group" aria-label="${escapeHtml(`${module2.name} \u4FEF\u89C6\u51B7\u5374\u76D8`)}"><span class="cooler-top-pocket is-${state}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${visibleWafer}</span></div>
       </article>`;
   }
   const atmosphereLevel = role === "lock" ? module2.loadLockPhase === "pumping" ? 100 - module2.progress * 100 : module2.loadLockPhase === "venting" ? module2.progress * 100 : /大气|ATM|ATR/i.test(module2.environment) ? 100 : 0 : 0;
-  const loadLockLayers = role === "lock" ? `<div class="loadlock-layers" aria-hidden="true">${[0, 1].map((index) => {
-    const layer = module2.loadLockSlots[index];
-    const wafer = layer ? layer.wafer : module2.wafers[index];
-    const processed = layer ? layer.processed : wafer ? processedWafers.has(wafer) : false;
-    const waferState = processed ? "processed" : "unprocessed";
-    return `<div class="loadlock-layer ${wafer ? "is-occupied" : "is-empty"}">${wafer ? `<span class="loadlock-wafer-line wafer-${waferState}" title="\u6676\u5706 ${escapeHtml(wafer)}\uFF08${processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}\uFF09"></span>` : ""}</div>`;
-  }).join("")}${overflow}</div>` : role === "process" ? `<div class="process-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>` : role === "port" ? `` : role === "auxiliary" ? `<div class="auxiliary-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>` : `<div class="wafer-stack">${wafers}${overflow}</div>`;
+  const loadLockLayers = role === "lock" ? (() => {
+    const slots = visibleModuleSlots(module2, "lock");
+    const visibleSlot = slots.find((slot) => slot.wafer) ?? slots[0];
+    const state = !visibleSlot?.wafer ? "empty" : visibleSlot.processed ? "processed" : "unprocessed";
+    const label = visibleSlot?.wafer ? `${module2.name}.${visibleSlot.slot}\uFF0C\u6676\u5706 ${visibleSlot.wafer}\uFF0C${visibleSlot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `${module2.name}.${visibleSlot?.slot ?? 1}\uFF0C\u7A7A\u69FD`;
+    const visibleWafer = visibleSlot?.wafer ? renderWaferToken(
+      visibleSlot.wafer,
+      waferOrigins[visibleSlot.wafer] ?? "",
+      waferProgress,
+      visibleSlot.processed
+    ) : "";
+    return `<div class="loadlock-top-chamber" role="group" aria-label="${escapeHtml(`${module2.name} \u4FEF\u89C6 LoadLock`)}"><span class="loadlock-top-seat is-${state}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${visibleWafer}</span></div>`;
+  })() : role === "process" ? `<div class="process-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>` : role === "auxiliary" ? `<div class="auxiliary-wafer-slot ${wafers ? "is-occupied" : "is-empty"}">${wafers}</div>` : `<div class="wafer-stack">${wafers}${overflow}</div>`;
   const bodyMarkup = role === "process" ? `<div class="equipment-process-shell"><div class="equipment-body">${loadLockLayers}</div></div>` : `<div class="equipment-body">${loadLockLayers}</div>`;
   const article = `
     <article class="equipment-card equipment-${role} status-${module2.status} door-${module2.door} ${module2.loadLockPhase ? `loadlock-${module2.loadLockPhase}` : ""} ${module2.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" style="--module-progress:${Math.round(module2.progress * 100)}%;--loadlock-atmosphere:${Math.max(0, Math.min(100, atmosphereLevel)).toFixed(1)}%;--loadlock-atmosphere-ratio:${Math.max(0, Math.min(1, atmosphereLevel / 100)).toFixed(3)}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
        ${bodyMarkup}
-      <div class="chamber-doors" aria-hidden="true">${role === "lock" ? '<i class="loadlock-door loadlock-door-vacuum"></i><i class="loadlock-door loadlock-door-atmosphere"></i>' : doors}</div>
+      <div class="chamber-doors" aria-hidden="true">${role === "lock" ? '<i class="loadlock-top-gate loadlock-top-gate-vacuum"></i><i class="loadlock-top-gate loadlock-top-gate-atmosphere"></i>' : doors}</div>
     </article>`;
   if (role === "process" || role === "auxiliary" || role === "lock") {
     return `<strong class="equipment-external-name">${escapeHtml(module2.name)}</strong>${article}`;
-  }
-  if (role === "port") {
-    const isDummy = isDummyPortName(module2.name) || module2.type.trim().toLowerCase() === "dummyport";
-    const portDoors = moduleDoorSides(module2, role, layout, roleIndex).map((side) => `<i class="chamber-door chamber-door-${side}"></i>`).join("");
-    return `<strong class="equipment-external-name ${isDummy ? "equipment-external-name-dummy" : "equipment-external-name-port"}">${escapeHtml(module2.name)}</strong><div class="load-port-assembly ${isDummy ? "is-dummy-port" : "is-load-port"} door-${module2.door}" role="group" aria-label="${escapeHtml(`${accessibleStatus}${isDummy ? "\uFF0CDummy Port" : ""}${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
-      <div class="chamber-doors" aria-hidden="true">${portDoors}</div>
-      ${renderLoadPortCassette(module2)}
-    </div>`;
   }
   return article;
 }
@@ -1400,36 +1498,182 @@ var TOPOLOGY_COLUMN_PERCENTAGES = [26, 42, 58, 74];
 var TOPOLOGY_ROW_TOP_PIXELS = [52, 154, 256, 358, 460, 562, 664, 786, 929, 1031, 1133];
 var TOPOLOGY_VIEWBOX_WIDTH = 1e3;
 var TOPOLOGY_ITEM_SIZE = 96;
-var TOPOLOGY_PROCESS_WIDTH = 104;
-var TOPOLOGY_PROCESS_HEIGHT = 104;
+var TOPOLOGY_PROCESS_WIDTH = 82;
+var TOPOLOGY_PROCESS_HEIGHT = 82;
 var TOPOLOGY_ROBOT_SIZE = 132;
-var TOPOLOGY_LOADLOCK_WIDTH = 120;
-var TOPOLOGY_LOADLOCK_HEIGHT = 72;
-var TOPOLOGY_LOADPORT_WIDTH = 112;
-var TOPOLOGY_LOADPORT_HEIGHT = 104;
-var TOPOLOGY_LOADPORT_BASE_HEIGHT = 22;
-var TOPOLOGY_LOADPORT_BASE_OVERHANG = 16;
+var TOPOLOGY_LOADLOCK_WIDTH = 82;
+var TOPOLOGY_LOADLOCK_HEIGHT = 82;
+var TOPOLOGY_LOADLOCK_BRIDGE_GAP = 2;
+var TOPOLOGY_CASCADE_FRAME_WIDTH = 240;
+var TOPOLOGY_CASCADE_VTR1_HEIGHT = 128;
+var TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET = (TOPOLOGY_LOADLOCK_WIDTH + 1) / TOPOLOGY_CASCADE_FRAME_WIDTH;
+var TOPOLOGY_LOADPORT_WIDTH = 82;
+var TOPOLOGY_LOADPORT_HEIGHT = 82;
+var TOPOLOGY_ATMOSPHERE_INTERIOR_INSET = 14;
 var TOPOLOGY_BUFFER_WIDTH = 104;
 var TOPOLOGY_BUFFER_HEIGHT = 56;
 var TOPOLOGY_COOLER_WIDTH = 76;
-var TOPOLOGY_COOLER_HEIGHT = 56;
+var TOPOLOGY_COOLER_HEIGHT = 72;
 var TOPOLOGY_ALIGNER_WIDTH = 76;
 var TOPOLOGY_ALIGNER_HEIGHT = 54;
 var TOPOLOGY_LOADLOCK_ROW_TOP_PIXELS = [664, 740];
 var TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS = 866;
 var TOPOLOGY_LOADPORT_ROW_TOP_PIXELS = 1006;
 var TOPOLOGY_CANVAS_PADDING = 28;
-var TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP = TOPOLOGY_ROW_TOP_PIXELS[4] - 32;
-var TOPOLOGY_SINGLE_PROCESS_LOWER_TOP = TOPOLOGY_ROW_TOP_PIXELS[5] - 10;
-var TOPOLOGY_CASCADE_PM_TOP = 60;
-var TOPOLOGY_CASCADE_UPPER_ROBOT_TOP = 190;
-var TOPOLOGY_CASCADE_BRIDGE_TOP = 310;
-var TOPOLOGY_CASCADE_LOWER_ROBOT_TOP = 430;
-var TOPOLOGY_CASCADE_LOCK_ROW_TOP = 548;
+var TOPOLOGY_MACHINE_FRAMES = {
+  single: [{
+    id: "vacuum-main",
+    label: "VTR VACUUM FRAME",
+    centerLeftPercent: 50,
+    centerTopPixels: 270,
+    widthPixels: 240,
+    heightPixels: 240,
+    shape: "square"
+  }],
+  dual: [{
+    id: "vacuum-main",
+    label: "",
+    centerLeftPercent: 50,
+    centerTopPixels: 270,
+    widthPixels: 240,
+    heightPixels: 240,
+    shape: "square"
+  }],
+  cascade: [
+    {
+      id: "vacuum-vtr-2",
+      label: "",
+      centerLeftPercent: 50,
+      centerTopPixels: 230,
+      widthPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
+      heightPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
+      shape: "square"
+    },
+    {
+      id: "vacuum-vtr-1",
+      label: "",
+      centerLeftPercent: 50,
+      /* 上移 8px，使 UBR/DBR 同时贴合 VTR_2 底边与 VTR_1 顶边。 */
+      centerTopPixels: 496,
+      widthPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
+      heightPixels: TOPOLOGY_CASCADE_VTR1_HEIGHT,
+      shape: "flat"
+    }
+  ]
+};
+var TOPOLOGY_ATMOSPHERE_FRAMES = {
+  single: {
+    id: "atmosphere-main",
+    /* 大气框架仅表达附着边界，不在框内重复显示区域名称。 */
+    label: "",
+    centerLeftPercent: 50,
+    /* LoadLock 作为真空与大气框架之间的桥接腔。 */
+    centerTopPixels: 547,
+    widthPixels: 425,
+    heightPixels: 150,
+    shape: "atmosphere"
+  },
+  dual: {
+    id: "atmosphere-main",
+    label: "",
+    centerLeftPercent: 50,
+    centerTopPixels: 547,
+    widthPixels: 425,
+    heightPixels: 150,
+    shape: "atmosphere"
+  },
+  cascade: {
+    id: "atmosphere-main",
+    label: "",
+    centerLeftPercent: 50,
+    centerTopPixels: 717,
+    widthPixels: 425,
+    heightPixels: 150,
+    shape: "atmosphere"
+  }
+};
+var TOPOLOGY_CASCADE_LOCK_ROW_TOP = 597;
 var TOPOLOGY_CASCADE_LOCK_ROW_GAP = 80;
-var TOPOLOGY_CASCADE_ATM_TOP = 742;
+var TOPOLOGY_CASCADE_ATM_TOP = 720;
 var TOPOLOGY_ATMOSPHERE_LOADPORT_OFFSET = 140;
 var TOPOLOGY_CASCADE_LOADPORT_TOP = TOPOLOGY_CASCADE_ATM_TOP + TOPOLOGY_ATMOSPHERE_LOADPORT_OFFSET;
+function topologyMachineFrame(layout, index = 0) {
+  return TOPOLOGY_MACHINE_FRAMES[layout][index] ?? TOPOLOGY_MACHINE_FRAMES[layout][0];
+}
+function topologyAtmosphereFrame(layout) {
+  return TOPOLOGY_ATMOSPHERE_FRAMES[layout];
+}
+function topologyFrameAttachment(frame, attachmentId, side, offset, widthPixels, heightPixels) {
+  const halfWidthPercent = widthPixels / TOPOLOGY_VIEWBOX_WIDTH * 50;
+  const frameWidthPercent = frame.widthPixels / TOPOLOGY_VIEWBOX_WIDTH * 100;
+  if (side === "center") {
+    return {
+      leftPercent: frame.centerLeftPercent,
+      topPixels: frame.centerTopPixels,
+      widthPixels,
+      heightPixels,
+      attachmentId,
+      fixedLeftOffsetPixels: 0
+    };
+  }
+  const horizontalOffset = offset * frameWidthPercent / 2;
+  const verticalOffset = offset * frame.heightPixels / 2;
+  return {
+    leftPercent: side === "left" ? frame.centerLeftPercent - frameWidthPercent / 2 - halfWidthPercent : side === "right" ? frame.centerLeftPercent + frameWidthPercent / 2 + halfWidthPercent : frame.centerLeftPercent + horizontalOffset,
+    topPixels: Math.round(side === "top" ? frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2 : side === "bottom" ? frame.centerTopPixels + frame.heightPixels / 2 + heightPixels / 2 : frame.centerTopPixels + verticalOffset),
+    widthPixels,
+    heightPixels,
+    attachmentId,
+    fixedLeftOffsetPixels: side === "left" ? -frame.widthPixels / 2 - widthPixels / 2 : side === "right" ? frame.widthPixels / 2 + widthPixels / 2 : horizontalOffset / 100 * TOPOLOGY_VIEWBOX_WIDTH
+  };
+}
+function topologyVacuumAtmosphereLoadLockBridge(layout, lockIndex, atmosphereOffset) {
+  const vacuumFrame = layout === "cascade" ? topologyMachineFrame("cascade", 1) : topologyMachineFrame(layout);
+  const atmosphereFrame = topologyAtmosphereFrame(layout);
+  const vacuumOffset = atmosphereOffset * atmosphereFrame.widthPixels / vacuumFrame.widthPixels;
+  const vacuumAttachment = topologyFrameAttachment(
+    vacuumFrame,
+    `${vacuumFrame.id}-loadlock-${lockIndex + 1}@bottom`,
+    "bottom",
+    vacuumOffset,
+    TOPOLOGY_LOADLOCK_WIDTH,
+    TOPOLOGY_LOADLOCK_HEIGHT
+  );
+  const atmosphereAttachment = topologyFrameAttachment(
+    atmosphereFrame,
+    `${atmosphereFrame.id}-loadlock-${lockIndex + 1}@top`,
+    "top",
+    atmosphereOffset,
+    TOPOLOGY_LOADLOCK_WIDTH,
+    TOPOLOGY_LOADLOCK_HEIGHT
+  );
+  return {
+    ...vacuumAttachment,
+    /* 两端框架的中心距由常量固定；保留大气锚点的纵坐标以表达两侧同时相切。 */
+    topPixels: atmosphereAttachment.topPixels,
+    attachmentId: `${vacuumAttachment.attachmentId}|${atmosphereAttachment.attachmentId}`
+  };
+}
+function topologyTightLoadLockOffsets(count, frameWidthPixels) {
+  if (count <= 1) return [0];
+  const centerSpacing = TOPOLOGY_LOADLOCK_WIDTH + TOPOLOGY_LOADLOCK_BRIDGE_GAP;
+  const offsetStep = centerSpacing / (frameWidthPixels / 2);
+  return Array.from(
+    { length: count },
+    (_, index) => (index - (count - 1) / 2) * offsetStep
+  );
+}
+function topologyFrameInteriorCorner(frame, attachmentId, horizontal, widthPixels, heightPixels) {
+  const horizontalOffset = frame.widthPixels / 2 - TOPOLOGY_ATMOSPHERE_INTERIOR_INSET - widthPixels / 2;
+  return {
+    leftPercent: frame.centerLeftPercent + (horizontal === "left" ? -horizontalOffset : horizontalOffset) / TOPOLOGY_VIEWBOX_WIDTH * 100,
+    topPixels: frame.centerTopPixels - frame.heightPixels / 2 + TOPOLOGY_ATMOSPHERE_INTERIOR_INSET + heightPixels / 2,
+    widthPixels,
+    heightPixels,
+    attachmentId,
+    fixedLeftOffsetPixels: horizontal === "left" ? -horizontalOffset : horizontalOffset
+  };
+}
 function distributedTopologyColumns(count) {
   if (count <= 1) return [50];
   if (count === 2) return [40, 60];
@@ -1479,15 +1723,16 @@ function moduleTopologyPosition(module2, role, index, roleModules, layout, bridg
   const column = TOPOLOGY_COLUMN_PERCENTAGES;
   const row = TOPOLOGY_ROW_TOP_PIXELS;
   if (layout === "cascade" && role === "process") {
-    const ordered = [...roleModules].sort((left, right) => naturalCompare(left.name, right.name));
+    const ordered = [...roleModules].filter((item) => !isHeaterModule(item.name, item.type)).sort((left, right) => naturalCompare(left.name, right.name));
     const layoutIndex = Math.max(0, ordered.findIndex((item) => item.name === module2.name));
+    const upperFrame = topologyMachineFrame("cascade", 0);
+    const lowerFrame = topologyMachineFrame("cascade", 1);
     const positions = [
-      { leftPercent: column[0], topPixels: TOPOLOGY_CASCADE_LOWER_ROBOT_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_CASCADE_LOWER_ROBOT_TOP },
-      { leftPercent: 50, topPixels: TOPOLOGY_CASCADE_PM_TOP },
-      { leftPercent: column[0], topPixels: TOPOLOGY_CASCADE_UPPER_ROBOT_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_CASCADE_UPPER_ROBOT_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_CASCADE_PM_TOP }
+      topologyFrameAttachment(lowerFrame, "vtr-1-process-left@left", "left", 0, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(lowerFrame, "vtr-1-process-right@right", "right", 0, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(upperFrame, "vtr-2-process-left-lower@left", "left", 0.55, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(upperFrame, "vtr-2-process-top-left@top", "top", -0.45, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(upperFrame, "vtr-2-process-right-upper@right", "right", -0.45, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT)
     ];
     const position = positions[layoutIndex] ?? {
       leftPercent: distributedTopologyColumns(roleCount)[layoutIndex] ?? 50,
@@ -1495,16 +1740,51 @@ function moduleTopologyPosition(module2, role, index, roleModules, layout, bridg
     };
     return { ...position, widthPixels: TOPOLOGY_PROCESS_WIDTH, heightPixels: TOPOLOGY_PROCESS_HEIGHT };
   }
+  if (layout === "dual" && role === "process") {
+    const dualBaseName = module2.name.replace(/-\d+$/, "");
+    const dualSlotIndex = Math.max(0, Number(/-(\d+)$/.exec(module2.name)?.[1] ?? "1") - 1);
+    const dualBaseNames = [...new Set(roleModules.map((item) => item.name.replace(/-\d+$/, "")))].sort(naturalCompare);
+    const dualBaseIndex = Math.max(0, dualBaseNames.indexOf(dualBaseName));
+    const frame = topologyMachineFrame("dual");
+    const dualLayout = [
+      [
+        topologyFrameAttachment(frame, "dual-pm1-upper@left", "left", -0.38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+        topologyFrameAttachment(frame, "dual-pm1-lower@left", "left", 0.38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT)
+      ],
+      [
+        topologyFrameAttachment(frame, "dual-pm2-left@top", "top", -0.5, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+        topologyFrameAttachment(frame, "dual-pm2-right@top", "top", 0.5, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT)
+      ],
+      [
+        topologyFrameAttachment(frame, "dual-pm3-upper@right", "right", -0.38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+        topologyFrameAttachment(frame, "dual-pm3-lower@right", "right", 0.38, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT)
+      ]
+    ];
+    const position = dualLayout[dualBaseIndex]?.[dualSlotIndex] ?? {
+      leftPercent: distributedTopologyColumns(roleCount)[dualBaseIndex] ?? 50,
+      topPixels: TOPOLOGY_ROW_TOP_PIXELS[3]
+    };
+    return { ...position, widthPixels: TOPOLOGY_PROCESS_WIDTH, heightPixels: TOPOLOGY_PROCESS_HEIGHT };
+  }
   if (role === "process") {
-    const ordered = [...roleModules].sort((left, right) => naturalCompare(left.name, right.name));
+    const frame = topologyMachineFrame("single");
+    if (isHeaterModule(module2.name, module2.type)) {
+      return topologyFrameAttachment(
+        frame,
+        "single-heater-top-left@top",
+        "top",
+        -0.5,
+        TOPOLOGY_PROCESS_WIDTH,
+        TOPOLOGY_PROCESS_HEIGHT
+      );
+    }
+    const ordered = [...roleModules].filter((item) => !isHeaterModule(item.name, item.type)).sort((left, right) => naturalCompare(left.name, right.name));
     const layoutIndex = Math.max(0, ordered.findIndex((item) => item.name === module2.name));
     const positions = [
-      { leftPercent: column[0], topPixels: TOPOLOGY_SINGLE_PROCESS_LOWER_TOP },
-      { leftPercent: column[0], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP },
-      { leftPercent: column[1], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP - TOPOLOGY_PROCESS_HEIGHT },
-      { leftPercent: column[2], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP - TOPOLOGY_PROCESS_HEIGHT },
-      { leftPercent: column[3], topPixels: TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP },
-      { leftPercent: column[3], topPixels: TOPOLOGY_SINGLE_PROCESS_LOWER_TOP }
+      topologyFrameAttachment(frame, "single-process-left-upper@left", "left", -0.32, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(frame, "single-process-left-lower@left", "left", 0.48, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(frame, "single-process-right-upper@right", "right", -0.32, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT),
+      topologyFrameAttachment(frame, "single-process-right-lower@right", "right", 0.48, TOPOLOGY_PROCESS_WIDTH, TOPOLOGY_PROCESS_HEIGHT)
     ];
     const position = positions[layoutIndex] ?? {
       leftPercent: distributedTopologyColumns(roleCount)[layoutIndex] ?? 50,
@@ -1513,17 +1793,21 @@ function moduleTopologyPosition(module2, role, index, roleModules, layout, bridg
     return { ...position, widthPixels: TOPOLOGY_PROCESS_WIDTH, heightPixels: TOPOLOGY_PROCESS_HEIGHT };
   }
   if (layout === "cascade" && role === "lock" && bridgeLoadLockNames.has(module2.name)) {
-    const bridgeIndex = [...bridgeLoadLockNames].indexOf(module2.name);
-    return {
-      leftPercent: bridgeIndex % 2 === 0 ? column[1] : column[2],
-      topPixels: TOPOLOGY_CASCADE_BRIDGE_TOP,
-      widthPixels: TOPOLOGY_LOADLOCK_WIDTH,
-      heightPixels: TOPOLOGY_LOADLOCK_HEIGHT
-    };
+    const orderedBridges = [...bridgeLoadLockNames];
+    const bridgeIndex = Math.max(0, orderedBridges.indexOf(module2.name));
+    return topologyFrameAttachment(
+      topologyMachineFrame("cascade", 0),
+      bridgeIndex % 2 === 0 ? "cascade-bridge-left" : "cascade-bridge-right",
+      "bottom",
+      bridgeIndex % 2 === 0 ? -TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET : TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET,
+      TOPOLOGY_LOADLOCK_WIDTH,
+      TOPOLOGY_LOADLOCK_HEIGHT
+    );
   }
   if (role === "lock") {
-    const canonicalOrder = { LA: 0, LB: 1, LC: 2, LD: 3 };
-    const orderedLoadLocks = [...roleModules].sort((left, right) => {
+    const canonicalOrder = layout === "dual" ? { LC: 0, LA: 1, LB: 2, LD: 3 } : { LA: 0, LB: 1, LC: 2, LD: 3 };
+    const atmosphereLoadLocks = layout === "cascade" ? roleModules.filter((item) => !bridgeLoadLockNames.has(item.name)) : roleModules;
+    const orderedLoadLocks = [...atmosphereLoadLocks].sort((left, right) => {
       const leftName = left.name.trim().toUpperCase();
       const rightName = right.name.trim().toUpperCase();
       const leftRank = canonicalOrder[leftName] ?? 100;
@@ -1531,6 +1815,18 @@ function moduleTopologyPosition(module2, role, index, roleModules, layout, bridg
       return leftRank - rightRank || naturalCompare(left.name, right.name);
     });
     const gridIndex = Math.max(0, orderedLoadLocks.findIndex((item) => item.name === module2.name));
+    if ((layout === "single" || layout === "dual" || layout === "cascade") && gridIndex < 4) {
+      const atmosphereLockCount = orderedLoadLocks.length;
+      const offsets = topologyTightLoadLockOffsets(
+        atmosphereLockCount,
+        topologyAtmosphereFrame(layout).widthPixels
+      );
+      return topologyVacuumAtmosphereLoadLockBridge(
+        layout,
+        gridIndex,
+        offsets[gridIndex] ?? 0
+      );
+    }
     const loadLockRowTop = layout === "cascade" ? TOPOLOGY_CASCADE_LOCK_ROW_TOP : TOPOLOGY_LOADLOCK_ROW_TOP_PIXELS[0];
     const loadLockRowGap = layout === "cascade" ? TOPOLOGY_CASCADE_LOCK_ROW_GAP : TOPOLOGY_LOADLOCK_ROW_TOP_PIXELS[1] - TOPOLOGY_LOADLOCK_ROW_TOP_PIXELS[0];
     return {
@@ -1551,36 +1847,43 @@ function moduleTopologyPosition(module2, role, index, roleModules, layout, bridg
       return leftRank - rightRank || naturalCompare(left.name, right.name);
     });
     const portIndex = Math.max(0, orderedPorts.findIndex((item) => item.name === module2.name));
-    const currentIsDummy = isDummyPortName(module2.name) || module2.type.trim().toLowerCase() === "dummyport";
+    if (portIndex < 4) {
+      const offsets = orderedPorts.length <= 1 ? [0] : orderedPorts.length === 2 ? [-0.3, 0.3] : orderedPorts.length === 3 ? [-0.6, 0, 0.6] : [-0.7, -0.233, 0.233, 0.7];
+      return topologyFrameAttachment(
+        topologyAtmosphereFrame(layout),
+        `atmosphere-port-${portIndex + 1}@bottom`,
+        "bottom",
+        offsets[portIndex] ?? 0,
+        TOPOLOGY_LOADPORT_WIDTH,
+        TOPOLOGY_LOADPORT_HEIGHT
+      );
+    }
     const portColumns = roleCount === 5 ? [26, 38, 50, 62, 74] : roleCount <= column.length ? column : Array.from({ length: roleCount }, (_, current) => 20 + current * 60 / (roleCount - 1));
     const loadPortTop = layout === "cascade" ? TOPOLOGY_CASCADE_LOADPORT_TOP : TOPOLOGY_LOADPORT_ROW_TOP_PIXELS;
     return {
-      /* 四列语义固定为 LP1 / LP2 / LP3 / Dummy Port；缺少 LP3 时保留空位。 */
-      leftPercent: currentIsDummy && roleCount <= column.length ? column[3] : portColumns[portIndex] ?? column[0],
+      leftPercent: portColumns[portIndex] ?? column[0],
       topPixels: loadPortTop,
       widthPixels: TOPOLOGY_LOADPORT_WIDTH,
       heightPixels: TOPOLOGY_LOADPORT_HEIGHT
     };
   }
   if (isAlignerModule(module2.name, module2.type)) {
-    return {
-      leftPercent: 10,
-      topPixels: layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS,
-      widthPixels: TOPOLOGY_ALIGNER_WIDTH,
-      heightPixels: TOPOLOGY_ALIGNER_HEIGHT
-    };
+    return topologyFrameInteriorCorner(
+      topologyAtmosphereFrame(layout),
+      "atmosphere-aligner-top-left@inside",
+      "left",
+      TOPOLOGY_ALIGNER_WIDTH,
+      TOPOLOGY_ALIGNER_HEIGHT
+    );
   }
   if (role === "auxiliary" && isCoolerModule(module2.name, module2.type)) {
-    const atmosphereTop = layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS;
-    const leftUtilities = roleModules.filter((item) => isCoolerModule(item.name, item.type)).sort((left, right) => naturalCompare(left.name, right.name));
-    const coolerIndex = Math.max(0, leftUtilities.findIndex((item) => item.name === module2.name));
-    const hasAligner = roleModules.some((item) => isAlignerModule(item.name, item.type));
-    return {
-      leftPercent: 10,
-      topPixels: atmosphereTop + (hasAligner ? 80 : 0) + coolerIndex * 80,
-      widthPixels: TOPOLOGY_COOLER_WIDTH,
-      heightPixels: TOPOLOGY_COOLER_HEIGHT
-    };
+    return topologyFrameInteriorCorner(
+      topologyAtmosphereFrame(layout),
+      "atmosphere-cooler-top-right@inside",
+      "right",
+      TOPOLOGY_COOLER_WIDTH,
+      TOPOLOGY_COOLER_HEIGHT
+    );
   }
   if (role === "auxiliary" && isBufferModule(module2.name, module2.type)) {
     const atmosphereTop = layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS;
@@ -1614,44 +1917,53 @@ function moduleTopologyPosition(module2, role, index, roleModules, layout, bridg
 }
 function robotTopologyPosition(robotIndex, robotCount, environment, layout) {
   if (environment === "atmosphere") {
-    const atmosphereTop = layout === "cascade" ? TOPOLOGY_CASCADE_ATM_TOP : TOPOLOGY_ATMOSPHERE_ROW_TOP_PIXELS;
+    const atmosphereFrame = topologyAtmosphereFrame(layout);
     if (robotCount > 1) {
       return {
         leftPercent: distributedTopologyColumns(robotCount)[robotIndex] ?? 50,
-        topPixels: atmosphereTop,
+        topPixels: atmosphereFrame.centerTopPixels,
         widthPixels: TOPOLOGY_ROBOT_SIZE,
         heightPixels: TOPOLOGY_ROBOT_SIZE
       };
     }
-    return {
-      leftPercent: 50,
-      topPixels: atmosphereTop,
-      widthPixels: TOPOLOGY_ROBOT_SIZE,
-      heightPixels: TOPOLOGY_ROBOT_SIZE
-    };
+    return topologyFrameAttachment(
+      atmosphereFrame,
+      "atr-center",
+      "center",
+      0,
+      TOPOLOGY_ROBOT_SIZE,
+      TOPOLOGY_ROBOT_SIZE
+    );
   }
   if (layout === "cascade") {
-    const upperCount = Math.max(1, robotCount - 1);
-    return {
-      leftPercent: robotIndex === 0 ? 50 : distributedTopologyColumns(upperCount)[robotIndex - 1] ?? 50,
-      topPixels: robotIndex === 0 ? TOPOLOGY_CASCADE_LOWER_ROBOT_TOP : TOPOLOGY_CASCADE_UPPER_ROBOT_TOP,
-      widthPixels: TOPOLOGY_ROBOT_SIZE,
-      heightPixels: TOPOLOGY_ROBOT_SIZE
-    };
+    const frame = topologyMachineFrame("cascade", robotIndex === 0 ? 1 : 0);
+    return topologyFrameAttachment(
+      frame,
+      robotIndex === 0 ? "vtr-1-center" : `vtr-2-center-${robotIndex}`,
+      "center",
+      0,
+      TOPOLOGY_ROBOT_SIZE,
+      TOPOLOGY_ROBOT_SIZE
+    );
   }
-  return {
-    leftPercent: 50,
-    topPixels: (TOPOLOGY_SINGLE_PROCESS_MIDDLE_TOP + TOPOLOGY_SINGLE_PROCESS_LOWER_TOP) / 2,
-    widthPixels: TOPOLOGY_ROBOT_SIZE,
-    heightPixels: TOPOLOGY_ROBOT_SIZE
-  };
-}
-function topologyVerticalExtent(positions) {
-  if (!positions.length) return null;
-  return {
-    top: Math.min(...positions.map((position) => position.topPixels - (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2)),
-    bottom: Math.max(...positions.map((position) => position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2))
-  };
+  if (layout === "dual") {
+    return topologyFrameAttachment(
+      topologyMachineFrame("dual"),
+      "dual-robot-center",
+      "center",
+      0,
+      TOPOLOGY_ROBOT_SIZE,
+      TOPOLOGY_ROBOT_SIZE
+    );
+  }
+  return topologyFrameAttachment(
+    topologyMachineFrame("single"),
+    "single-robot-center",
+    "center",
+    0,
+    TOPOLOGY_ROBOT_SIZE,
+    TOPOLOGY_ROBOT_SIZE
+  );
 }
 function interpolatedRobotAngle(start, end, progress) {
   let delta = (end - start) % (Math.PI * 2);
@@ -1709,6 +2021,7 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
   const atmosphereNames = new Set(atmosphereRobots.map((robot) => robot.name));
   const vacuumRobots = snapshot.robots.filter((robot) => !atmosphereNames.has(robot.name));
   const layout = device ? detectDeviceTopologyLayout(device) : detectTopologyLayout(visibleModules, snapshot.robots.length);
+  const machineFrames = TOPOLOGY_MACHINE_FRAMES[layout].map((frame) => ({ ...frame }));
   const processChamberViews = layout === "dual" ? expandDualProcessChambers(groups.processModules) : groups.processModules.map((module2) => ({ view: module2, sourceName: module2.name }));
   const processSourceNames = new Map(processChamberViews.map((item) => [item.view.name, item.sourceName]));
   const loadLockNameSet = new Set(groups.loadLocks.map((module2) => module2.name));
@@ -1750,9 +2063,22 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
   });
   positionRobotGroup(vacuumRobots, "vacuum");
   positionRobotGroup(atmosphereRobots, "atmosphere");
+  const atmosphereFrame = { ...topologyAtmosphereFrame(layout) };
   const allPositions = [
     ...modulePositions.values(),
-    ...robotPositions.values()
+    ...robotPositions.values(),
+    ...machineFrames.map((frame) => ({
+      leftPercent: frame.centerLeftPercent,
+      topPixels: frame.centerTopPixels,
+      widthPixels: frame.widthPixels,
+      heightPixels: frame.heightPixels
+    })),
+    {
+      leftPercent: atmosphereFrame.centerLeftPercent,
+      topPixels: atmosphereFrame.centerTopPixels,
+      widthPixels: atmosphereFrame.widthPixels,
+      heightPixels: atmosphereFrame.heightPixels
+    }
   ];
   const minimumTop = allPositions.length ? Math.min(...allPositions.map((position) => position.topPixels - (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2)) : 0;
   const maximumBottom = allPositions.length ? Math.max(...allPositions.map((position) => position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2)) : TOPOLOGY_ITEM_SIZE;
@@ -1767,67 +2093,27 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
   for (const [name, position] of robotPositions) {
     robotPositions.set(name, { ...position, topPixels: position.topPixels + verticalOffset });
   }
-  const positionedModules = (modules) => modules.map((module2) => modulePositions.get(module2.name)).filter((position) => Boolean(position));
-  const positionedRobots = (robots) => robots.map((robot) => robotPositions.get(robot.name)).filter((position) => Boolean(position));
-  const interfaceLoadLocks = groups.loadLocks.filter((module2) => !bridgeLoadLockNames.has(module2.name));
-  const vacuumExtent = topologyVerticalExtent([
-    ...positionedModules(processChamberViews.map((item) => item.view)),
-    ...positionedRobots(vacuumRobots),
-    ...positionedModules(groups.loadLocks.filter((module2) => bridgeLoadLockNames.has(module2.name)))
-  ]);
-  const interfaceExtent = topologyVerticalExtent(positionedModules(interfaceLoadLocks));
-  let atmosphereExtent = topologyVerticalExtent([
-    ...positionedModules(groups.auxiliaryModules),
-    ...positionedModules(groups.loadPorts),
-    ...positionedRobots(atmosphereRobots)
-  ]);
-  if (interfaceExtent && atmosphereExtent) {
-    const atmosphereOffset = interfaceExtent.bottom + 24 - atmosphereExtent.top;
-    const shiftPosition = (position) => {
-      if (position) position.topPixels += atmosphereOffset;
-    };
-    groups.auxiliaryModules.forEach((module2) => shiftPosition(modulePositions.get(module2.name)));
-    groups.loadPorts.forEach((module2) => shiftPosition(modulePositions.get(module2.name)));
-    atmosphereRobots.forEach((robot) => shiftPosition(robotPositions.get(robot.name)));
-    atmosphereExtent = topologyVerticalExtent([
-      ...positionedModules(groups.auxiliaryModules),
-      ...positionedModules(groups.loadPorts),
-      ...positionedRobots(atmosphereRobots)
-    ]);
-    const finalMaximumBottom = Math.max(
-      ...[...modulePositions.values()].map((position) => position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2),
-      ...[...robotPositions.values()].map((position) => position.topPixels + (position.heightPixels ?? TOPOLOGY_ITEM_SIZE) / 2)
-    );
-    canvasHeight = Math.max(520, Math.ceil(finalMaximumBottom + TOPOLOGY_CANVAS_PADDING));
-  }
-  const interfaceTop = interfaceExtent ? Math.max(12, interfaceExtent.top - 12) : Math.round(canvasHeight * 0.48);
-  const interfaceBottom = interfaceExtent ? Math.min(canvasHeight - 12, interfaceExtent.bottom + 12) : interfaceTop;
-  const vacuumTop = vacuumExtent ? Math.max(12, vacuumExtent.top - 24) : 12;
-  const vacuumBottom = Math.max(vacuumTop + 120, interfaceTop - 12);
-  const atmosphereTop = atmosphereExtent ? interfaceExtent ? interfaceBottom + 12 : Math.max(12, atmosphereExtent.top) : interfaceExtent ? interfaceBottom + 12 : Math.round(canvasHeight * 0.52);
-  const atmosphereBottom = atmosphereExtent ? Math.min(canvasHeight - 12, atmosphereExtent.bottom + 24) : canvasHeight - 12;
-  const machineAreaMarkup = `
-    <div class="topology-zone topology-zone-vacuum" style="--zone-top:${vacuumTop}px;--zone-height:${Math.max(120, vacuumBottom - vacuumTop)}px" aria-hidden="true">
-      <span><small>\u771F\u7A7A\u52A0\u5DE5\u533A</small></span>
-    </div>
-    ${interfaceExtent ? `<div class="topology-interface-bay" style="--zone-top:${interfaceTop}px;--zone-height:${Math.max(96, interfaceBottom - interfaceTop)}px" aria-hidden="true"><span>VACUUM / ATM INTERFACE</span></div>` : ""}
-    <div class="topology-zone topology-zone-atmosphere" style="--zone-top:${atmosphereTop}px;--zone-height:${Math.max(120, atmosphereBottom - atmosphereTop)}px" aria-hidden="true">
-      <span><small>\u5927\u6C14\u4F20\u8F93\u533A</small></span>
+  machineFrames.forEach((frame) => {
+    frame.centerTopPixels += verticalOffset;
+  });
+  atmosphereFrame.centerTopPixels += verticalOffset;
+  const machineAreaMarkup = "";
+  const machineFrameMarkup = [...machineFrames, atmosphereFrame].map((frame) => {
+    const frameAnchors = ["top", "right", "bottom", "left"].flatMap((edge) => [1, 2].map((index) => `<i class="topology-frame-anchor topology-frame-anchor-${edge} topology-frame-anchor-${index}" data-anchor-id="${escapeHtml(frame.id)}-${edge}-${index}" data-anchor-edge="${edge}" aria-hidden="true"></i>`)).join("");
+    return `
+    <div class="topology-machine-frame topology-machine-frame-${frame.shape}" data-frame-id="${escapeHtml(frame.id)}" style="--frame-left:${frame.centerLeftPercent}%;--frame-top:${frame.centerTopPixels}px;--frame-width:${frame.widthPixels}px;--frame-height:${frame.heightPixels}px" aria-hidden="true">
+      ${frame.label ? `<span>${escapeHtml(frame.label)}</span>` : ""}
+      ${frameAnchors}
     </div>`;
+  }).join("");
+  const attachmentPointMarkup = [...modulePositions.values(), ...robotPositions.values()].filter((position) => position.attachmentId).map((position) => `<i class="topology-attachment-point" data-attachment-id="${escapeHtml(position.attachmentId ?? "")}" style="--attachment-left:${position.leftPercent}%;--attachment-top:${position.topPixels}px" aria-hidden="true"></i>`).join("");
   const renderModuleGroup = (modules, role) => modules.map((module2, roleIndex) => {
     const position = modulePositions.get(module2.name);
     if (!position) return "";
     const candidateSource = processSourceNames.get(module2.name) ?? module2.name;
-    return `<div class="reference-module-position" style="--module-left:${position.leftPercent}%;--module-top:${position.topPixels}px">${renderModule(module2, snapshot.waferOrigins, role, destinations.get(candidateSource), layout, roleIndex)}</div>`;
+    const fixedLeft = position.fixedLeftOffsetPixels === void 0 ? "" : `;--fixed-left:calc(50% ${position.fixedLeftOffsetPixels < 0 ? "-" : "+"} ${Math.abs(position.fixedLeftOffsetPixels)}px)`;
+    return `<div class="reference-module-position" style="--module-left:${position.leftPercent}%;--module-top:${position.topPixels}px${fixedLeft}">${renderModule(module2, snapshot.waferOrigins, role, destinations.get(candidateSource), layout, roleIndex, position.attachmentId)}</div>`;
   }).join("");
-  const positionedLoadPorts = positionedModules(groups.loadPorts);
-  const loadPortBaseMarkup = positionedLoadPorts.length ? (() => {
-    const lefts = positionedLoadPorts.map((position) => position.leftPercent);
-    const baseCenter = (Math.min(...lefts) + Math.max(...lefts)) / 2;
-    const baseWidth = Math.max(...lefts) - Math.min(...lefts) + TOPOLOGY_LOADPORT_WIDTH / TOPOLOGY_VIEWBOX_WIDTH * 100;
-    const baseTop = positionedLoadPorts[0].topPixels + TOPOLOGY_LOADPORT_HEIGHT / 2 + TOPOLOGY_LOADPORT_BASE_OVERHANG - TOPOLOGY_LOADPORT_BASE_HEIGHT / 2;
-    return `<div class="load-port-shared-base" style="--base-left:${baseCenter.toFixed(2)}%;--base-width:${baseWidth.toFixed(2)}%;--base-top:${baseTop.toFixed(1)}px" aria-hidden="true"></div>`;
-  })() : "";
   const moduleMarkup = [
     renderModuleGroup(processChamberViews.map((item) => item.view), "process"),
     renderModuleGroup(groups.loadLocks, "lock"),
@@ -1856,43 +2142,28 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
       }
     }
     const angleDegrees = armAngle * 180 / Math.PI;
-    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees)}</div>`;
+    const fixedLeft = position.fixedLeftOffsetPixels === void 0 ? "" : `;--fixed-left:calc(50% ${position.fixedLeftOffsetPixels < 0 ? "-" : "+"} ${Math.abs(position.fixedLeftOffsetPixels)}px)`;
+    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px${fixedLeft}">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees)}</div>`;
   }).join("");
   const robotMarkup = renderRobotGroup(vacuumRobots, "vacuum") + renderRobotGroup(atmosphereRobots, "atmosphere");
   return `
     <section class="equipment-schematic" data-topology-layout="${layout}" aria-label="\u5B8C\u6574\u8BBE\u5907\u62D3\u6251\u56DE\u653E">
       <div class="schematic-canvas reference-grid-canvas" style="--topology-canvas-height:${canvasHeight}px">
+        <div class="topology-status-legend" role="group" aria-label="\u56DE\u653E\u72B6\u6001\u56FE\u4F8B">
+          <span><i class="topology-status-legend-processing"></i>\u52A0\u5DE5</span>
+          <span><i class="topology-status-legend-pumping"></i>\u62BD\u6C14</span>
+          <span><i class="topology-status-legend-venting"></i>\u5145\u6C14</span>
+          <span><i class="topology-status-legend-cleaning"></i>\u6E05\u6D01</span>
+          <span><i class="topology-status-legend-transfer"></i>\u4F20\u8F93</span>
+          <span><i class="topology-status-legend-door"></i>\u95E8\u52A8\u4F5C</span>
+        </div>
         ${machineAreaMarkup}
-        ${loadPortBaseMarkup}
+        ${machineFrameMarkup}
+        ${attachmentPointMarkup}
         ${moduleMarkup}
         ${robotMarkup}
       </div>
     </section>`;
-}
-function modelSeconds(value, sign = false) {
-  if (value === null) return "\u2014";
-  const prefix = sign && value > PERFORMANCE_DISPLAY_TOLERANCE ? "+" : "";
-  return `${prefix}${value.toFixed(value >= 100 ? 0 : 1)}s`;
-}
-function modelPreference(value) {
-  const percent = Math.max(0, value) * 100;
-  if (percent > 0 && Math.round(percent) === 0) return "<1%";
-  return `${Math.round(percent)}%`;
-}
-function decisionCandidatePath(candidate) {
-  const robotHand = `${candidate.robot || "Robot"} \u624B\u4E0A`;
-  if (candidate.kind === "pick") {
-    return `${candidate.source || "\u2014"} \u2192 ${robotHand}`;
-  }
-  if (candidate.kind === "place") {
-    return `${robotHand} \u2192 ${candidate.destination || "\u2014"}${candidate.destinationSlot ? ` \xB7 \u69FD ${candidate.destinationSlot}` : ""}`;
-  }
-  if (candidate.kind === "swap") {
-    return `${robotHand} \u2194 ${candidate.destination || "\u2014"}${candidate.destinationSlot ? ` \xB7 \u69FD ${candidate.destinationSlot}` : ""}`;
-  }
-  const source = candidate.source || "\u5F53\u524D\u4F4D\u7F6E";
-  const destination = candidate.destination || "\u2014";
-  return `${source} \u2192 ${destination}${candidate.destinationSlot ? ` \xB7 \u69FD ${candidate.destinationSlot}` : ""}`;
 }
 function decisionSpaceSignature(decision) {
   const actionIds = decision.candidates.map((candidate) => candidate.actionId).filter(Boolean).sort();
@@ -1908,114 +2179,56 @@ function primitiveDecisionBoundaryTimes(moves) {
     moves.filter((move) => PRIMITIVE_DECISION_COMPLETION_MOVE_TYPES.has(finiteNumber(move.MoveType, -1))).map((move) => finiteNumber(move.EndTime)).filter((time) => time >= 0)
   )].sort((left, right) => left - right);
 }
-function renderDecisionLens(decision, requestState = "idle", requestError = "") {
+function renderDecisionLens(decision, requestState = "idle", requestError = "", statusFilters = ["enabled"]) {
   if (!decision) {
     if (requestState === "loading") {
       return `
         <div class="decision-empty is-loading" role="status" aria-live="polite">
           <div class="visual-loader" aria-hidden="true"></div>
-          <strong>\u6B63\u5728\u8BC4\u4F30\u5F53\u524D\u5408\u6CD5\u52A8\u4F5C</strong>
-          <p>\u6B63\u5728\u91CD\u5EFA\u673A\u5668\u72B6\u6001\u5E76\u8FD0\u884C\u63A8\u8350\u6A21\u578B\u3002</p>
+          <strong>\u6B63\u5728\u66F4\u65B0\u5F53\u524D\u52A8\u4F5C</strong>
+          <p>\u6B63\u5728\u6309 Move \u72B6\u6001\u8C03\u7528\u7B97\u6CD5\u52A8\u4F5C\u63A5\u53E3\u3002</p>
         </div>`;
     }
     if (requestState === "error") {
       return `
         <div class="decision-empty is-error" role="alert">
-          <strong>\u63A8\u8350\u6A21\u578B\u8BC4\u4F30\u5931\u8D25</strong>
-          <p>${escapeHtml(requestError || "\u65E0\u6CD5\u83B7\u53D6\u5F53\u524D\u5408\u6CD5\u52A8\u4F5C\uFF0C\u8BF7\u68C0\u67E5\u670D\u52A1\u72B6\u6001\u3002")}</p>
+          <strong>\u52A8\u4F5C\u63A5\u53E3\u8C03\u7528\u5931\u8D25</strong>
+          <p>${escapeHtml(requestError || "\u65E0\u6CD5\u83B7\u53D6\u5F53\u524D\u52A8\u4F5C\uFF0C\u8BF7\u68C0\u67E5\u670D\u52A1\u72B6\u6001\u3002")}</p>
         </div>`;
     }
     return `
       <div class="decision-empty">
-        <strong>\u5F53\u524D\u65F6\u523B\u6682\u65E0\u5408\u6CD5\u52A8\u4F5C</strong>
-        <p>\u56DE\u653E\u5230\u4E0B\u4E00\u8BBE\u5907\u4E8B\u4EF6\u540E\u66F4\u65B0\u3002</p>
+        <strong>\u5F53\u524D\u52A8\u4F5C\u5361\u7247\u4E3A\u7A7A</strong>
+        <p>\u5F53\u524D\u7B97\u6CD5\u672A\u63D0\u4F9B\u52A8\u4F5C\u63A5\u53E3\uFF0C\u6216\u56DE\u653E\u5230\u6B64\u65F6\u6CA1\u6709\u52A8\u4F5C\u3002</p>
       </div>`;
   }
-  if (decision.model === "dual-actor-e2e") {
-    return renderDualActorDecisionLens(decision);
-  }
-  const shownText = decision.candidatesTruncated ? `\u5C55\u793A Top ${decision.shownCandidateCount} / ${decision.candidateCount}` : `${decision.candidateCount} \u4E2A\u53EF\u884C\u52A8\u4F5C`;
-  const hasExplicitRecommendation = decision.candidates.some((candidate) => candidate.selected) || Boolean(decision.selectedActionId);
-  const rankedCandidates = [...decision.candidates].sort((left, right) => Number(left.priorityDeferred) - Number(right.priorityDeferred) || right.policyPreference - left.policyPreference || left.rank - right.rank || left.actionId.localeCompare(right.actionId));
-  const candidates = rankedCandidates.map((candidate, index) => {
-    const preference = modelPreference(candidate.policyPreference);
-    const isRecommendation = hasExplicitRecommendation ? candidate.selected || candidate.actionId === decision.selectedActionId : index === 0;
-    const tags = `${isRecommendation ? '<span class="decision-tag is-recommendation">E2E\u63A8\u8350</span>' : ""}${candidate.executed ? '<span class="decision-tag is-plan">\u4E0E\u8BA1\u5212\u4E00\u81F4</span>' : ""}`;
-    const delta = isRecommendation ? "\u0394 \u57FA\u51C6" : `\u0394 ${modelSeconds(candidate.makespanDelta, true)}`;
+  const statusLabels = {
+    enabled: "\u4F7F\u80FD",
+    "physical-blocked": "\u7269\u7406\u62E6\u622A",
+    "deadlock-blocked": "\u6B7B\u9501\u89C4\u5219\u62E6\u622A"
+  };
+  const kindLabels = { pick: "Pick", place: "Place", swap: "Swap" };
+  const visibleActions = decision.actionDiagnostics.filter((action) => statusFilters.includes(action.status));
+  const cards = visibleActions.map((action) => {
+    const source = action.sourceSlot > 0 ? `${action.source} #${action.sourceSlot}` : action.source;
+    const destination = action.destinationSlot > 0 ? `${action.destination} #${action.destinationSlot}` : action.destination;
     return `
-      <li class="decision-candidate">
-        <div class="decision-candidate-rank" aria-label="\u7B2C ${index + 1} \u540D">${index + 1}</div>
+      <li class="decision-candidate action-card action-status-${action.status}">
+        <span class="decision-tag action-kind">${kindLabels[action.kind]}</span>
         <div class="decision-candidate-main">
-          <div class="decision-candidate-title"><strong>${escapeHtml(decisionCandidatePath(candidate))}</strong>${tags}</div>
-          <small>${escapeHtml(candidate.robot || "Robot")} \xB7 ${escapeHtml(candidate.flowKind || candidate.kind)}</small>
-          <div class="decision-candidate-detail">
-            <span>\u5269\u4F59\u5DE5\u671F <strong>${modelSeconds(candidate.expectedRemainingMakespan)}</strong></span>
-            <span>${delta}</span>
-          </div>
+          <div class="decision-candidate-title"><strong>${escapeHtml(source || action.robot)} \u2192 ${escapeHtml(destination || "Robot hand")}</strong></div>
+          <small>${escapeHtml(action.robot || "Robot")} \xB7 ${action.materialIds.length ? `Material ${escapeHtml(action.materialIds.join(", "))}` : "\u65E0\u7269\u6599\u6807\u8BC6"}</small>
+          ${action.reason ? `<p class="action-block-reason">${escapeHtml(action.reason)}</p>` : ""}
         </div>
-        <strong class="decision-candidate-preference" aria-label="E2E \u504F\u597D ${preference}">${preference}</strong>
+        <span class="decision-tag action-status">${statusLabels[action.status]}</span>
       </li>`;
   }).join("");
+  const counts = decision.actionCounts;
+  const provider = decision.actionDiagnosticsSource === "algorithm" ? `\u7B97\u6CD5\u63A5\u53E3 \xB7 ${decision.actionDiagnosticsProvider || "\u672A\u547D\u540D\u5B9E\u73B0"}` : "\u7B97\u6CD5\u672A\u63D0\u4F9B\u52A8\u4F5C\u63A5\u53E3";
   return `
-    <section class="decision-candidate-section" aria-labelledby="decisionCandidatesTitle">
-      <header>
-        <strong id="decisionCandidatesTitle">\u51B3\u7B56 #${decision.decisionIndex} <small>@ ${formatSeconds(decision.time)}s</small></strong>
-        <span>${escapeHtml(shownText)} \xB7 E2E \u6392\u5E8F</span>
-      </header>
-      ${candidates ? `<ol>${candidates}</ol>` : '<p class="decision-alternative-empty">\u5F53\u524D\u6CA1\u6709\u5408\u6CD5\u52A8\u4F5C</p>'}
-    </section>`;
-}
-function renderDualActorDecisionLens(decision) {
-  const groupsByActor = new Map(
-    decision.candidateGroups.map((group) => [group.actor, group])
-  );
-  const groups = [
-    { actor: "atmosphere", label: "\u5927\u6C14\u7AEF Actor", hint: "LoadPort \u2194 LoadLock" },
-    { actor: "vacuum", label: "\u771F\u7A7A\u7AEF Actor", hint: "LoadLock \u2194 \u5DE5\u827A\u8154" }
-  ].map((definition) => ({
-    ...definition,
-    group: groupsByActor.get(definition.actor) ?? null
-  }));
-  const groupMarkup = groups.map(({ actor, label, hint, group }) => {
-    const rankedCandidates = [...group?.candidates ?? []].sort((left, right) => right.policyPreference - left.policyPreference || left.rank - right.rank || left.actionId.localeCompare(right.actionId));
-    const shownText = group?.candidatesTruncated ? `Top ${group.shownCandidateCount} / ${group.candidateCount}` : `${group?.candidateCount ?? 0} \u4E2A\u539F\u5B50\u52A8\u4F5C`;
-    const candidates = rankedCandidates.map((candidate, index) => {
-      const preference = modelPreference(candidate.policyPreference);
-      const isRecommendation = candidate.selected || candidate.actionId === group?.selectedActionId || !group?.selectedActionId && index === 0;
-      const recommendationTag = isRecommendation ? `<span class="decision-tag is-recommendation is-${actor}">${actor === "atmosphere" ? "\u5927\u6C14\u7AEF\u63A8\u8350" : "\u771F\u7A7A\u7AEF\u63A8\u8350"}</span>` : "";
-      const planTag = candidate.executed ? '<span class="decision-tag is-plan">\u4E0E\u8BA1\u5212\u4E00\u81F4</span>' : "";
-      const remainingCost = candidate.expectedRemainingCost ?? candidate.expectedRemainingMakespan;
-      const delta = isRecommendation ? "\u0394 \u57FA\u51C6" : `\u0394 ${modelSeconds(candidate.makespanDelta, true)}`;
-      return `
-        <li class="decision-candidate">
-          <div class="decision-candidate-rank" aria-label="\u7B2C ${index + 1} \u540D">${index + 1}</div>
-          <div class="decision-candidate-main">
-            <div class="decision-candidate-title"><strong>${escapeHtml(decisionCandidatePath(candidate))}</strong>${recommendationTag}${planTag}</div>
-            <small>${escapeHtml(candidate.robot || "Robot")} \xB7 ${escapeHtml(candidate.kind || "\u539F\u5B50\u52A8\u4F5C")}</small>
-            <div class="decision-candidate-detail">
-              <span>\u5269\u4F59\u6210\u672C <strong>${modelSeconds(remainingCost)}</strong></span>
-              <span>${delta}</span>
-            </div>
-          </div>
-          <strong class="decision-candidate-preference" aria-label="${escapeHtml(label)}\u504F\u597D ${preference}">${preference}</strong>
-        </li>`;
-    }).join("");
-    return `
-      <article class="dual-actor-recommendation is-${actor}" data-recommendation-actor="${actor}">
-        <header>
-          <div><strong>${label}</strong><small>${hint}</small></div>
-          <span>${shownText} \xB7 \u72EC\u7ACB\u6392\u5E8F</span>
-        </header>
-        ${candidates ? `<ol>${candidates}</ol>` : '<p class="decision-alternative-empty">\u5F53\u524D\u63A7\u5236\u57DF\u6CA1\u6709\u5408\u6CD5\u539F\u5B50\u52A8\u4F5C</p>'}
-      </article>`;
-  }).join("");
-  return `
-    <section class="dual-actor-decision" aria-labelledby="dualActorDecisionTitle">
-      <header class="dual-actor-decision-head">
-        <strong id="dualActorDecisionTitle">\u51B3\u7B56 #${decision.decisionIndex} <small>@ ${formatSeconds(decision.time)}s</small></strong>
-        <span>\u53CC Actor \xB7 ${decision.replayEvaluated ? "\u56DE\u653E\u91CD\u8BC4\u4F30" : "\u539F\u59CB\u6A21\u578B\u51B3\u7B56"}</span>
-      </header>
-      <div class="dual-actor-recommendation-list">${groupMarkup}</div>
+    <section class="decision-candidate-section" aria-label="\u5F53\u524D\u5408\u6CD5\u52A8\u4F5C">
+      <p class="action-count-summary">\u4F7F\u80FD ${counts.enabled} \xB7 \u7269\u7406\u62E6\u622A ${counts["physical-blocked"]} \xB7 \u6B7B\u9501\u62E6\u622A ${counts["deadlock-blocked"]}</p>
+      ${cards ? `<ul>${cards}</ul>` : '<p class="decision-alternative-empty">\u5F53\u524D\u7B5B\u9009\u6761\u4EF6\u4E0B\u6CA1\u6709\u52A8\u4F5C</p>'}
     </section>`;
 }
 function formatPercent(value) {
@@ -2078,7 +2291,7 @@ function renderBottleneckAnalysis(performance2) {
     loadport: "LoadPort",
     auxiliary: "\u8F85\u52A9\u6A21\u5757"
   };
-  const displayedResources = groupedBottleneckResources(performance2);
+  const displayedResources = groupedBottleneckResources(performance2).slice(0, 3);
   const resourceRows = (items) => items.map((resource, index) => {
     const candidate = resource.candidate;
     const evidenceScore = candidate ? Math.round(candidate.score * 100) : null;
@@ -2086,28 +2299,27 @@ function renderBottleneckAnalysis(performance2) {
     const resourceLabel = resource.memberNames.length > 1 ? `${resourceKindLabels[resource.kind]} \xB7 ${resource.memberNames.length} \u53F0\u5E73\u5747` : resourceKindLabels[resource.kind];
     return `
       <li class="resource-utilization-row">
-        <div class="resource-utilization-name">
-          <span>${index + 1}</span>
-          <div><strong>${escapeHtml(resource.name)}</strong><small>${escapeHtml(resourceLabel)}</small></div>
+        <div class="resource-utilization-summary">
+          <div class="resource-utilization-name">
+            <span>${index + 1}</span>
+            <div><strong>${escapeHtml(resource.name)}</strong><small>${escapeHtml(resourceLabel)}</small></div>
+          </div>
+          <strong class="resource-utilization-percent">${formatPercent(resource.utilization)}</strong>
+          <div class="utilization-track" aria-label="${escapeHtml(resource.name)} \u5360\u7528\u7387 ${formatPercent(resource.utilization)}">${renderCategoryBars(resource, window.duration)}</div>
+          <div class="resource-evidence-score"><strong>${evidenceScore ?? "\u2014"}</strong><small>${evidenceLabel}</small></div>
+          <span aria-hidden="true"></span>
         </div>
-        <strong class="resource-utilization-percent">${formatPercent(resource.utilization)}</strong>
-        <div class="utilization-track" aria-label="${escapeHtml(resource.name)} \u5360\u7528\u7387 ${formatPercent(resource.utilization)}">${renderCategoryBars(resource, window.duration)}</div>
-        <small class="resource-utilization-time">${formatSeconds(resource.busyTime)} s</small>
-        <div class="resource-evidence-score"><strong>${evidenceScore ?? "\u2014"}</strong><small>${evidenceLabel}</small></div>
       </li>`;
   }).join("");
   const legend = ACTIVITY_CATEGORIES.map((category) => `<span><i class="performance-swatch category-${category}"></i>${ACTIVITY_CATEGORY_LABELS[category]}</span>`).join("");
   return `
-    <header class="bottleneck-analysis-head">
-      <div>
-        <strong>\u74F6\u9888\u5206\u6790</strong>
-      </div>
+    <header class="analysis-section-head bottleneck-analysis-head">
+      <div class="analysis-section-title"><strong>\u74F6\u9888\u5206\u6790</strong></div>
       <div class="bottleneck-analysis-actions">
-        <button class="bottleneck-analysis-help" id="bottleneckAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="bottleneckAnalysisHelpDialog">\u74F6\u9888\u5206\u6790\u8BF4\u660E</button>
         <label class="bottleneck-window-control"><span class="visually-hidden">\u7EDF\u8BA1\u53E3\u5F84</span><div class="bottleneck-window-slot"></div></label>
+        <button class="analysis-secondary-button bottleneck-analysis-help" id="bottleneckAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="bottleneckAnalysisHelpDialog"><span aria-hidden="true">\u24D8</span> \u8BF4\u660E</button>
       </div>
     </header>
-    <div class="resource-utilization-head" aria-hidden="true"><span>\u8D44\u6E90</span><span>\u5229\u7528\u7387</span><span>\u5360\u7528\u7EC4\u6210</span><span>\u6D3B\u8DC3\u65F6\u957F</span><span>\u74F6\u9888\u8BC1\u636E\u5F97\u5206</span></div>
     <ol class="resource-utilization-list">
       ${resourceRows(displayedResources)}
     </ol>
@@ -2124,7 +2336,7 @@ function renderResidenceMetricChart(samples, kind) {
   const values = samples.map(metric.value);
   const meanSeconds = values.reduce((sum, value) => sum + value, 0) / values.length;
   const maximumSeconds = Math.max(...values, 1);
-  const plotHeight = 120;
+  const plotHeight = 150;
   const scaleMaximum = maximumSeconds * 1.08;
   const meanHeight = Math.min(meanSeconds / scaleMaximum * plotHeight, plotHeight);
   const bars = samples.map((sample) => {
@@ -2133,7 +2345,7 @@ function renderResidenceMetricChart(samples, kind) {
     const wafer = escapeHtml(String(sample.wafer));
     const duration = formatSeconds(seconds);
     return `
-      <li class="residence-metric-bar-item" role="img" aria-label="\u6676\u5706 ${wafer}\uFF0C${metric.label} ${duration} \u79D2" title="\u6676\u5706 ${wafer} \xB7 ${metric.label} ${duration} s">
+      <li class="residence-metric-bar-item" role="img" aria-label="\u6676\u5706 ${wafer}\uFF0C${metric.label} ${duration} \u79D2">
         <strong>${duration}</strong>
         <span class="residence-metric-bar residence-bar-${kind}"><i style="height:${height.toFixed(2)}px"></i></span>
         <small>${wafer}</small>
@@ -2151,45 +2363,34 @@ function renderResidenceMetricChart(samples, kind) {
 }
 function renderWaferResidenceChart(performance2) {
   const samples = performance2.waferSystemResidenceTimes ?? [];
-  const helpButton = `<button class="bottleneck-analysis-help residence-analysis-help" id="residenceAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="residenceAnalysisHelpDialog">\u8BF4\u660E</button>`;
+  const helpButton = `<button class="analysis-secondary-button residence-analysis-help" id="residenceAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="residenceAnalysisHelpDialog"><span aria-hidden="true">\u24D8</span> \u8BF4\u660E</button>`;
   if (!samples.length) {
     return `
-      <header class="residence-chart-head"><strong>\u9A7B\u7559\u65F6\u95F4\u5206\u6790</strong>${helpButton}</header>
-      <div class="residence-chart-empty">\u5F53\u524D\u7ED3\u679C\u4E2D\u6CA1\u6709\u5B8C\u6210\u5F80\u8FD4 LoadPort \u7684\u6676\u5706\u3002</div>`;
+      <header class="analysis-section-head residence-chart-head"><div class="analysis-section-title"><strong>\u9A7B\u7559\u65F6\u95F4\u5206\u6790</strong></div>${helpButton}</header>
+      <div class="analysis-empty-state"><strong>\u6682\u65E0\u9A7B\u7559\u6570\u636E</strong><span>\u5F53\u524D\u7ED3\u679C\u4E2D\u6CA1\u6709\u5B8C\u6210\u5F80\u8FD4 LoadPort \u7684\u6676\u5706\u3002</span></div>`;
   }
   const systemValues = samples.map((sample) => sample.duration);
-  const systemMeanSeconds = systemValues.reduce((sum, value) => sum + value, 0) / systemValues.length;
-  const maximumSeconds = Math.max(...systemValues);
-  const minimumSeconds = Math.min(...systemValues);
-  const rangeToMinimumPercent = minimumSeconds > PERFORMANCE_DISPLAY_TOLERANCE ? (maximumSeconds - minimumSeconds) / minimumSeconds * 100 : null;
-  const chamberMeanSeconds = samples.reduce((sum, sample) => sum + (sample.chamberDwellSeconds ?? 0), 0) / samples.length;
-  const robotMeanSeconds = samples.reduce((sum, sample) => sum + (sample.robotDwellSeconds ?? 0), 0) / samples.length;
   const chamberValues = samples.map((sample) => sample.chamberDwellSeconds ?? 0);
   const robotValues = samples.map((sample) => sample.robotDwellSeconds ?? 0);
-  const summary = (kind, content) => `<div class="residence-chart-summary" data-residence-summary="${kind}"${kind === "system" ? "" : " hidden"}>${content}</div>`;
+  const metricSummary = (values, label) => {
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const deviation = Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+    const upperControlLimit = mean + deviation * 2;
+    const abnormalCount = values.filter((value) => value > upperControlLimit).length;
+    return `<span><small>\u5E73\u5747</small><b>${formatSeconds(mean)}</b><em>s</em></span><span><small>\u6700\u5927</small><b>${formatSeconds(Math.max(...values))}</b><em>s</em></span><span class="${abnormalCount ? "is-warning" : ""}"><small>\u504F\u9AD8\u6BD4\u4F8B</small><b>${(abnormalCount / values.length * 100).toFixed(1)}</b><em>%</em></span><span><small>\u6837\u672C</small><b>${values.length}</b><em>\u7247</em></span><span class="visually-hidden">${label}</span>`;
+  };
+  const summary = (kind, content) => `<div class="analysis-compact-stats residence-chart-summary" data-residence-summary="${kind}"${kind === "system" ? "" : " hidden"}>${content}</div>`;
   return `
-    <header class="residence-chart-head">
-      <strong>\u9A7B\u7559\u65F6\u95F4\u5206\u6790</strong>
-      <label class="residence-metric-control"><span class="visually-hidden">\u9009\u62E9\u9A7B\u7559\u65F6\u95F4\u56FE\u8868</span><select id="residenceMetricSelect" aria-label="\u9009\u62E9\u9A7B\u7559\u65F6\u95F4\u56FE\u8868">
+    <header class="analysis-section-head residence-chart-head">
+      <div class="analysis-section-title"><strong>\u9A7B\u7559\u65F6\u95F4\u5206\u6790</strong></div>
+      <label class="analysis-filter residence-metric-control"><select id="residenceMetricSelect" aria-label="\u9009\u62E9\u9A7B\u7559\u65F6\u95F4\u56FE\u8868">
         <option value="system">\u7CFB\u7EDF\u9A7B\u7559\u65F6\u95F4</option>
         <option value="chamber">\u8154\u5BA4\u9A7B\u7559\u65F6\u95F4</option>
         <option value="robot">\u673A\u5668\u624B\u9A7B\u7559\u65F6\u95F4</option>
       </select></label>
-      ${summary("system", `
-        <span>\u7CFB\u7EDF\u5E73\u5747 <b>${formatSeconds(systemMeanSeconds)} s</b></span>
-        <span>\u7CFB\u7EDF\u6700\u5927 <b>${formatSeconds(maximumSeconds)} s</b></span>
-        <span>\u6781\u5DEE/\u6700\u5C0F\u503C <b>${rangeToMinimumPercent === null ? "\u2014" : `${rangeToMinimumPercent.toFixed(1)}%`}</b></span>
-        <span>\u6837\u672C <b>${samples.length} \u7247</b></span>`)}
-      ${summary("chamber", `
-        <span>\u8154\u5BA4\u5E73\u5747 <b>${formatSeconds(chamberMeanSeconds)} s</b></span>
-        <span>\u8154\u5BA4\u6700\u5927 <b>${formatSeconds(Math.max(...chamberValues))} s</b></span>
-        <span>\u8154\u5BA4\u7D2F\u8BA1 <b>${formatSeconds(chamberValues.reduce((sum, value) => sum + value, 0))} s</b></span>
-        <span>\u6837\u672C <b>${samples.length} \u7247</b></span>`)}
-      ${summary("robot", `
-        <span>\u673A\u5668\u624B\u5E73\u5747 <b>${formatSeconds(robotMeanSeconds)} s</b></span>
-        <span>\u673A\u5668\u624B\u6700\u5927 <b>${formatSeconds(Math.max(...robotValues))} s</b></span>
-        <span>\u673A\u5668\u624B\u7D2F\u8BA1 <b>${formatSeconds(robotValues.reduce((sum, value) => sum + value, 0))} s</b></span>
-        <span>\u6837\u672C <b>${samples.length} \u7247</b></span>`)}
+      ${summary("system", metricSummary(systemValues, "\u7CFB\u7EDF\u9A7B\u7559"))}
+      ${summary("chamber", metricSummary(chamberValues, "\u8154\u5BA4\u9A7B\u7559"))}
+      ${summary("robot", metricSummary(robotValues, "\u673A\u5668\u624B\u9A7B\u7559"))}
       ${helpButton}
     </header>
     <div class="residence-chart-body">
@@ -2198,8 +2399,162 @@ function renderWaferResidenceChart(performance2) {
       ${renderResidenceMetricChart(samples, "robot")}
     </div>`;
 }
+function filterThroughputPoints(points, range) {
+  if (!points.length || range === "all") return points;
+  const [kind, rawAmount] = range.split(":");
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount) || amount <= 0) return points;
+  if (kind === "wafer") return points.slice(-Math.floor(amount));
+  if (kind === "time") {
+    const cutoff = points[points.length - 1].completedAt - amount;
+    const filtered = points.filter((point) => point.completedAt >= cutoff);
+    return filtered.length ? filtered : points.slice(-1);
+  }
+  return points;
+}
+var MAXIMUM_THROUGHPUT_DRAW_POINTS = 72;
+var MAXIMUM_THROUGHPUT_VALUE_LABELS = 12;
+function simplifyThroughputPoints(points) {
+  if (points.length <= MAXIMUM_THROUGHPUT_DRAW_POINTS) return points;
+  const interior = points.slice(1, -1);
+  const bucketCount = Math.max(1, Math.floor((MAXIMUM_THROUGHPUT_DRAW_POINTS - 2) / 2));
+  const selected = [points[0]];
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const start = Math.floor(bucket * interior.length / bucketCount);
+    const end = Math.max(start + 1, Math.floor((bucket + 1) * interior.length / bucketCount));
+    const rows = interior.slice(start, end).map((point, index) => ({ point, index: start + index }));
+    const minimum = rows.reduce((best, row) => row.point.throughputPerHour < best.point.throughputPerHour ? row : best);
+    const maximum = rows.reduce((best, row) => row.point.throughputPerHour > best.point.throughputPerHour ? row : best);
+    [minimum, maximum].sort((left, right) => left.index - right.index).forEach((row) => {
+      if (selected[selected.length - 1] !== row.point) selected.push(row.point);
+    });
+  }
+  selected.push(points[points.length - 1]);
+  return selected;
+}
+function renderThroughputSvg(points, title) {
+  const width = 760;
+  const height = 174;
+  const left = 12;
+  const right = 12;
+  const top = 12;
+  const bottom = 12;
+  const usableWidth = width - left - right;
+  const usableHeight = height - top - bottom;
+  const allValues = points.map((point) => Math.max(0, Number(point.throughputPerHour) || 0));
+  const mean = allValues.reduce((sum, value) => sum + value, 0) / allValues.length;
+  const displayPoints = simplifyThroughputPoints(points);
+  const values = displayPoints.map((point) => Math.max(0, Number(point.throughputPerHour) || 0));
+  const observedMinimum = Math.min(...values);
+  const observedMaximum = Math.max(...values);
+  const spread = Math.max(observedMaximum - observedMinimum, Math.max(mean * 0.04, 1));
+  const padding = Math.max(1, spread * 0.18);
+  const step = spread > 20 ? 5 : spread > 8 ? 2 : 1;
+  const minimum = Math.max(0, Math.floor((observedMinimum - padding) / step) * step);
+  const maximum = Math.max(minimum + step * 3, Math.ceil((observedMaximum + padding) / step) * step);
+  const yRange = maximum - minimum;
+  const firstIndex = displayPoints[0].completedWaferIndex;
+  const lastIndex = displayPoints[displayPoints.length - 1].completedWaferIndex;
+  const indexRange = Math.max(1, lastIndex - firstIndex);
+  const coordinates = displayPoints.map((point, index) => ({
+    x: left + (point.completedWaferIndex - firstIndex) / indexRange * usableWidth,
+    y: top + (1 - (values[index] - minimum) / yRange) * usableHeight
+  }));
+  const linePath = coordinates.length === 1 ? `M ${coordinates[0].x.toFixed(2)} ${coordinates[0].y.toFixed(2)}` : coordinates.reduce((path, point, index) => {
+    if (index === 0) return `M ${point.x.toFixed(2)} ${point.y.toFixed(2)}`;
+    return `${path} L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`;
+  }, "");
+  const latest = displayPoints[displayPoints.length - 1];
+  const yForValue = (value) => top + (1 - (value - minimum) / yRange) * usableHeight;
+  const meanY = yForValue(mean);
+  const labelStride = Math.max(1, Math.ceil(displayPoints.length / MAXIMUM_THROUGHPUT_VALUE_LABELS));
+  const pointTargets = displayPoints.map((point, index) => {
+    const coordinate = coordinates[index];
+    const value = values[index];
+    const previousValue = values[index - 1] ?? value;
+    const nextValue = values[index + 1] ?? value;
+    const isLocalMinimum = index > 0 && index < values.length - 1 && value <= previousValue && value <= nextValue;
+    const labelY = isLocalMinimum ? Math.min(top + usableHeight - 4, coordinate.y + 17) : Math.max(top + 10, coordinate.y - 9);
+    const labelClass = isLocalMinimum ? "throughput-chart-value is-below" : "throughput-chart-value";
+    const showLabel = index === 0 || index === displayPoints.length - 1 || index % labelStride === 0;
+    return `${showLabel ? `<text class="${labelClass}" x="${coordinate.x.toFixed(2)}" y="${labelY.toFixed(2)}" text-anchor="middle">${value.toFixed(1)}</text>` : ""}<circle class="throughput-chart-point" cx="${coordinate.x.toFixed(2)}" cy="${coordinate.y.toFixed(2)}" r="${displayPoints.length > 36 ? "1.8" : "2.6"}"/>`;
+  }).join("");
+  return `
+        <svg class="throughput-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${title}\uFF0C\u6700\u65B0\u4E3A\u7B2C ${latest.completedWaferIndex} \u7247\uFF0C\u6BCF\u5C0F\u65F6 ${latest.throughputPerHour.toFixed(1)} \u7247">
+          <g class="throughput-control-lines">
+            <line class="throughput-mean-line" x1="${left}" y1="${meanY.toFixed(2)}" x2="${width - right}" y2="${meanY.toFixed(2)}"/>
+          </g>
+          <path class="throughput-chart-line" d="${linePath}"/>
+          ${pointTargets}
+          <circle class="throughput-chart-latest" cx="${coordinates[coordinates.length - 1].x.toFixed(2)}" cy="${coordinates[coordinates.length - 1].y.toFixed(2)}" r="4"/>
+        </svg>`;
+}
+function renderThroughputLine(points, chartKey, title, visible, initialRange = "wafer:30") {
+  const serializedPoints = escapeHtml(JSON.stringify(points));
+  const visiblePoints = filterThroughputPoints(points, initialRange);
+  return `
+    <div class="throughput-chart" data-throughput-chart="${chartKey}" data-throughput-title="${escapeHtml(title)}" data-throughput-points="${serializedPoints}"${visible ? "" : " hidden"}>
+      <div class="throughput-chart-scroll" tabindex="0" aria-label="${escapeHtml(title)}\uFF0C\u9010\u70B9\u5C55\u793A\u4EA7\u80FD\u6570\u503C">
+        <div class="throughput-chart-canvas">${renderThroughputSvg(visiblePoints, title)}</div>
+      </div>
+    </div>`;
+}
+function renderThroughputChart(performance2) {
+  const timeline = performance2.throughputTimeline;
+  const helpButton = `<button class="analysis-secondary-button throughput-analysis-help" id="throughputAnalysisHelpButton" type="button" aria-haspopup="dialog" aria-controls="throughputAnalysisHelpDialog"><span aria-hidden="true">\u24D8</span> \u8BF4\u660E</button>`;
+  if (!timeline?.cumulative?.length) {
+    return `
+      <header class="analysis-section-head throughput-chart-head"><div class="analysis-section-title"><strong>\u4EA7\u80FD\u5206\u6790</strong></div>${helpButton}</header>
+      <div class="analysis-empty-state"><strong>\u6682\u65E0\u751F\u4EA7\u6570\u636E</strong><span>\u8BF7\u7B49\u5F85\u65B0\u7684\u6676\u5706\u5B8C\u6210\u540E\u67E5\u770B\u5206\u6790\u7ED3\u679C\u3002</span></div>`;
+  }
+  const cumulative = timeline.cumulative;
+  const minimumWindow = timeline.rollingWindowMinimum;
+  const maximumWindow = timeline.rollingWindowMaximum;
+  const defaultWindow = Math.min(Math.max(5, minimumWindow), maximumWindow);
+  const windowOptions = Array.from(
+    { length: maximumWindow - minimumWindow + 1 },
+    (_, index) => minimumWindow + index
+  );
+  const lastCumulative = cumulative[cumulative.length - 1];
+  const summary = (chartKey, content, visible) => `<div class="analysis-compact-stats throughput-chart-summary" data-throughput-summary="${chartKey}"${visible ? "" : " hidden"}>${content}</div>`;
+  const rollingContent = windowOptions.map((windowSize) => {
+    const points = timeline.rollingByWindow[String(windowSize)] ?? [];
+    const latest = points[points.length - 1];
+    const average = points.length ? points.reduce((sum, point) => sum + point.throughputPerHour, 0) / points.length : 0;
+    return summary(
+      `rolling-${windowSize}`,
+      latest ? `<span><small>\u6700\u65B0</small><b>${latest.throughputPerHour.toFixed(1)}</b><em>\u7247/h</em></span><span><small>\u5E73\u5747</small><b>${average.toFixed(1)}</b><em>\u7247/h</em></span>` : `<span class="is-muted"><small>\u6837\u672C\u72B6\u6001</small><b>\u4E0D\u8DB3</b><em>\u81F3\u5C11 ${windowSize + 1} \u7247</em></span>`,
+      windowSize === defaultWindow
+    );
+  }).join("");
+  const rollingCharts = windowOptions.map((windowSize) => {
+    const points = timeline.rollingByWindow[String(windowSize)] ?? [];
+    const chartKey = `rolling-${windowSize}`;
+    return points.length ? renderThroughputLine(points, chartKey, `${windowSize} \u7247\u6ED1\u52A8\u7A97\u53E3\u4EA7\u80FD\u66F2\u7EBF`, windowSize === defaultWindow) : `<div class="throughput-chart-empty" data-throughput-chart="${chartKey}" hidden>\u5C1A\u672A\u5F62\u6210\u5B8C\u6574 ${windowSize} \u7247\u6ED1\u52A8\u7A97\u53E3\u3002</div>`;
+  }).join("");
+  const cumulativeAverage = cumulative.reduce((sum, point) => sum + point.throughputPerHour, 0) / cumulative.length;
+  return `
+    <header class="analysis-section-head throughput-chart-head">
+      <div class="analysis-section-title"><strong>\u4EA7\u80FD\u5206\u6790</strong></div>
+      <div class="analysis-filter-group">
+      <label class="analysis-filter throughput-metric-control"><select id="throughputMetricSelect" aria-label="\u9009\u62E9\u4EA7\u80FD\u53E3\u5F84">
+        <option value="cumulative">\u7D2F\u8BA1\u4EA7\u80FD\uFF08\u516C\u53F8\u53E3\u5F84\uFF09</option>
+        <option value="rolling" selected>\u6ED1\u52A8\u7A97\u53E3</option>
+      </select></label>
+      <label class="analysis-filter throughput-window-control" data-throughput-window-control><select id="throughputWindowSize" aria-label="\u6ED1\u52A8\u7A97\u53E3\u5927\u5C0F">${windowOptions.map((windowSize) => `<option value="${windowSize}"${windowSize === defaultWindow ? " selected" : ""}>${windowSize} \u7247</option>`).join("")}</select></label>
+      <label class="analysis-filter throughput-range-control"><select id="throughputRangeSelect" aria-label="\u9009\u62E9\u4EA7\u80FD\u56FE\u663E\u793A\u8303\u56F4"><option value="wafer:30" selected>\u6700\u8FD1 30 \u7247</option><option value="wafer:60">\u6700\u8FD1 60 \u7247</option><option value="wafer:120">\u6700\u8FD1 120 \u7247</option><option value="time:600">\u6700\u8FD1 10 \u5206\u949F</option><option value="time:1800">\u6700\u8FD1 30 \u5206\u949F</option><option value="all">\u5168\u90E8</option></select></label>
+      </div>
+      ${summary("cumulative", `<span><small>\u6700\u65B0</small><b>${lastCumulative.throughputPerHour.toFixed(1)}</b><em>\u7247/h</em></span><span><small>\u5E73\u5747</small><b>${cumulativeAverage.toFixed(1)}</b><em>\u7247/h</em></span><span><small>\u65F6\u523B</small><b>${formatSeconds(lastCumulative.completedAt)}</b><em>s</em></span>`, false)}
+      ${rollingContent}
+      ${helpButton}
+    </header>
+    <div class="throughput-chart-body">
+      <div class="analysis-chart-legend" aria-label="\u4EA7\u80FD\u56FE\u56FE\u4F8B"><span><i class="legend-current"></i>\u5F53\u524D\u4EA7\u80FD</span><span><i class="legend-average"></i>\u663E\u793A\u8303\u56F4\u5E73\u5747</span></div>
+      ${renderThroughputLine(cumulative, "cumulative", "\u7D2F\u8BA1\u4EA7\u80FD\u66F2\u7EBF", false)}
+      ${rollingCharts}
+    </div>`;
+}
 function renderSchedulePerformance(performance2) {
-  const window = performance2.window;
   const loadLockEfficiency = performance2.loadLockEfficiency ?? {
     cycleCount: 0,
     waferCycleCount: 0,
@@ -2209,44 +2564,39 @@ function renderSchedulePerformance(performance2) {
     fullLoadCycleRatio: 0,
     emptyLoadCycleRatio: 0
   };
+  const kpiCard = (label, value, unit, detail, cardClass = "") => `
+    <article class="performance-kpi-card ${cardClass}">
+      <div class="performance-kpi-label">
+        <span>${label}</span>
+        <span class="performance-kpi-help" tabindex="0" aria-label="${escapeHtml(detail)}">
+          <i aria-hidden="true">i</i><span class="performance-kpi-tooltip" role="tooltip">${detail}</span>
+        </span>
+      </div>
+      <div class="performance-kpi-value"><strong>${value}</strong>${unit ? `<small>${unit}</small>` : ""}</div>
+    </article>`;
+  const primaryBottleneck = performance2.primaryBottleneck;
+  const bottleneckUtilization = primaryBottleneck?.utilization ?? performance2.bottleneck?.utilization ?? null;
+  const bottleneckDetail = bottleneckUtilization !== null ? "\u5F53\u524D\u7EDF\u8BA1\u7A97\u53E3\u5185\u6700\u9AD8\u7684\u8D44\u6E90\u5229\u7528\u7387" : "\u5F53\u524D\u7EDF\u8BA1\u7A97\u53E3\u5185\u672A\u5F62\u6210\u660E\u786E\u74F6\u9888";
   return `
     <section class="result-card overview-card">
-      <header class="overview-head"><strong>KPI \u603B\u89C8</strong></header>
       <div class="performance-summary">
-        <div>
-          <span>\u7EDF\u8BA1\u7A97\u53E3</span>
-          <strong>${escapeHtml(window.label)} \xB7 ${formatSeconds(window.duration)} s</strong>
-          <small>\u5254\u9664\u5F00\u5934 ${formatSeconds(window.trimmedStart)} s / \u7ED3\u5C3E ${formatSeconds(window.trimmedEnd)} s</small>
-        </div>
-        <div>
-          <span>\u4EA7\u80FD</span>
-          <strong>${performance2.throughputPerHour > 0 ? `${performance2.throughputPerHour.toFixed(1)} \u7247/h` : "\u2014"}</strong>
-          <small>${performance2.throughputSampleCount ? `\u56FA\u5B9A ${performance2.throughputSampleCount} \u7247\u6837\u672C \xB7 \u5254\u9664\u524D 15 \u7247 \xB7 \u5B8C\u5DE5\u7247\u6570\u4E25\u683C\u5927\u4E8E 150` : escapeHtml(performance2.throughputReason || "\u6837\u672C\u4E0D\u8DB3\uFF0C\u5B8C\u5DE5\u7247\u6570\u5FC5\u987B\u5927\u4E8E 150")}</small>
-        </div>
-        <div>
-          <span>LoadLock \u5229\u7528\u6548\u7387</span>
-          <strong>${loadLockEfficiency.cycleCount ? `${loadLockEfficiency.wafersPerCycle.toFixed(2)} \u7247/\u5468\u671F` : "\u2014"}</strong>
-          <small>${loadLockEfficiency.cycleCount ? `${loadLockEfficiency.waferCycleCount} \u7247\xB7\u5468\u671F / ${loadLockEfficiency.cycleCount} \u4E2A\u5B8C\u6574\u62BD\u5145\u6C14\u5468\u671F \xB7 \u6EE1\u8F7D ${formatPercent(loadLockEfficiency.fullLoadCycleRatio)}\uFF08${loadLockEfficiency.fullLoadCycleCount}/${loadLockEfficiency.cycleCount}\uFF09\xB7 \u7A7A\u8F7D ${formatPercent(loadLockEfficiency.emptyLoadCycleRatio)}\uFF08${loadLockEfficiency.emptyLoadCycleCount}/${loadLockEfficiency.cycleCount}\uFF09` : "\u6CA1\u6709\u5B8C\u6574\u7684\u62BD\u6C14\u2014\u5145\u6C14\u5468\u671F"}</small>
-        </div>
-        <div>
-          <span>CPU Time</span>
-          <strong>${Number.isFinite(performance2.cpuTimeMs) ? `${Number(performance2.cpuTimeMs).toFixed(1)} ms` : "\u2014"}</strong>
-          <small>\u672C\u6B21\u8FD0\u884C\u7D2F\u8BA1 CPU \u65F6\u95F4</small>
-        </div>
-        <div>
-          <span>\u5E73\u5747\u91CD\u7B97\u65F6\u95F4</span>
-          <strong>${Number.isFinite(performance2.averageRecomputeTimeMs) ? `${Number(performance2.averageRecomputeTimeMs).toFixed(1)} ms` : "\u2014"}</strong>
-          <small>${performance2.recomputeCount ? `CPU Time / ${performance2.recomputeCount} \u6B21\u91CD\u7B97` : "\u6CA1\u6709\u91CD\u7B97\u8F6E\u6B21"}</small>
-        </div>
+        ${kpiCard("\u4EA7\u80FD", performance2.throughputPerHour > 0 ? performance2.throughputPerHour.toFixed(1) : "\u2014", performance2.throughputPerHour > 0 ? "\u7247/h" : "", performance2.throughputSampleCount ? `\u5C45\u4E2D ${performance2.throughputSampleCount} \u7247\u7A33\u6001\u6837\u672C` : escapeHtml(performance2.throughputReason || "\u6837\u672C\u4E0D\u8DB3\uFF0C\u5B8C\u5DE5\u7247\u6570\u5FC5\u987B\u5927\u4E8E 150"), "is-primary")}
+        ${kpiCard("\u5E73\u5747\u91CD\u7B97\u65F6\u95F4", Number.isFinite(performance2.averageRecomputeTimeMs) ? Number(performance2.averageRecomputeTimeMs).toFixed(1) : "\u2014", Number.isFinite(performance2.averageRecomputeTimeMs) ? "ms" : "", performance2.recomputeCount ? `CPU Time / ${performance2.recomputeCount} \u6B21\u91CD\u7B97` : "\u6CA1\u6709\u91CD\u7B97\u8F6E\u6B21")}
+        ${kpiCard("\u74F6\u9888\u5229\u7528\u7387", bottleneckUtilization !== null ? formatPercent(bottleneckUtilization) : "\u2014", "", bottleneckDetail)}
+        ${kpiCard("LoadLock \u5229\u7528\u6548\u7387", loadLockEfficiency.cycleCount ? loadLockEfficiency.wafersPerCycle.toFixed(2) : "\u2014", loadLockEfficiency.cycleCount ? "\u7247/\u5468\u671F" : "", loadLockEfficiency.cycleCount ? `${loadLockEfficiency.cycleCount} \u4E2A\u5B8C\u6574\u5468\u671F \xB7 \u6EE1\u8F7D ${formatPercent(loadLockEfficiency.fullLoadCycleRatio)} \xB7 \u7A7A\u8F7D ${formatPercent(loadLockEfficiency.emptyLoadCycleRatio)}` : "\u6CA1\u6709\u5B8C\u6574\u7684\u62BD\u6C14\u2014\u5145\u6C14\u5468\u671F")}
       </div>
     </section>
 
-    <section class="result-card wafer-residence-card">
-      ${renderWaferResidenceChart(performance2)}
+    <section class="result-card throughput-analysis-card">
+      ${renderThroughputChart(performance2)}
     </section>
 
     <section class="result-card bottleneck-analysis-card">
       ${renderBottleneckAnalysis(performance2)}
+    </section>
+
+    <section class="result-card wafer-residence-card">
+      ${renderWaferResidenceChart(performance2)}
     </section>
 
     `;
@@ -2258,15 +2608,11 @@ var VisualizationWorkspace = class {
   analysisRoutes = [];
   analysisRounds = [];
   moves = [];
-  decisionTrace = [];
   replayPlan = null;
-  recommendationModel = "e2e-ctq";
+  actionStatusFilters = ["enabled"];
   liveDecision = null;
   liveDecisionKey = "";
-  decisionBoundaries = [];
   primitiveDecisionBoundaries = [];
-  pauseOnDecisionChange = false;
-  pauseTriggeredByDecisionChange = false;
   replayDecisionCache = /* @__PURE__ */ new Map();
   pendingReplayDecisionKeys = /* @__PURE__ */ new Set();
   replayDecisionErrorKey = "";
@@ -2283,8 +2629,6 @@ var VisualizationWorkspace = class {
   time = 0;
   playing = false;
   liveSolving = false;
-  /** 外部（Schedule-AlphaGo 搜索面板）接管右侧决策镜头时跳过本类每帧覆盖。 */
-  externalDecisionLensOwner = false;
   playbackSpeed = DEFAULT_PLAYBACK_SPEED;
   performanceWindowMode = "steady";
   animationFrame = 0;
@@ -2296,8 +2640,6 @@ var VisualizationWorkspace = class {
     this.elements = collectElements(root);
     this.bindEvents();
     this.updatePlayButton();
-    this.updatePauseOnDecisionChangeButton();
-    this.updateRecommendationModelControl();
     this.setTopologyVisible(false);
   }
   /** 更新当前设备拓扑；已有 MoveList 会立即按新拓扑重绘。 */
@@ -2376,21 +2718,15 @@ var VisualizationWorkspace = class {
     this.replayDecisionErrorMessage = "";
     this.liveDecision = null;
     this.liveDecisionKey = "";
-    this.decisionBoundaries = decisionBoundaryTimes(this.moves);
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     this.replayDecisionRequestVersion += 1;
     if (this.moves.length) this.render();
   }
-  /** 让 Schedule-AlphaGo 搜索面板接管右侧“合法动作空间”的渲染。 */
-  setExternalDecisionLensOwner(owner) {
-    this.externalDecisionLensOwner = owner;
-  }
   /** 在完整 MoveList 返回前显示初始拓扑，并进入增量求解状态。 */
-  beginLiveSolve(plan, sourceName = "Schedule-AlphaGo \u5B9E\u65F6\u6C42\u89E3") {
+  beginLiveSolve(plan, sourceName = "Search Tree \u5B9E\u65F6\u6C42\u89E3") {
     this.pause();
     this.liveSolving = true;
     this.moves = [];
-    this.decisionTrace = [];
     this.sourceName = sourceName;
     this.resultUrl = "";
     this.analysisResultId = "";
@@ -2417,7 +2753,6 @@ var VisualizationWorkspace = class {
     const previousTime = this.time;
     this.pause();
     this.moves = normalizeMovePayload({ MoveList: rawMoves });
-    this.decisionBoundaries = decisionBoundaryTimes(this.moves);
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     const latestSnapshot = buildWorkspaceSnapshot(
       this.moves,
@@ -2484,10 +2819,8 @@ var VisualizationWorkspace = class {
     this.pause();
     this.liveSolving = false;
     this.moves = [];
-    this.decisionTrace = [];
     this.liveDecision = null;
     this.liveDecisionKey = "";
-    this.decisionBoundaries = [];
     this.primitiveDecisionBoundaries = [];
     this.replayDecisionCache.clear();
     this.pendingReplayDecisionKeys.clear();
@@ -2527,14 +2860,12 @@ var VisualizationWorkspace = class {
       <span>\u8FD0\u884C\u4E00\u6B21\u8BA1\u5212\uFF0C\u6216\u5BFC\u5165\u5DF2\u6709\u7684 MoveList JSON \u6587\u4EF6\u540E\u67E5\u770B\u8BBE\u5907\u62D3\u6251\u5E76\u5F00\u59CB\u56DE\u653E\u3002</span>`;
   }
   /** 接收规范化后的 MoveList 并重置时间轴。 */
-  async loadMoves(moves, decisionTrace, sourceName, resultUrl, analysisResultId, cpuTimeMs = null, recomputeCount = 0) {
+  async loadMoves(moves, _decisionTrace, sourceName, resultUrl, analysisResultId, cpuTimeMs = null, recomputeCount = 0) {
     if (!moves.length) throw new Error("MoveList \u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u5EFA\u7ACB\u53EF\u89C6\u5316\u56DE\u653E");
     this.pause();
     this.liveSolving = false;
     this.moves = moves;
-    this.decisionBoundaries = decisionBoundaryTimes(moves);
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(moves);
-    this.decisionTrace = alignOriginalDecisionTraceToMoves(decisionTrace, moves);
     this.liveDecision = null;
     this.liveDecisionKey = "";
     this.replayDecisionCache.clear();
@@ -2562,7 +2893,6 @@ var VisualizationWorkspace = class {
     this.elements.resultButton.disabled = false;
     this.showSingleResult();
     this.setTopologyVisible(true);
-    this.updateRecommendationModelControl();
     this.render(snapshot);
     await this.renderPerformance();
   }
@@ -2584,23 +2914,10 @@ var VisualizationWorkspace = class {
       if (this.playing) this.pause();
       else this.play();
     });
-    this.elements.pauseOnDecisionChangeButton.addEventListener("click", () => {
-      this.pauseOnDecisionChange = !this.pauseOnDecisionChange;
-      this.pauseTriggeredByDecisionChange = false;
-      this.updatePauseOnDecisionChangeButton();
-    });
-    this.elements.recommendationModel.addEventListener("change", () => {
-      this.recommendationModel = this.elements.recommendationModel.value === "dual-actor-e2e" ? "dual-actor-e2e" : "e2e-ctq";
-      this.liveDecision = null;
-      this.liveDecisionKey = "";
-      this.pendingReplayDecisionKeys.clear();
-      this.replayDecisionErrorKey = "";
-      this.replayDecisionErrorMessage = "";
-      this.replayDecisionRequestVersion += 1;
-      this.updateRecommendationModelControl();
-      this.updatePauseOnDecisionChangeButton();
+    this.elements.actionStatusFilters.forEach((filter) => filter.addEventListener("change", () => {
+      this.actionStatusFilters = this.elements.actionStatusFilters.filter((item) => item.checked).map((item) => item.value);
       this.render();
-    });
+    }));
     this.elements.speed.addEventListener("change", () => {
       this.playbackSpeed = Math.max(0.25, finiteNumber(this.elements.speed.value, DEFAULT_PLAYBACK_SPEED));
     });
@@ -2622,20 +2939,17 @@ var VisualizationWorkspace = class {
       this.elements.range.value = "0";
     }
     this.playing = true;
-    this.pauseTriggeredByDecisionChange = false;
     this.previousFrameTime = performance.now();
     this.previousRenderTime = 0;
     this.updatePlayButton();
     this.animationFrame = requestAnimationFrame((timestamp) => this.tick(timestamp));
   }
   /** 暂停回放并保留当前时间。 */
-  pause(triggeredByDecisionChange = false) {
+  pause() {
     this.playing = false;
-    this.pauseTriggeredByDecisionChange = triggeredByDecisionChange;
     if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
     this.animationFrame = 0;
     this.updatePlayButton();
-    this.updatePauseOnDecisionChangeButton();
   }
   /** 推进播放时钟，并按固定上限刷新 DOM。 */
   tick(timestamp) {
@@ -2643,17 +2957,9 @@ var VisualizationWorkspace = class {
     const elapsedSeconds = Math.max(0, timestamp - this.previousFrameTime) / 1e3;
     this.previousFrameTime = timestamp;
     const endTime = finiteNumber(this.elements.range.max);
-    const previousTime = this.time;
-    const advancedTime = Math.min(endTime, previousTime + elapsedSeconds * this.playbackSpeed);
-    const nextDecisionBoundary = this.pauseOnDecisionChange ? this.currentDecisionBoundaries().find((boundary) => boundary > previousTime + PERFORMANCE_DISPLAY_TOLERANCE && boundary <= advancedTime + PERFORMANCE_DISPLAY_TOLERANCE) : void 0;
-    this.time = nextDecisionBoundary ?? advancedTime;
+    const advancedTime = Math.min(endTime, this.time + elapsedSeconds * this.playbackSpeed);
+    this.time = advancedTime;
     this.elements.range.value = String(this.time);
-    if (nextDecisionBoundary !== void 0) {
-      this.previousRenderTime = timestamp;
-      this.render();
-      this.pause(true);
-      return;
-    }
     if (timestamp - this.previousRenderTime >= PLAYBACK_FRAME_INTERVAL_MS || this.time >= endTime) {
       this.previousRenderTime = timestamp;
       this.render();
@@ -2670,22 +2976,6 @@ var VisualizationWorkspace = class {
     this.elements.playButton.innerHTML = this.playing ? `${icon("pause")}<span>\u6682\u505C</span>` : `${icon("play")}<span>\u64AD\u653E</span>`;
     this.elements.playButton.setAttribute("aria-label", this.playing ? "\u6682\u505C\u56DE\u653E" : "\u64AD\u653E\u56DE\u653E");
     this.elements.playButton.classList.toggle("is-playing", this.playing);
-  }
-  /** 同步决策空间自动暂停按钮的开关、触发状态和无障碍文本。 */
-  updatePauseOnDecisionChangeButton() {
-    const state = this.pauseTriggeredByDecisionChange ? "\u5DF2\u6682\u505C" : this.pauseOnDecisionChange ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED";
-    const decisionKind = this.recommendationModel === "dual-actor-e2e" ? "\u539F\u5B50\u52A8\u4F5C\u51B3\u7B56" : "\u5B8C\u6574\u4E8B\u52A1\u51B3\u7B56";
-    this.elements.pauseOnDecisionChangeButton.innerHTML = `
-      <span class="decision-switch-copy"><span>\u4E0B\u4E00\u51B3\u7B56\u65F6\u6682\u505C</span><strong>${state}</strong></span>
-      <span class="decision-switch-track" aria-hidden="true"><i></i></span>`;
-    this.elements.pauseOnDecisionChangeButton.setAttribute("aria-pressed", String(this.pauseOnDecisionChange));
-    this.elements.pauseOnDecisionChangeButton.setAttribute("aria-checked", String(this.pauseOnDecisionChange));
-    this.elements.pauseOnDecisionChangeButton.setAttribute(
-      "aria-label",
-      this.pauseTriggeredByDecisionChange ? `\u5DF2\u5230\u8FBE\u4E0B\u4E00\u4E2A${decisionKind}\uFF0C\u56DE\u653E\u5DF2\u6682\u505C` : `\u5230\u4E0B\u4E00\u4E2A${decisionKind}\u65F6\u81EA\u52A8\u6682\u505C\uFF1A${this.pauseOnDecisionChange ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED"}`
-    );
-    this.elements.pauseOnDecisionChangeButton.classList.toggle("is-active", this.pauseOnDecisionChange);
-    this.elements.pauseOnDecisionChangeButton.classList.toggle("is-triggered", this.pauseTriggeredByDecisionChange);
   }
   /** 切换单例分析模式，测试组统计与单例诊断不会同时出现。 */
   showSingleResult() {
@@ -2721,11 +3011,8 @@ var VisualizationWorkspace = class {
       this.liveDecision = cachedDecision;
       this.liveDecisionKey = replayKey;
     }
-    const traceDecision = decisionAtTime(this.decisionTrace, snapshot.time);
-    const compatibleTraceDecision = traceDecision?.model === this.recommendationModel ? traceDecision : null;
-    const originalDecisionTraceAvailable = this.hasOriginalDecisionTrace();
-    const currentDecision = originalDecisionTraceAvailable ? compatibleTraceDecision : cachedDecision ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null) ?? compatibleTraceDecision;
-    if (this.replayPlan && !this.liveSolving && !originalDecisionTraceAvailable && !cachedDecision && this.liveDecisionKey !== replayKey && !this.pendingReplayDecisionKeys.has(replayKey) && this.replayDecisionErrorKey !== replayKey) {
+    const currentDecision = cachedDecision ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null);
+    if (this.replayPlan && !this.liveSolving && !cachedDecision && this.liveDecisionKey !== replayKey && !this.pendingReplayDecisionKeys.has(replayKey) && this.replayDecisionErrorKey !== replayKey) {
       void this.refreshReplayDecision(replayKey, replayTime);
     }
     const topologySnapshot = snapshotWithFullDeviceModules(
@@ -2738,14 +3025,17 @@ var VisualizationWorkspace = class {
       void 0,
       this.device
     );
-    if (!this.externalDecisionLensOwner) {
-      const requestState = this.pendingReplayDecisionKeys.has(replayKey) ? "loading" : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
-      this.elements.decisionLens.innerHTML = renderDecisionLens(
-        currentDecision,
-        requestState,
-        this.replayDecisionErrorMessage
-      );
-    }
+    const topologyCanvas = this.elements.stage.querySelector(".reference-grid-canvas");
+    const canvasHeight = topologyCanvas?.style.getPropertyValue("--topology-canvas-height") ?? "";
+    this.elements.frontSlotOverview.style.setProperty("--topology-canvas-height", canvasHeight);
+    this.elements.frontSlotOverview.innerHTML = renderFrontSlotOverview(topologySnapshot.modules);
+    const requestState = this.pendingReplayDecisionKeys.has(replayKey) ? "loading" : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
+    this.elements.decisionLens.innerHTML = renderDecisionLens(
+      currentDecision,
+      requestState,
+      this.replayDecisionErrorMessage,
+      this.actionStatusFilters
+    );
     this.elements.activeMoves.innerHTML = snapshot.activeMoves.length ? snapshot.activeMoves.map((move) => `
         <li>
           <span class="active-move-id">#${finiteNumber(move.MoveID)}</span>
@@ -2754,22 +3044,7 @@ var VisualizationWorkspace = class {
           <time>${formatSeconds(finiteNumber(move.StartTime))}\u2013${formatSeconds(finiteNumber(move.EndTime))} s</time>
         </li>`).join("") : '<li class="active-move-empty">\u5F53\u524D\u65F6\u523B\u6CA1\u6709\u6267\u884C\u4E2D\u7684\u52A8\u4F5C</li>';
   }
-  /** 同步推荐模型选择说明；双 Actor 明确提示两端互不混排。 */
-  updateRecommendationModelControl() {
-    this.elements.recommendationModel.value = this.recommendationModel;
-    if (this.hasOriginalDecisionTrace()) {
-      this.elements.recommendationModelHint.textContent = this.recommendationModel === "dual-actor-e2e" ? "\u663E\u793A\u672C\u6B21\u8C03\u5EA6\u4FDD\u5B58\u7684\u5927\u6C14\u7AEF\u3001\u771F\u7A7A\u7AEF\u539F\u59CB\u63D0\u6848\u548C\u6700\u7EC8\u6267\u884C\u52A8\u4F5C\u3002" : "\u663E\u793A\u672C\u6B21\u8C03\u5EA6\u4FDD\u5B58\u7684\u539F\u59CB E2E \u8054\u5408\u52A8\u4F5C\u51B3\u7B56\u3002";
-      return;
-    }
-    this.elements.recommendationModelHint.textContent = this.recommendationModel === "dual-actor-e2e" ? "\u6309\u5F53\u524D\u7269\u7406\u65F6\u523B\u91CD\u65B0\u8BC4\u4F30\u4E24\u7AEF\u539F\u5B50\u52A8\u4F5C\uFF1B\u8FD9\u662F\u56DE\u653E\u91CD\u8BC4\u4F30\uFF0C\u4E0D\u4EE3\u8868\u539F\u8BA1\u5212\u5F53\u65F6\u9009\u62E9\u3002" : "\u6309\u5F53\u524D\u7269\u7406\u65F6\u523B\u91CD\u65B0\u8BC4\u4F30\u5B8C\u6574 Pick + Place / Swap \u4E8B\u52A1\u3002";
-  }
-  /** 当前结果是否保存了与所选策略一致、可审计的原始模型轨迹。 */
-  hasOriginalDecisionTrace() {
-    const planStrategy = String(this.replayPlan?.strategy ?? "");
-    const strategyCompatible = !planStrategy || planStrategy === this.recommendationModel;
-    return strategyCompatible && this.decisionTrace.some((step) => step.model === this.recommendationModel && !step.replayEvaluated);
-  }
-  /** 返回不晚于当前时刻、符合当前模型决策粒度的最近边界。 */
+  /** 返回不晚于当前时刻的最近原子动作边界。 */
   replayDecisionTime(time) {
     let decisionTime = 0;
     for (const boundary of this.currentDecisionBoundaries()) {
@@ -2778,13 +3053,13 @@ var VisualizationWorkspace = class {
     }
     return decisionTime;
   }
-  /** E2E 按完整事务，双 Actor 按原子机器人动作选择各自的回放边界。 */
+  /** 动作接口在每个 Pick、Place、Swap 完成边界更新。 */
   currentDecisionBoundaries() {
-    return this.recommendationModel === "dual-actor-e2e" ? this.primitiveDecisionBoundaries : this.decisionBoundaries;
+    return this.primitiveDecisionBoundaries;
   }
-  /** 每个模型在自身决策边界只执行一次前向。 */
+  /** 每个原子动作边界只请求一次算法接口。 */
   replayStateKey(replayTime) {
-    return `${this.recommendationModel}@${replayTime.toFixed(6)}`;
+    return `actions@${replayTime.toFixed(6)}`;
   }
   /** 异步请求当前 Machine 候选；过期响应不会覆盖用户已经拖到的新时刻。 */
   async refreshReplayDecision(replayKey, replayTime) {
@@ -2800,7 +3075,6 @@ var VisualizationWorkspace = class {
         resultId: this.analysisResultId || void 0,
         moves: this.analysisResultId ? void 0 : this.moves,
         plan: this.replayPlan,
-        recommendationModel: this.recommendationModel,
         time: replayTime
       });
       const decision = normalizeDecisionTrace({ DecisionTrace: [rawDecision] })[0] ?? null;
@@ -2828,7 +3102,11 @@ var VisualizationWorkspace = class {
   async renderPerformance() {
     if (!this.moves.length) return;
     const requestVersion = ++this.analysisRequestVersion;
-    this.elements.performance.innerHTML = '<div class="visual-loader" aria-label="\u6B63\u5728\u5206\u6790"></div>';
+    this.elements.performance.innerHTML = `
+      <section class="result-card analysis-skeleton" aria-label="\u6B63\u5728\u52A0\u8F7D\u7ED3\u679C\u5206\u6790">
+        <div class="analysis-skeleton-head"><i></i><span></span></div>
+        <div class="analysis-skeleton-grid">${Array.from({ length: 6 }, () => "<span></span>").join("")}</div>
+      </section>`;
     try {
       const result = await requestScheduleAnalysis({
         ...this.analysisResultId ? { resultId: this.analysisResultId } : { moves: this.moves },
@@ -2849,15 +3127,22 @@ var VisualizationWorkspace = class {
         this.elements.performanceWindow.tabIndex = 0;
         windowSlot.append(this.elements.performanceWindow);
       }
+      this.elements.performance.querySelectorAll(".residence-metric-scroll").forEach((scroller) => {
+        scroller.scrollLeft = scroller.scrollWidth;
+      });
     } catch (error) {
       if (requestVersion !== this.analysisRequestVersion) return;
       this.analysis = null;
       this.bottleneckSummary = null;
       this.elements.performance.innerHTML = `
-        <div class="visual-empty is-error">
-          <strong>\u7ED3\u679C\u5206\u6790\u5931\u8D25</strong>
+        <div class="analysis-error-state">
+          <strong>\u6570\u636E\u83B7\u53D6\u5931\u8D25</strong>
           <span>${escapeHtml(error instanceof Error ? error.message : String(error))}</span>
+          <button class="analysis-secondary-button" type="button" data-performance-retry>\u91CD\u65B0\u52A0\u8F7D</button>
         </div>`;
+      this.elements.performance.querySelector("[data-performance-retry]")?.addEventListener("click", () => {
+        void this.renderPerformance();
+      });
     }
   }
   /** 显示加载状态并保留明确的系统反馈。 */
@@ -2923,8 +3208,12 @@ function createVisualizationWorkspace(root = document) {
   normalizeDecisionTrace,
   normalizeMovePayload,
   primitiveDecisionBoundaryTimes,
+  renderDecisionLens,
   renderEquipmentTopology,
+  renderFrontSlotOverview,
   renderSchedulePerformance,
+  renderThroughputChart,
   renderWaferResidenceChart,
+  simplifyThroughputPoints,
   snapshotWithFullDeviceModules
 });

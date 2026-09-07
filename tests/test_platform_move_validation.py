@@ -1183,6 +1183,128 @@ def test_dual_chamber_process_updates_both_physical_slots() -> None:
     ]
 
 
+def _zero_duration_pm_route(step_id: int = 4, station: str = "PM1") -> dict:
+    """构造 NeedProcess 且 Recipe 为空的零时长产品 Route。"""
+    return {
+        "RouteSteps": [
+            {
+                "StepID": step_id,
+                "NeedProcess": True,
+                "Visits": [{"StationName": station, "ProcessRecipe": ""}],
+            }
+        ]
+    }
+
+
+def test_dual_chamber_omitted_zero_duration_process_allows_paired_pick() -> None:
+    """双腔两片 0s 工艺省略 ProcessMove 后，关门即应成对完成并允许双片 Pick。"""
+    update = _dual_chamber_update()
+    zero_route = _zero_duration_pm_route()
+    for material in update["Materials"]:
+        material["Route"] = zero_route
+        material["PJobName"] = "P1"
+    update["ProcessJobs"] = [{
+        "JobName": "P1",
+        "MatList": [101, 102],
+        "OriginRoute": zero_route,
+    }]
+    moves = [
+        _move(1, 6, 0, 1, ModuleName="PM1", RelatedRobotType=1),
+        _move(
+            2, 0, 1, 2, ModuleName="VACRobot", MatIDList=[101, 102],
+            SrcStationList=["PM1", "PM1"], SrcSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+        _move(
+            3, 1, 2, 3, ModuleName="VACRobot", MatIDList=[101, 102],
+            DestStationList=["PM1", "PM1"], DestSlotList=[1, 2], RobotSlotList=[1, 2],
+            StepIDList=[4, 4],
+        ),
+        _move(4, 7, 3, 4, ModuleName="PM1"),
+        _move(5, 6, 4, 5, ModuleName="PM1", RelatedRobotType=1, RelatedActionType=1),
+        _move(
+            6, 0, 5, 6, ModuleName="VACRobot", MatIDList=[101, 102],
+            SrcStationList=["PM1", "PM1"], SrcSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+    ]
+    assert validate_move_list(None, moves, update) == []
+
+
+def test_dual_chamber_omitted_zero_duration_process_from_pjob_matlist() -> None:
+    """仅 OriginRoute/MatList 声明 0s 时，物理第二片也应能省略 ProcessMove。"""
+    update = _dual_chamber_update()
+    zero_route = _zero_duration_pm_route()
+    update["Materials"] = [update["Materials"][0]]
+    update["Materials"][0]["Route"] = {}
+    update["ProcessJobs"] = [{
+        "JobName": "P1",
+        "MatList": [101, 102],
+        "OriginRoute": zero_route,
+    }]
+    update["Materials"].append({
+        "ID": 102,
+        "CurrentModuleName": "PM1",
+        "SlotID": 2,
+        "StepID": 4,
+    })
+    moves = [
+        _move(1, 6, 0, 1, ModuleName="PM1", RelatedRobotType=1),
+        _move(
+            2, 0, 1, 2, ModuleName="VACRobot", MatIDList=[101, 102],
+            SrcStationList=["PM1", "PM1"], SrcSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+        _move(
+            3, 1, 2, 3, ModuleName="VACRobot", MatIDList=[101, 102],
+            DestStationList=["PM1", "PM1"], DestSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+        _move(4, 7, 3, 4, ModuleName="PM1"),
+        _move(5, 6, 4, 5, ModuleName="PM1", RelatedRobotType=1, RelatedActionType=1),
+        _move(
+            6, 0, 5, 6, ModuleName="VACRobot", MatIDList=[101, 102],
+            SrcStationList=["PM1", "PM1"], SrcSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+    ]
+    assert validate_move_list(None, moves, update) == []
+
+
+def test_dual_chamber_mixed_process_times_still_require_process_move() -> None:
+    """双腔一槽 0s、一槽非零时，不能省略覆盖两片的 ProcessMove。"""
+    update = _dual_chamber_update()
+    update["Materials"][0]["Route"] = _zero_duration_pm_route()
+    update["Materials"][1]["Route"] = {
+        "RouteSteps": [{
+            "StepID": 4,
+            "NeedProcess": True,
+            "Visits": [{"StationName": "PM1", "ProcessRecipe": "LongRecipe"}],
+        }]
+    }
+    update["ProcessRecipes"] = [{
+        "Name": "LongRecipe",
+        "ModuleName": "PM1",
+        "Time": 10.0,
+    }]
+    moves = [
+        _move(1, 6, 0, 1, ModuleName="PM1", RelatedRobotType=1),
+        _move(
+            2, 0, 1, 2, ModuleName="VACRobot", MatIDList=[101, 102],
+            SrcStationList=["PM1", "PM1"], SrcSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+        _move(
+            3, 1, 2, 3, ModuleName="VACRobot", MatIDList=[101, 102],
+            DestStationList=["PM1", "PM1"], DestSlotList=[1, 2], RobotSlotList=[1, 2],
+            StepIDList=[4, 4],
+        ),
+        _move(4, 7, 3, 4, ModuleName="PM1"),
+        _move(5, 6, 4, 5, ModuleName="PM1", RelatedRobotType=1, RelatedActionType=1),
+        _move(
+            6, 0, 5, 6, ModuleName="VACRobot", MatIDList=[101, 102],
+            SrcStationList=["PM1", "PM1"], SrcSlotList=[1, 2], RobotSlotList=[1, 2],
+        ),
+    ]
+    issues = validate_move_list(None, moves, update)
+    assert issues
+    assert "没有匹配的已完成物料" in issues[0]
+
+
 def test_empty_pretrans_may_carry_future_pick_material_id() -> None:
     """Pick 明确引用的空载 PreTrans 可用 MatIDList 标注将要运输的晶圆。"""
     moves = [
@@ -1982,6 +2104,60 @@ def test_cascade_dbr_open_pressure_uses_preprepare_side_mapping() -> None:
     for move in moves:
         replay.update_move_state({"MoveID": move["MoveID"], "MoveState": MoveStateReplay.RUNNING}, snapshot=False)
         replay.update_move_state({"MoveID": move["MoveID"], "MoveState": MoveStateReplay.DONE}, snapshot=False)
+    assert replay.state.stations["DBR"].environment == VACUUM
+
+
+def test_cascade_loadlock_omits_zero_duration_preprepare() -> None:
+    """DBR/UBR 零时长抽充气省略 Move 后仍应切换压力态并允许 Pick。
+
+    标准算法会省略零时长 ``PrePrepareMove``。级联 LoadLock 不能因此保留
+    旧压力态，否则 VTR_2 随后的开门和 Pick 会被错误拒绝。
+    """
+    update = _cascade_dbr_update()
+    transitions = update["Stations"]["DBR"]["PrePrepareTime"]
+    transitions[0]["Time"] = 0.0
+    transitions[1]["Time"] = 0.0
+    moves = [
+        # 初态为 VTR_1 侧；省略 VTR_1→VTR_2 的零时长 Pump。
+        _move(1, 6, 0, 1, ModuleName="DBR", RelatedRobotType=2),
+        _move(
+            2,
+            0,
+            1,
+            2,
+            ModuleName="VTR_2",
+            MatIDList=[1],
+            SrcStationList=["DBR"],
+            SrcSlotList=[1],
+            RobotSlotList=[1],
+            StepIDList=[5],
+        ),
+        _move(3, 7, 2, 3, ModuleName="DBR"),
+        # 省略 VTR_2→VTR_1 的零时长 Vent；下一条 Pump 应先补齐该状态。
+        _move(
+            4,
+            10,
+            3,
+            3,
+            ModuleName="DBR",
+            LastState="VTR_1",
+            CurState="VTR_2",
+            MatIDList=[],
+        ),
+    ]
+
+    assert validate_move_list(None, moves, update) == []
+
+    replay = MoveStateReplay(None, moves, update)
+    for move in moves:
+        replay.update_move_state(
+            {"MoveID": move["MoveID"], "MoveState": MoveStateReplay.RUNNING},
+            snapshot=False,
+        )
+        replay.update_move_state(
+            {"MoveID": move["MoveID"], "MoveState": MoveStateReplay.DONE},
+            snapshot=False,
+        )
     assert replay.state.stations["DBR"].environment == VACUUM
 
 

@@ -15,9 +15,8 @@ import {
   requestSearchTelemetry,
   requestTestGroupAnalysis,
 } from "./api_client";
-import { createVisualizationWorkspace, detectDeviceTopologyLayout } from "./workspace_visualizer";
+import { createVisualizationWorkspace, detectDeviceTopologyLayout, updateThroughputChartRange } from "./workspace_visualizer";
 import { renderTestGroupAnalysis, testGroupSummaryCsv } from "./group_analysis_view";
-import { createDocumentationView } from "./documentation_view";
 import {
   CJOB_TYPES,
   TASK_MODES,
@@ -34,7 +33,6 @@ import {
 
 const { VISIT_SHARED_FIELDS, automaticTemplateName } = RouteEditorLogic;
 const visualizationWorkspace = createVisualizationWorkspace();
-const documentationView = createDocumentationView(document.getElementById("documentationRoot"));
 const batchPerformanceAnalyses = new Map();
 const batchBottleneckSummaries = new Map();
 const batchBottleneckRequests = new Map();
@@ -48,7 +46,7 @@ const DEFAULT_SCHEDULE_OPTIONS = Object.freeze({
   maximumSystemResidenceCv: 0,
   loadLockMacroSearchSeconds: 4,
   loadLockMacroRollouts: 96,
-  scheduleAlphaGoModelPath: "",
+  searchTreeModelPath: "",
   seed: 0,
 });
 const SCHEDULE_OPTION_KEYS = new Set(Object.keys(DEFAULT_SCHEDULE_OPTIONS));
@@ -163,22 +161,12 @@ let searchTelemetryRunActive = false;
 let searchTelemetryControlPending = false;
 let lastSearchTelemetryMoveCount = 0;
 let lastBatchItemsRenderSignature = "";
-/** 是否在步进模式下持续提交每一轮搜索的模型推荐动作。 */
 let continuousDecisionEnabled = false;
-/** 已由持续决策提交的 searchId；防止同一遥测帧被轮询重复提交。 */
 let continuousDecisionSubmittedSearchId = "";
-/** 拓扑回放页面的求解模式：回放模式连续求解，步进模式等待用户选择根动作。 */
 let playbackMode = "replay";
-/** 用户最近一次 choose 的根动作键；用于回放历史时高亮实际执行的动作。 */
 let userChosenActionKey = "";
-/** 用户最近一次 choose 对应的根决策 searchId；跨决策后不再沿用旧高亮。 */
 let userChosenSearchId = "";
-/** 控制请求在途时待补发的模式切换命令；避免前后端执行模式失步。 */
 let pendingModeSync = "";
-/** “运行模型步进”是否正在运行；运行中按钮变为停止入口。 */
-let stepRunActive = false;
-/** 停止请求是否已在途；避免重复发送。 */
-let stepRunCancelling = false;
 /** 普通单测通过 clientRunId 轮询真实 init/update/output 阶段。 */
 let singleRunActive = false;
 let singleRunCancelling = false;
@@ -187,7 +175,7 @@ let singleRunAbortController: AbortController | null = null;
 let runStatusStartedAt = 0;
 let runStatusElapsedMs = 0;
 let runStatusTimer = 0;
-let pendingAlphaGoCheckpointFile: File | null = null;
+let pendingSearchTreeCheckpointFile: File | null = null;
 let dataTransferMode: "import" | "export" = "import";
 /**
  * 当前页面会话统一使用的运行配置。
@@ -998,16 +986,84 @@ function buildDeviceTimingDraft(device) {
     }
     draft.robots[robotName] = timing;
   });
+  const configuredExecution = device?.ExecutionTiming && typeof device.ExecutionTiming === "object"
+    ? device.ExecutionTiming
+    : {};
+  const overlayTiming = (defaults, configured) => Object.fromEntries(Object.entries(defaults).map(([itemName, fields]) => [
+    itemName,
+    Object.fromEntries(Object.entries(fields).map(([fieldName, values]) => {
+      const configuredValues = configured?.[itemName]?.[fieldName];
+      if (Array.isArray(values)) {
+        return [fieldName, values.map((value, index) => Number.isFinite(Number(configuredValues?.[index])) ? Number(configuredValues[index]) : value)];
+      }
+      return [fieldName, Object.fromEntries(Object.entries(values).map(([key, value]) => [
+        key,
+        Number.isFinite(Number(configuredValues?.[key])) ? Number(configuredValues[key]) : value,
+      ]))];
+    })),
+  ]));
+  const rawFluctuation = configuredExecution.fluctuation || {};
+  draft.execution = {
+    mode: configuredExecution.mode === "fluctuation" ? "fluctuation" : "fixed",
+    fluctuation: {
+      kind: rawFluctuation.kind === "offset" ? "offset" : "ratio",
+      ratio: Math.max(0, Math.min(1, Number(rawFluctuation.ratio) || 0)),
+      minimumOffsetSeconds: Number.isFinite(Number(rawFluctuation.minimumOffsetSeconds)) ? Number(rawFluctuation.minimumOffsetSeconds) : 0,
+      maximumOffsetSeconds: Number.isFinite(Number(rawFluctuation.maximumOffsetSeconds)) ? Number(rawFluctuation.maximumOffsetSeconds) : 0,
+    },
+    stations: overlayTiming(draft.stations, configuredExecution.stations),
+    robots: overlayTiming(draft.robots, configuredExecution.robots),
+  };
   return draft;
 }
 
-/** 生成统一的秒数输入框，使用等宽数字并携带设备计时数据定位信息。 */
+/** 读取一个理论时间输入所对应的固定执行秒数。 */
+function configuredExecutionTime(dataset) {
+  const section = dataset["device-timing-target"]?.startsWith("station") ? "stations" : "robots";
+  const fields = state.deviceTimingDraft?.execution?.[section]?.[dataset["device-name"]];
+  if (!fields) return 0;
+  return dataset["device-timing-target"]?.endsWith("map")
+    ? fields[dataset["timing-field"]]?.[dataset["timing-key"]] ?? 0
+    : fields[dataset["timing-field"]]?.[Number(dataset["timing-index"])] ?? 0;
+}
+
+/** 生成理论/固定执行时间输入组，波动模式下固定值保留但不可编辑。 */
 function deviceTimeInput(value, label, dataset) {
   const attributes = Object.entries(dataset)
     .map(([name, item]) => `data-${name}="${escapeHtml(item)}"`)
     .join(" ");
   const numericValue = Number(value);
-  return `<label class="device-time-input"><input type="number" min="0" step="any" inputmode="decimal" required value="${Number.isFinite(numericValue) ? numericValue : 0}" aria-label="${escapeHtml(label)}" ${attributes}><span>s</span></label>`;
+  const executionValue = Number(configuredExecutionTime(dataset));
+  const executionDisabled = state.deviceTimingDraft?.execution?.mode === "fluctuation" ? " disabled" : "";
+  const executionAttributes = attributes.replaceAll("data-device-timing-target", "data-device-execution-target");
+  return `<span class="device-time-pair"><label><small>理论</small><span class="device-time-input"><input type="number" min="0" step="any" inputmode="decimal" required value="${Number.isFinite(numericValue) ? numericValue : 0}" aria-label="${escapeHtml(label)}（理论）" ${attributes}><span>s</span></span></label><label><small>执行</small><span class="device-time-input"><input type="number" min="0" step="any" inputmode="decimal" required value="${Number.isFinite(executionValue) ? executionValue : 0}" aria-label="${escapeHtml(label)}（固定执行）" ${executionAttributes}${executionDisabled}><span>s</span></span></label></span>`;
+}
+
+/** 绘制设备实际执行时间模式；固定值在各动作表中与理论值并列编辑。 */
+function renderExecutionTimingConfiguration() {
+  const container = document.getElementById("deviceExecutionTimingEditor");
+  const execution = state.deviceTimingDraft?.execution;
+  if (!container || !execution) {
+    if (container) container.innerHTML = `<div class="device-config-empty"><strong>暂无执行时间配置</strong><span>请先选择设备。</span></div>`;
+    return;
+  }
+  const fluctuating = execution.mode === "fluctuation";
+  const offset = execution.fluctuation.kind === "offset";
+  container.innerHTML = `
+    <section class="execution-timing-card">
+      <header><div><h3>实际动作时长</h3><p>算法始终使用理论时间；平台状态机只在运行设置启用后应用这里的执行时间。</p></div></header>
+      <div class="execution-mode-grid" role="radiogroup" aria-label="执行时间模式">
+        <label class="run-setting-option"><span class="run-setting-option-main"><input type="radio" name="executionTimingMode" value="fixed" ${fluctuating ? "" : "checked"}><span>固定执行值</span></span><small>使用设备时间和机器手时间表中并列的“执行”值。</small></label>
+        <label class="run-setting-option"><span class="run-setting-option-main"><input type="radio" name="executionTimingMode" value="fluctuation" ${fluctuating ? "checked" : ""}><span>理论值随机波动</span></span><small>以每个 Move 的理论时长为均值，按 seed 生成可复现样本。</small></label>
+      </div>
+      <div class="execution-fluctuation-fields" ${fluctuating ? "" : "hidden"}>
+        <label class="field"><span>波动方式</span><select id="executionFluctuationKind"><option value="ratio" ${offset ? "" : "selected"}>比例（±）</option><option value="offset" ${offset ? "selected" : ""}>最小/最大偏移</option></select></label>
+        <label class="field" ${offset ? "hidden" : ""}><span>波动比例</span><input id="executionFluctuationRatio" type="number" min="0" max="100" step="0.1" value="${(execution.fluctuation.ratio * 100).toFixed(1)}"><small>例如 10 表示理论时长的 ±10%。</small></label>
+        <label class="field" ${offset ? "" : "hidden"}><span>最小波动（秒）</span><input id="executionMinimumOffset" type="number" step="any" value="${execution.fluctuation.minimumOffsetSeconds}"></label>
+        <label class="field" ${offset ? "" : "hidden"}><span>最大波动（秒）</span><input id="executionMaximumOffset" type="number" step="any" value="${execution.fluctuation.maximumOffsetSeconds}"></label>
+      </div>
+      <div class="device-time-inline-empty">固定模式的具体执行值位于“设备时间”和“机器手时间”表格，每个理论值右侧均有对应执行值。</div>
+    </section>`;
 }
 
 /** 根据当前设备、脏状态和保存状态刷新设备配置页头部反馈与操作按钮。 */
@@ -1274,6 +1330,7 @@ function renderDeviceTimingConfiguration() {
   if (state.deviceConfigSection === "station-time") renderDeviceStationTiming();
   if (state.deviceConfigSection === "robot-time") renderDeviceRobotTiming();
   if (state.deviceConfigSection === "robot-slot") renderRobotSlots();
+  if (state.deviceConfigSection === "execution-time") renderExecutionTimingConfiguration();
 }
 
 /** 从当前设备重新建立时间草稿，既用于设备切换，也用于撤销尚未保存的修改。 */
@@ -1299,10 +1356,13 @@ function updateDeviceTimingFromControl(control) {
   const valid = control.value.trim() !== "" && Number.isFinite(value) && value >= 0;
   control.setCustomValidity(valid ? "" : "请输入大于或等于 0 的有限秒数");
   control.classList.toggle("is-invalid", !valid);
-  const section = control.dataset.deviceTimingTarget?.startsWith("station") ? "stations" : "robots";
-  const item = state.deviceTimingDraft?.[section]?.[control.dataset.deviceName];
+  const targetName = control.dataset.deviceExecutionTarget ? "deviceExecutionTarget" : "deviceTimingTarget";
+  const target = control.dataset[targetName];
+  const section = target?.startsWith("station") ? "stations" : "robots";
+  const root = targetName === "deviceExecutionTarget" ? state.deviceTimingDraft?.execution : state.deviceTimingDraft;
+  const item = root?.[section]?.[control.dataset.deviceName];
   if (!item) return;
-  if (control.dataset.deviceTimingTarget?.endsWith("map")) {
+  if (target?.endsWith("map")) {
     item[control.dataset.timingField][control.dataset.timingKey] = valid ? value : Number.NaN;
   } else {
     item[control.dataset.timingField][Number(control.dataset.timingIndex)] = valid ? value : Number.NaN;
@@ -1313,7 +1373,13 @@ function updateDeviceTimingFromControl(control) {
 /** 校验草稿中的每个秒数，确保保存请求不会包含 NaN、Infinity 或负数。 */
 function validateDeviceTimingDraft() {
   let invalidLabel = "";
-  Object.entries(state.deviceTimingDraft || {}).some(([sectionName, items]) => Object.entries(items).some(([itemName, fields]) => Object.entries(fields).some(([fieldName, values]) => {
+  const timingSections = {
+    stations: state.deviceTimingDraft?.stations || {},
+    robots: state.deviceTimingDraft?.robots || {},
+    executionStations: state.deviceTimingDraft?.execution?.stations || {},
+    executionRobots: state.deviceTimingDraft?.execution?.robots || {},
+  };
+  Object.entries(timingSections).some(([sectionName, items]) => Object.entries(items).some(([itemName, fields]) => Object.entries(fields).some(([fieldName, values]) => {
     const rows = Array.isArray(values) ? values.map((value, index) => [index, value]) : Object.entries(values || {});
     const invalid = rows.find(([, value]) => !Number.isFinite(Number(value)) || Number(value) < 0);
     if (!invalid) return false;
@@ -1321,6 +1387,8 @@ function validateDeviceTimingDraft() {
     return true;
   })));
   if (invalidLabel) throw new Error(`${invalidLabel} 必须是大于或等于 0 的有限秒数`);
+  const fluctuation = state.deviceTimingDraft?.execution?.fluctuation;
+  if (fluctuation?.minimumOffsetSeconds > fluctuation?.maximumOffsetSeconds) throw new Error("执行时间最小波动不能大于最大波动");
 }
 
 /** 保存当前设备的全部时间草稿，并用服务端返回的拓扑刷新排程与可视化数据。 */
@@ -1651,22 +1719,6 @@ function resetSearchTelemetryView() {
   continuousDecisionSubmittedSearchId = "";
   userChosenActionKey = "";
   userChosenSearchId = "";
-  const panel = document.getElementById("searchTelemetryPanel");
-  panel.hidden = true;
-  document.getElementById("searchTelemetryVariationPanel").hidden = true;
-  document.getElementById("searchTelemetryDecisionSelect").innerHTML = "";
-  document.getElementById("searchTelemetryVariation").innerHTML = "";
-  for (const id of [
-    "searchTelemetryPauseButton",
-    "searchTelemetryStepButton",
-    "searchTelemetryContinueButton",
-    "searchTelemetryFollowRecommendationButton",
-    "searchTelemetryContinuousDecisionButton",
-  ]) {
-    const button = document.getElementById(id);
-    button.disabled = true;
-    button.classList.remove("is-active");
-  }
 }
 
 /** 把搜索数值格式化为稳定的有限小数。 */
@@ -1685,14 +1737,7 @@ function searchTelemetryStopReason(reason) {
 }
 
 /** 把一次 Alpha 决策的稳定动作链渲染成三张可展开候选卡片。 */
-function renderSearchActionChains(
-  chains,
-  decisionIndex,
-  recommendedKey,
-  selectedKey,
-  maximumVisits,
-  interactive,
-) {
+function renderSearchActionChains(chains, decisionIndex, recommendedKey, maximumVisits) {
   return `<section class="decision-candidate-section search-action-section" aria-labelledby="searchCandidatesTitle">
     <header>
       <strong id="searchCandidatesTitle">决策 #${decisionIndex}</strong>
@@ -1703,11 +1748,10 @@ function renderSearchActionChains(
         const visits = Number(chain?.visits) || 0;
         const visitPercent = Math.max(0, Math.min(100, visits / maximumVisits * 100));
         const isRecommended = String(chain?.actionKey || "") === recommendedKey;
-        const isSelected = String(chain?.actionKey || "") === selectedKey;
-        const tags = `${isRecommended ? '<span class="decision-tag is-recommendation">推荐</span>' : ""}${isSelected && !isRecommended ? '<span class="decision-tag is-user-chosen">你的选择</span>' : ""}`;
+        const tags = isRecommended ? '<span class="decision-tag is-recommendation">推荐</span>' : "";
         const description = String(chain?.description || "稳定动作链");
         const steps = Array.isArray(chain?.steps) ? chain.steps : [];
-        return `<li class="decision-candidate search-action-candidate search-action-chain ${isSelected ? "is-selected" : ""} ${interactive ? "is-interactive" : ""}" data-action-key="${escapeHtml(String(chain?.actionKey || ""))}" ${interactive ? `role="button" tabindex="0" aria-label="执行 ${escapeHtml(description)}"` : ""}>
+        return `<li class="decision-candidate search-action-candidate search-action-chain ${isRecommended ? "is-selected" : ""}">
           <div class="decision-candidate-rank" aria-label="第 ${index + 1} 名">${index + 1}</div>
           <div class="decision-candidate-main">
             <div class="decision-candidate-title"><strong title="${escapeHtml(description)}">${escapeHtml(description)}</strong>${tags}</div>
@@ -1731,23 +1775,14 @@ function renderSearchActionChains(
 function renderSearchTelemetryDecision(snapshot) {
   const chains = Array.isArray(snapshot?.actionChains) ? snapshot.actionChains.slice(0, 3) : [];
   const recommendedKey = String(snapshot?.selectedActionKey || "");
-  // 用户选择只作用于其提交时的那个根决策；跨决策或回看其他历史时沿用模型推荐。
-  const selectedKey = String(snapshot?.searchId || "") === userChosenSearchId
-    ? userChosenActionKey
-    : recommendedKey;
   const decisionIndex = Number(snapshot?.decisionIndex || 0) + 1;
-  const interactive = playbackMode === "step"
-    && latestSearchTelemetry?.status === "waiting-choice"
-    && String(snapshot?.searchId || "") === String(latestSearchTelemetry?.searchId || "");
   const maximumVisits = Math.max(1, ...chains.map(chain => Number(chain?.visits) || 0));
   document.getElementById("visualDecisionLens").innerHTML = chains.length
     ? renderSearchActionChains(
       chains,
       decisionIndex,
       recommendedKey,
-      selectedKey,
       maximumVisits,
-      interactive,
     )
     : `<div class="decision-empty"><strong>正在构造稳定动作链…</strong><p>只有在 50 层内回到 Robot 全部空手状态的链才会出现。</p></div>`;
 
@@ -1873,17 +1908,8 @@ async function flushPendingModeSync() {
   await setPlaybackMode(mode);
 }
 
-/** 切换回放/步进模式；运行中会同步后端执行模式。 */
-/** 同步回放/步进模式切换按钮的选中状态（不向后端发命令）。 */
-function renderPlaybackModeSwitch() {
-  const stepMode = playbackMode === "step";
-  document.getElementById("playbackModeReplayButton").classList.toggle("is-active", playbackMode === "replay");
-  document.getElementById("playbackModeStepButton").classList.toggle("is-active", stepMode);
-  document.getElementById("playbackModeReplayButton").setAttribute("aria-pressed", String(playbackMode === "replay"));
-  document.getElementById("playbackModeStepButton").setAttribute("aria-pressed", String(stepMode));
-  document.getElementById("visualRecommendationModelControl").hidden = stepMode;
-  document.getElementById("visualPauseOnDecisionChangeButton").hidden = stepMode;
-}
+/** 已移除模式切换控件；搜索始终以连续模式启动。 */
+function renderPlaybackModeSwitch() {}
 
 /** 当持续决策开启时，为当前根决策恰好提交一次模型推荐动作。 */
 function maybeContinueModelDecision(snapshot) {
@@ -1957,12 +1983,12 @@ async function controlSearchTelemetry(command) {
 /** 合并实时帧与已完成历史，并保持用户手动选择的旧决策。 */
 function renderSearchTelemetry(snapshot) {
   if (!snapshot || snapshot.unchanged) return;
-  if (snapshot.algorithm !== "schedule-alphago" && latestSearchTelemetry) return;
+  if (snapshot.algorithm !== "search-tree" && latestSearchTelemetry) return;
   latestSearchTelemetry = snapshot;
   const panel = document.getElementById("searchTelemetryPanel");
   panel.hidden = false;
   const status = document.getElementById("searchTelemetryStatus");
-  if (snapshot.algorithm !== "schedule-alphago") {
+  if (snapshot.algorithm !== "search-tree") {
     status.textContent = "正在初始化搜索器…";
     status.classList.add("is-searching");
     status.classList.remove("is-paused");
@@ -2029,7 +2055,7 @@ async function pollSearchTelemetry(token) {
   }
 }
 
-/** 开始本次 Schedule-AlphaGo 运行的实时搜索轮询。 */
+/** 开始本次 Search Tree 运行的实时搜索轮询。 */
 function startSearchTelemetryPolling() {
   resetSearchTelemetryView();
   searchTelemetryRunActive = true;
@@ -2054,7 +2080,7 @@ function stopSearchTelemetryPolling(finalSnapshot = null) {
   visualizationWorkspace.setExternalDecisionLensOwner(false);
   if (finalSnapshot) renderSearchTelemetry(finalSnapshot);
   const status = document.getElementById("searchTelemetryStatus");
-  if (!finalSnapshot && latestSearchTelemetry?.algorithm === "schedule-alphago") {
+  if (!finalSnapshot && latestSearchTelemetry?.algorithm === "search-tree") {
     status.classList.remove("is-searching");
   }
   updateSearchTelemetryControls(finalSnapshot || latestSearchTelemetry);
@@ -2485,9 +2511,6 @@ function switchTab(name) {
   document.querySelectorAll("[data-tab-view]").forEach(view => view.classList.toggle("active", view.dataset.tabView === name));
   document.getElementById("scheduleSide").classList.toggle("is-hidden", name !== "schedule");
   document.getElementById("pageLayout").classList.toggle("editor-mode", name !== "schedule");
-  document.getElementById("pageLayout").classList.toggle("documentation-mode", name === "documentation");
-  document.body.classList.toggle("documentation-mode", name === "documentation");
-  if (name === "documentation") void documentationView.load();
   if (name === "device-config") renderDeviceTimingConfiguration();
   if (name !== "route") closeStepDrawer();
 }
@@ -3475,20 +3498,20 @@ async function restoreRobotSlotDefault(robotName) {
 /** 渲染所有依赖状态的区域。 */
 function renderAll() { renderTimes(); renderRoutes(); renderRounds(); renderRobotSlots(); if (state.drawer) renderStepDrawer(); }
 
-/** 打开 AlphaGo 模型选择弹窗。 */
-function openScheduleAlphaGoOptionsDialog() {
-  pendingAlphaGoCheckpointFile = null;
-  const configuredPath = String(state.options.scheduleAlphaGoModelPath || "").trim();
-  document.getElementById("alphaGoCheckpointPath").value = configuredPath;
-  document.getElementById("alphaGoCheckpointFile").value = "";
-  document.getElementById("alphaGoCheckpointHint").textContent = configuredPath
+/** 打开 SearchTree 模型选择弹窗。 */
+function openSearchTreeOptionsDialog() {
+  pendingSearchTreeCheckpointFile = null;
+  const configuredPath = String(state.options.searchTreeModelPath || "").trim();
+  document.getElementById("searchTreeCheckpointPath").value = configuredPath;
+  document.getElementById("searchTreeCheckpointFile").value = "";
+  document.getElementById("searchTreeCheckpointHint").textContent = configuredPath
     ? "当前 checkpoint 已保存在本地服务中；重新选择文件可替换它。"
     : "选择本机 checkpoint 后将上传到本地服务，并用于后续运行。";
-  document.getElementById("scheduleAlphaGoOptionsDialog").showModal();
+  document.getElementById("searchTreeOptionsDialog").showModal();
 }
 
 /** 上传用户从文件夹选取的 checkpoint，并返回本地服务可访问的绝对路径。 */
-async function uploadAlphaGoCheckpoint(file) {
+async function uploadSearchTreeCheckpoint(file) {
   const response = await fetch("/api/model-checkpoints", {
     method: "POST",
     headers: { "X-Checkpoint-Filename": encodeURIComponent(file.name) },
@@ -3501,20 +3524,20 @@ async function uploadAlphaGoCheckpoint(file) {
   return String(result.modelPath);
 }
 
-/** 保存 AlphaGo checkpoint；搜索和深度参数由生产后端统一管理。 */
-async function saveScheduleAlphaGoOptions() {
-  const saveButton = document.getElementById("saveScheduleAlphaGoOptionsButton");
+/** 保存 Search Tree checkpoint；搜索和深度参数由生产后端统一管理。 */
+async function saveSearchTreeOptions() {
+  const saveButton = document.getElementById("saveSearchTreeOptionsButton");
   saveButton.disabled = true;
   try {
-    const modelPath = pendingAlphaGoCheckpointFile
-      ? await uploadAlphaGoCheckpoint(pendingAlphaGoCheckpointFile)
-      : String(document.getElementById("alphaGoCheckpointPath").value || "").trim();
-    state.options.scheduleAlphaGoModelPath = modelPath;
-    pendingAlphaGoCheckpointFile = null;
+    const modelPath = pendingSearchTreeCheckpointFile
+      ? await uploadSearchTreeCheckpoint(pendingSearchTreeCheckpointFile)
+      : String(document.getElementById("searchTreeCheckpointPath").value || "").trim();
+    state.options.searchTreeModelPath = modelPath;
+    pendingSearchTreeCheckpointFile = null;
     retainSessionSchedulingConfiguration();
     markTestDirty();
     renderAll();
-    document.getElementById("scheduleAlphaGoOptionsDialog").close();
+    document.getElementById("searchTreeOptionsDialog").close();
   } finally {
     saveButton.disabled = false;
   }
@@ -3824,11 +3847,11 @@ function buildPayload() {
   const routes = instances.routes.map(route => ({ ...normalizeRoute(route), stages: route.stages.map(stage => ({ ...stage, visits: stage.visits.map(visit => structuredClone(visit)) })) }));
   const cleans = state.cleans.map(runtimeClean);
   const options = { ...state.options };
-  if (state.strategy === "schedule-alphago") {
-    // 初始执行模式随回放/步进模式走，避免 update 启动时的会话重置覆盖用户选择。
-    options.scheduleAlphaGoExecutionMode = playbackMode === "step" ? "stepped" : "continuous";
+  if (state.strategy === "search-tree") {
+    // 拓扑回放固定为连续求解，不再提供步进求解分支。
+    options.searchTreeExecutionMode = "continuous";
   }
-  return { schemaVersion: EXPECTED_API_SCHEMA, workspaceDeviceId: state.workspaceDeviceId, workspaceTestId: state.testCaseId, deviceName: state.deviceName, device: state.device, strategy: state.strategy, roundCount: state.roundCount, options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), skipBaseline: skipBaselineEnabled(), cleanValidationTypes: cleanValidationTypes(), recipes: collectRecipes(routes), cleans, routes, rounds: instances.rounds };
+  return { schemaVersion: EXPECTED_API_SCHEMA, workspaceDeviceId: state.workspaceDeviceId, workspaceTestId: state.testCaseId, deviceName: state.deviceName, device: state.device, strategy: state.strategy, roundCount: state.roundCount, options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), executionTimingEnabled: executionTimingEnabled(), skipBaseline: skipBaselineEnabled(), cleanValidationTypes: cleanValidationTypes(), recipes: collectRecipes(routes), cleans, routes, rounds: instances.rounds };
 }
 
 /** 把数字输入限制在 [min, max] 并回填 DOM，防止手输越界值。 */
@@ -3867,6 +3890,7 @@ function currentRunSettingsPreferences() {
     compatibilityMode: compatibilityModeEnabled(),
     hongYeCheck: hongYeCheckEnabled(),
     skipBaseline: skipBaselineEnabled(),
+    executionTimingEnabled: executionTimingEnabled(),
     maximumWorkers: batchParallelism(),
     validationWorkers: validationParallelism(),
     cleanValidationTypes: cleanValidationTypes(),
@@ -3880,6 +3904,7 @@ function applyRunSettingsPreferences(settings) {
     compatibilityMode: "compatibilityModeInput",
     hongYeCheck: "hongYeCheckInput",
     skipBaseline: "skipBaselineInput",
+    executionTimingEnabled: "executionTimingEnabledInput",
   };
   Object.entries(checkboxFields).forEach(([field, elementId]) => {
     const input = document.getElementById(elementId);
@@ -3921,6 +3946,11 @@ function hongYeCheckEnabled() {
   return document.getElementById("hongYeCheckInput")?.checked === true;
 }
 
+/** 返回是否在兼容推进中应用设备实际执行时间。 */
+function executionTimingEnabled() {
+  return compatibilityModeEnabled() && document.getElementById("executionTimingEnabledInput")?.checked === true;
+}
+
 let runSettingsTrigger = null;
 
 /** 更新齿轮按钮的无障碍摘要，并标记是否偏离推荐默认设置。 */
@@ -3930,19 +3960,22 @@ function updateRunSettingsButtonLabel() {
   const compatibility = document.getElementById("compatibilityModeInput")?.checked === true;
   const hongYe = document.getElementById("hongYeCheckInput")?.checked === true;
   const skipBaseline = document.getElementById("skipBaselineInput")?.checked === true;
+  const executionTiming = document.getElementById("executionTimingEnabledInput")?.checked === true;
   const algorithmWorkers = batchParallelism();
   const validationWorkers = validationParallelism();
   const enabledCleanTypes = cleanValidationTypes();
   const validationInput = document.getElementById("validationParallelismInput");
   if (validationInput) validationInput.disabled = !hongYe;
-  const labels = [compatibility && "兼容模式", hongYe && "HongYe Check", skipBaseline && "跳过 Baseline", enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length && `Clean 校验 ${enabledCleanTypes.length}/${CLEAN_VALIDATION_TYPES.length}`].filter(Boolean);
+  const executionInput = document.getElementById("executionTimingEnabledInput");
+  if (executionInput) executionInput.disabled = !compatibility;
+  const labels = [compatibility && "兼容模式", executionTiming && compatibility && "执行时间模拟", hongYe && "HongYe Check", skipBaseline && "跳过 Baseline", enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length && `Clean 校验 ${enabledCleanTypes.length}/${CLEAN_VALIDATION_TYPES.length}`].filter(Boolean);
   const parallelism = `算法×${algorithmWorkers}${hongYe ? ` 校验×${validationWorkers}` : ""}`;
   const summary = labels.length ? `运行设置：${labels.join("、")}（${parallelism}）` : `运行设置：${parallelism}`;
   button.setAttribute("aria-label", summary);
   button.setAttribute("title", summary);
   button.classList.toggle(
     "is-customized",
-    !compatibility || !hongYe || !skipBaseline
+    !compatibility || executionTiming || !hongYe || !skipBaseline
       || algorithmWorkers !== 4 || validationWorkers !== 2 || enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length,
   );
 }
@@ -4013,7 +4046,7 @@ function updateStrategyOptionVisibility() {
   const optionGroups = new Set(algorithm?.optionGroups || []);
   document.getElementById("loadlockOptions").classList.toggle("is-hidden", !optionGroups.has("loadlock"));
   document.getElementById("heuristicObjectiveOptions").classList.toggle("is-hidden", !optionGroups.has("heuristic-objectives"));
-  document.getElementById("scheduleAlphaGoOptions").classList.toggle("is-hidden", !optionGroups.has("schedule-alphago"));
+  document.getElementById("searchTreeOptions").classList.toggle("is-hidden", !optionGroups.has("search-tree"));
 }
 
 /** 在策略列表下方显示指定算法的介绍。 */
@@ -4076,9 +4109,6 @@ async function prepareWorkspaceView(result) {
     const serverCode = String(result.deadlock.Code || "").toUpperCase();
     result.deadlock = replayDeadlock
       || (DEADLOCK_TYPE_CATALOG[serverCode] ? result.deadlock : { Code: "DEADLOCK.UNCLASSIFIED" });
-  }
-  if (latestSearchTelemetry?.algorithm === "schedule-alphago") {
-    renderSearchTelemetry(latestSearchTelemetry);
   }
   return visualizationWorkspace.getBottleneckUtilization();
 }
@@ -4196,7 +4226,7 @@ async function requestSingleRunCancellation() {
     const snapshot = await response.json();
     if (!response.ok) throw new Error(snapshot.error || `服务返回 ${response.status}`);
     renderSingleRunStatus(snapshot);
-    if (state.strategy === "schedule-alphago") {
+    if (state.strategy === "search-tree") {
       try { await requestSearchControl("cancel"); } catch { /* 单测停止状态已经生效。 */ }
     }
     singleRunAbortController?.abort();
@@ -4210,7 +4240,6 @@ async function requestSingleRunCancellation() {
 /** 调用本地服务运行排程。 */
 async function runPlan() {
   const button = document.getElementById("runButton");
-  const stepRunButton = document.getElementById("stepRunButton");
   const batchButton = document.getElementById("batchRunButton");
   if (singleRunActive) {
     try { await requestSingleRunCancellation(); }
@@ -4218,8 +4247,6 @@ async function runPlan() {
     return;
   }
   let logReady = false, ganttReady = false, runResult = null, bottleneckSummary = null;
-  const telemetryEnabled = state.strategy === "schedule-alphago";
-  let telemetryStopped = false;
   // 健康检查和必要的自动保存也可能涉及磁盘；点击后先立即反馈，避免用户误以为按钮失效。
   button.disabled = true;
   batchButton.disabled = true;
@@ -4247,20 +4274,8 @@ async function runPlan() {
     button.classList.remove("running"); button.classList.add("cancel"); button.textContent = "■ 停止当前测试";
     startRunStatus(`正在运行 · ${payload.testCaseName}`, "提交运行请求");
     void pollSingleRunStatus(runId);
-    if (telemetryEnabled) {
-      stepRunActive = true; stepRunCancelling = false;
-      stepRunButton.classList.add("cancel"); stepRunButton.disabled = false; stepRunButton.textContent = "■ 停止模型步进";
-    }
     resetRunResult();
     visualizationWorkspace.setAnalysisConfiguration(state.routes, state.rounds);
-    if (telemetryEnabled) {
-      visualizationWorkspace.beginLiveSolve(
-        payload,
-        `${displayStrategyName(state.strategy)} · 实时求解`,
-      );
-      visualizationWorkspace.showPlayback();
-      startSearchTelemetryPolling();
-    }
     writeTerminal(`$ 开始运行 ${state.strategy}\n  总轮数: ${state.roundCount}\n  重算时间: ${state.rounds.map(round => round.currentTime).join(", ")} s`);
     const response = await fetch("/api/run", {
       method: "POST",
@@ -4271,10 +4286,6 @@ async function runPlan() {
     const responseText = await response.text();
     try { runResult = JSON.parse(responseText); }
     catch { throw new Error(responseText.trim().slice(0, 240) || `服务返回 ${response.status}`); }
-    if (telemetryEnabled) {
-      stopSearchTelemetryPolling(runResult?.searchTelemetry || null);
-      telemetryStopped = true;
-    }
     logReady = prepareLogDownload(runResult);
     ganttReady = prepareGanttView(runResult);
     if (runResult?.resultId) {
@@ -4316,46 +4327,9 @@ async function runPlan() {
     finishRunStatus(cancelled ? "cancelled" : "failed", cancelled ? "当前测试已停止" : "当前测试运行失败");
   }
   finally {
-    if (telemetryEnabled && !telemetryStopped) {
-      stopSearchTelemetryPolling(runResult?.searchTelemetry || null);
-    }
-    if (stepRunActive) {
-      stepRunActive = false; stepRunCancelling = false;
-      stepRunButton.classList.remove("cancel"); stepRunButton.textContent = "⟳ 运行模型步进";
-    }
     singleRunActive = false; singleRunCancelling = false; activeSingleRunId = ""; singleRunAbortController = null;
     button.disabled = false; button.classList.remove("running", "cancel"); button.textContent = "▶ 运行当前测试"; renderWorkspaceControls();
   }
-}
-
-/** 以步进模式运行当前测试：运行中按钮变为停止入口，可随时终止耗时较长的搜索。 */
-async function runModelStepped() {
-  const stepButton = document.getElementById("stepRunButton");
-  if (stepButton.disabled) return;
-  if (stepRunActive) {
-    if (stepRunCancelling) return;
-    stepRunCancelling = true;
-    stepButton.disabled = true;
-    stepButton.textContent = "正在停止…";
-    writeTerminal("$ 正在停止模型步进运行…");
-    try {
-      await requestSearchControl("cancel");
-    } catch (error) {
-      stepRunCancelling = false;
-      stepButton.disabled = false;
-      stepButton.classList.add("cancel");
-      stepButton.textContent = "■ 停止";
-      writeTerminal(`$ 停止请求失败：${error.message || "未知错误"}\n  可再次点击“■ 停止”重试。`, true);
-    }
-    return;
-  }
-  if (state.strategy !== "schedule-alphago") {
-    writeTerminal("$ 运行模型步进仅支持 Schedule-AlphaGo 策略，请先在“运行策略”中选择。", true);
-    return;
-  }
-  playbackMode = "step";
-  renderPlaybackModeSwitch();
-  await runPlan();
 }
 
 /** 返回当前测试组按名称数字自然顺序排列的测试。 */
@@ -4472,7 +4446,7 @@ async function runCurrentTestGroup(selectedTestIds = null) {
     const response = await fetch("/api/run-batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId: state.workspaceDeviceId, group: state.activeTestGroup, testIds: tests.map(test => test.id), strategy: state.strategy, options: state.options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), skipBaseline: skipBaselineEnabled(), maximumWorkers: batchParallelism(), validationWorkers: validationParallelism(), cleanValidationTypes: cleanValidationTypes() }),
+      body: JSON.stringify({ deviceId: state.workspaceDeviceId, group: state.activeTestGroup, testIds: tests.map(test => test.id), strategy: state.strategy, options: state.options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), executionTimingEnabled: executionTimingEnabled(), skipBaseline: skipBaselineEnabled(), maximumWorkers: batchParallelism(), validationWorkers: validationParallelism(), cleanValidationTypes: cleanValidationTypes() }),
     });
     let result = await response.json();
     if (!response.ok || !result.batchId || !Array.isArray(result.items)) throw new Error(result.error || `服务返回 ${response.status}`);
@@ -5131,21 +5105,10 @@ async function checkService() {
     if (!response.ok) throw new Error();
     const status = await response.json(), compatible = status.schemaVersion === EXPECTED_API_SCHEMA;
     state.serviceCompatible = compatible;
-    const e2eCTQAvailable = status.strategies?.["e2e-ctq"] === true, dualActorE2EAvailable = status.strategies?.["dual-actor-e2e"] === true;
     state.algorithmMetadata = status.algorithmMetadata || {};
-    const replayModelSelect = document.getElementById("visualRecommendationModel");
-    replayModelSelect.querySelector('option[value="e2e-ctq"]').disabled = !e2eCTQAvailable;
-    replayModelSelect.querySelector('option[value="dual-actor-e2e"]').disabled = !dualActorE2EAvailable;
-    if (replayModelSelect.selectedOptions[0]?.disabled) {
-      replayModelSelect.value = dualActorE2EAvailable ? "dual-actor-e2e" : "e2e-ctq";
-      replayModelSelect.dispatchEvent(new Event("change"));
-    }
     renderOtherAlgorithmOptions(status.algorithms || status.otherAlgorithms || []);
     runButton.disabled = !compatible || singleRunCancelling || state.batchRunning;
     batchRunButton.disabled = !compatible || singleRunActive || (state.batchRunning && state.batchCancelRequested);
-    document.getElementById("stepRunButton").disabled = stepRunActive
-      ? false
-      : !compatible || state.strategy !== "schedule-alphago";
     renderWorkspaceControls();
     pill.textContent = compatible ? "本地服务已连接" : "服务版本过旧";
     if (!compatible) {
@@ -5157,7 +5120,6 @@ async function checkService() {
     state.serviceCompatible = false;
     runButton.disabled = true;
     batchRunButton.disabled = true;
-    document.getElementById("stepRunButton").disabled = true;
     renderWorkspaceControls();
     pill.textContent = "本地服务未连接";
     pill.style.color = "var(--red)";
@@ -5187,6 +5149,8 @@ const bottleneckAnalysisHelpDialog = document.getElementById("bottleneckAnalysis
 document.getElementById("bottleneckAnalysisHelpDialogClose").addEventListener("click", () => bottleneckAnalysisHelpDialog.close());
 const residenceAnalysisHelpDialog = document.getElementById("residenceAnalysisHelpDialog") as HTMLDialogElement;
 document.getElementById("residenceAnalysisHelpDialogClose").addEventListener("click", () => residenceAnalysisHelpDialog.close());
+const throughputAnalysisHelpDialog = document.getElementById("throughputAnalysisHelpDialog") as HTMLDialogElement;
+document.getElementById("throughputAnalysisHelpDialogClose").addEventListener("click", () => throughputAnalysisHelpDialog.close());
 document.getElementById("visualPerformance").addEventListener("click", event => {
   if (!(event.target instanceof Element)) return;
   if (event.target.closest("#bottleneckAnalysisHelpButton") && !bottleneckAnalysisHelpDialog.open) {
@@ -5195,27 +5159,59 @@ document.getElementById("visualPerformance").addEventListener("click", event => 
   if (event.target.closest("#residenceAnalysisHelpButton") && !residenceAnalysisHelpDialog.open) {
     residenceAnalysisHelpDialog.showModal();
   }
+  if (event.target.closest("#throughputAnalysisHelpButton") && !throughputAnalysisHelpDialog.open) {
+    throughputAnalysisHelpDialog.showModal();
+  }
 });
 document.getElementById("visualPerformance").addEventListener("change", event => {
-  const select = event.target instanceof HTMLSelectElement && event.target.id === "residenceMetricSelect"
+  const select = event.target instanceof HTMLSelectElement && (
+    event.target.id === "residenceMetricSelect"
+    || event.target.id === "throughputMetricSelect"
+    || event.target.id === "throughputWindowSize"
+    || event.target.id === "throughputRangeSelect"
+  )
     ? event.target
     : null;
   if (!select) return;
   const performancePanel = event.currentTarget;
   if (!(performancePanel instanceof HTMLElement)) return;
   const selectedMetric = select.value;
-  performancePanel.querySelectorAll<HTMLElement>("[data-residence-metric-chart]").forEach(chart => {
-    chart.hidden = chart.dataset.residenceMetricChart !== selectedMetric;
+  if (select.id === "residenceMetricSelect") {
+    performancePanel.querySelectorAll<HTMLElement>("[data-residence-metric-chart]").forEach(chart => {
+      chart.hidden = chart.dataset.residenceMetricChart !== selectedMetric;
+    });
+    performancePanel.querySelectorAll<HTMLElement>("[data-residence-summary]").forEach(summary => {
+      summary.hidden = summary.dataset.residenceSummary !== selectedMetric;
+    });
+    return;
+  }
+  const throughputMode = performancePanel.querySelector<HTMLSelectElement>("#throughputMetricSelect")?.value ?? "cumulative";
+  const throughputWindow = performancePanel.querySelector<HTMLSelectElement>("#throughputWindowSize")?.value ?? "5";
+  const activeThroughputChart = throughputMode === "rolling"
+    ? `rolling-${throughputWindow}`
+    : "cumulative";
+  performancePanel.querySelectorAll<HTMLElement>("[data-throughput-window-control]").forEach(control => {
+    control.hidden = throughputMode !== "rolling";
   });
-  performancePanel.querySelectorAll<HTMLElement>("[data-residence-summary]").forEach(summary => {
-    summary.hidden = summary.dataset.residenceSummary !== selectedMetric;
+  performancePanel.querySelectorAll<HTMLElement>("[data-throughput-chart]").forEach(chart => {
+    chart.hidden = chart.dataset.throughputChart !== activeThroughputChart;
   });
+  performancePanel.querySelectorAll<HTMLElement>("[data-throughput-summary]").forEach(summary => {
+    summary.hidden = summary.dataset.throughputSummary !== activeThroughputChart;
+  });
+  const range = performancePanel.querySelector<HTMLSelectElement>("#throughputRangeSelect")?.value ?? "wafer:30";
+  const activeChart = performancePanel.querySelector<HTMLElement>(`[data-throughput-chart="${activeThroughputChart}"]`);
+  if (activeChart?.dataset.throughputPoints) updateThroughputChartRange(activeChart, range);
 });
+
 document.getElementById("bottleneckAnalysisHelpDialog").addEventListener("click", event => {
   if (event.target === bottleneckAnalysisHelpDialog) bottleneckAnalysisHelpDialog.close();
 });
 document.getElementById("residenceAnalysisHelpDialog").addEventListener("click", event => {
   if (event.target === residenceAnalysisHelpDialog) residenceAnalysisHelpDialog.close();
+});
+document.getElementById("throughputAnalysisHelpDialog").addEventListener("click", event => {
+  if (event.target === throughputAnalysisHelpDialog) throughputAnalysisHelpDialog.close();
 });
 document.getElementById("pjobRouteProcess").addEventListener("change", event => renderPJobRouteDialogGroup(event.target.value));
 document.getElementById("pjobRouteParallel").addEventListener("change", event => renderPJobRouteDialogGroup(pjobRoutePickerContext?.processKey, event.target.value));
@@ -5324,12 +5320,11 @@ document.getElementById("saveTestButton").addEventListener("click", () => saveCu
 document.getElementById("deleteTestButton").addEventListener("click", () => deleteCurrentTest().catch(error => writeTerminal(`$ 删除测试集失败\n  ${error.message}`, true)));
 document.getElementById("roundCount").addEventListener("input", event => { resizeRounds(event.target.value); markTestDirty(); });
 document.getElementById("runButton").addEventListener("click", runPlan);
-document.getElementById("stepRunButton").addEventListener("click", runModelStepped);
 document.getElementById("batchRunButton").addEventListener("click", runCurrentTestGroup);
 document.getElementById("openRunSettingsButton").addEventListener("click", openRunSettingsDialog);
 document.getElementById("runSettingsDialogClose").addEventListener("click", closeRunSettingsDialog);
 document.getElementById("runSettingsDialog").addEventListener("close", finishRunSettingsDialog);
-["hongYeCheckInput", "compatibilityModeInput", "skipBaselineInput", "batchParallelismInput", "validationParallelismInput", ...CLEAN_VALIDATION_TYPES.map(type => `cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`)].forEach(id => {
+["hongYeCheckInput", "compatibilityModeInput", "executionTimingEnabledInput", "skipBaselineInput", "batchParallelismInput", "validationParallelismInput", ...CLEAN_VALIDATION_TYPES.map(type => `cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`)].forEach(id => {
   document.getElementById(id).addEventListener("change", () => {
     runSettingsPreferencesDirty = true;
     updateRunSettingsButtonLabel();
@@ -5356,24 +5351,24 @@ document.getElementById("batchTestSelectionForm").addEventListener("submit", eve
   event.preventDefault();
   runBatchSelection(false);
 });
-document.getElementById("openScheduleAlphaGoOptionsDialogButton").addEventListener("click", openScheduleAlphaGoOptionsDialog);
-document.getElementById("scheduleAlphaGoOptionsDialogCancel").addEventListener("click", () => document.getElementById("scheduleAlphaGoOptionsDialog").close());
-document.getElementById("alphaGoCheckpointFile").addEventListener("change", event => {
-  pendingAlphaGoCheckpointFile = event.currentTarget.files?.[0] || null;
-  if (!pendingAlphaGoCheckpointFile) return;
-  document.getElementById("alphaGoCheckpointPath").value = pendingAlphaGoCheckpointFile.name;
-  document.getElementById("alphaGoCheckpointHint").textContent = `已选择“${pendingAlphaGoCheckpointFile.name}”；保存参数时上传。`;
+document.getElementById("openSearchTreeOptionsDialogButton").addEventListener("click", openSearchTreeOptionsDialog);
+document.getElementById("searchTreeOptionsDialogCancel").addEventListener("click", () => document.getElementById("searchTreeOptionsDialog").close());
+document.getElementById("searchTreeCheckpointFile").addEventListener("change", event => {
+  pendingSearchTreeCheckpointFile = event.currentTarget.files?.[0] || null;
+  if (!pendingSearchTreeCheckpointFile) return;
+  document.getElementById("searchTreeCheckpointPath").value = pendingSearchTreeCheckpointFile.name;
+  document.getElementById("searchTreeCheckpointHint").textContent = `已选择“${pendingSearchTreeCheckpointFile.name}”；保存参数时上传。`;
 });
-document.getElementById("clearAlphaGoCheckpointButton").addEventListener("click", () => {
-  pendingAlphaGoCheckpointFile = null;
-  document.getElementById("alphaGoCheckpointFile").value = "";
-  document.getElementById("alphaGoCheckpointPath").value = "";
-  document.getElementById("alphaGoCheckpointHint").textContent = "保存后将使用默认模型或冷启动模型。";
+document.getElementById("clearSearchTreeCheckpointButton").addEventListener("click", () => {
+  pendingSearchTreeCheckpointFile = null;
+  document.getElementById("searchTreeCheckpointFile").value = "";
+  document.getElementById("searchTreeCheckpointPath").value = "";
+  document.getElementById("searchTreeCheckpointHint").textContent = "保存后将使用默认模型或冷启动模型。";
 });
-document.getElementById("scheduleAlphaGoOptionsForm").addEventListener("submit", event => {
+document.getElementById("searchTreeOptionsForm").addEventListener("submit", event => {
   event.preventDefault();
-  saveScheduleAlphaGoOptions().catch(error => {
-    document.getElementById("alphaGoCheckpointHint").textContent = error.message || "参数保存失败";
+  saveSearchTreeOptions().catch(error => {
+    document.getElementById("searchTreeCheckpointHint").textContent = error.message || "参数保存失败";
   });
 });
 document.getElementById("clearExportsButton").addEventListener("click", clearExportedArtifacts);
@@ -5385,51 +5380,41 @@ document.getElementById("logButton").addEventListener("click", event => { if (ev
 document.getElementById("ganttButton").addEventListener("click", event => { if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault(); });
 document.getElementById("batchLogButton").addEventListener("click", event => { if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault(); });
 document.getElementById("batchGanttButton").addEventListener("click", event => { if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault(); });
-document.getElementById("searchTelemetryDecisionSelect").addEventListener("change", event => {
-  selectedSearchTelemetryId = String(event.currentTarget.value || "");
-  followLatestSearchTelemetry = selectedSearchTelemetryId === String(latestSearchTelemetry?.searchId || "");
-  if (latestSearchTelemetry) renderSearchTelemetry(latestSearchTelemetry);
-});
-document.getElementById("searchTelemetryPauseButton").addEventListener("click", () => {
-  void controlSearchTelemetry("pause");
-});
-document.getElementById("searchTelemetryStepButton").addEventListener("click", () => {
-  void controlSearchTelemetry("step");
-});
-document.getElementById("searchTelemetryContinueButton").addEventListener("click", () => {
-  void controlSearchTelemetry("continue");
-});
-document.getElementById("searchTelemetryFollowRecommendationButton").addEventListener("click", followSearchRecommendation);
-document.getElementById("searchTelemetryContinuousDecisionButton").addEventListener("click", toggleContinuousDecision);
-document.getElementById("playbackModeReplayButton").addEventListener("click", () => {
-  void setPlaybackMode("replay");
-});
-document.getElementById("playbackModeStepButton").addEventListener("click", () => {
-  void setPlaybackMode("step");
-});
-// 步进模式下点击候选行提交该动作；事件委托在容器上，避免每次重渲染重复绑定。
-// 只响应可交互（role="button"）的候选行，防止搜索中的误点被静默预选。
-document.getElementById("visualDecisionLens").addEventListener("click", event => {
-  const candidate = event.target.closest?.("[data-action-key][role='button']");
-  if (!candidate) return;
-  void chooseSearchAction(candidate.dataset.actionKey);
-});
-document.getElementById("visualDecisionLens").addEventListener("keydown", event => {
-  if (event.key !== "Enter" && event.key !== " ") return;
-  const candidate = event.target.closest?.("[data-action-key][role='button']");
-  if (!candidate) return;
-  event.preventDefault();
-  void chooseSearchAction(candidate.dataset.actionKey);
-});
 document.getElementById("closeDrawer").addEventListener("click", closeStepDrawer);
 document.getElementById("drawerLayer").addEventListener("click", event => { if (event.target.id === "drawerLayer") closeStepDrawer(); });
 document.addEventListener("keydown", event => { if (event.key === "Escape") closeStepDrawer(); });
 document.addEventListener("keydown", event => { const card = event.target.closest?.("[data-step-card]"); if (card && event.key === "Enter") openPJobStepDrawer(Number(card.dataset.routeIndex), Number(card.dataset.stageIndex)); });
 document.addEventListener("input", event => {
-  if (event.target.matches("[data-device-timing-target]")) updateDeviceTimingFromControl(event.target);
+  if (event.target.matches("[data-device-timing-target], [data-device-execution-target]")) updateDeviceTimingFromControl(event.target);
+  const execution = state.deviceTimingDraft?.execution;
+  if (execution && event.target.id === "executionFluctuationRatio") {
+    execution.fluctuation.ratio = Math.max(0, Math.min(1, (Number(event.target.value) || 0) / 100));
+    markDeviceTimingDirty();
+  }
+  if (execution && event.target.id === "executionMinimumOffset") {
+    execution.fluctuation.minimumOffsetSeconds = Number(event.target.value);
+    markDeviceTimingDirty();
+  }
+  if (execution && event.target.id === "executionMaximumOffset") {
+    execution.fluctuation.maximumOffsetSeconds = Number(event.target.value);
+    markDeviceTimingDirty();
+  }
   if (event.target.matches("[data-scope], [data-option], [data-time-index], [data-round-time-index]")) updateStateFromControl(event.target);
 });
 document.addEventListener("change", event => {
+  const execution = state.deviceTimingDraft?.execution;
+  if (execution && event.target.name === "executionTimingMode") {
+    execution.mode = event.target.value === "fluctuation" ? "fluctuation" : "fixed";
+    markDeviceTimingDirty();
+    renderDeviceTimingConfiguration();
+    return;
+  }
+  if (execution && event.target.id === "executionFluctuationKind") {
+    execution.fluctuation.kind = event.target.value === "offset" ? "offset" : "ratio";
+    markDeviceTimingDirty();
+    renderDeviceTimingConfiguration();
+    return;
+  }
   const transferAxis = event.target.closest?.("[data-robot-transfer-axis]");
   if (transferAxis) {
     state.deviceRobotTransferAxes[transferAxis.dataset.robotTransferAxis] = transferAxis.value;
@@ -5464,10 +5449,6 @@ document.addEventListener("change", event => {
     document.getElementById("roundCount").disabled = false;
     updateStrategyOptionVisibility();
     showAlgorithmDetails(state.strategy);
-    // 运行期保持“停止”入口可用；非运行期才按策略/服务状态禁用。
-    document.getElementById("stepRunButton").disabled = stepRunActive
-      ? false
-      : !state.serviceCompatible || state.strategy !== "schedule-alphago";
     markTestDirty(); renderAll();
   }
 });

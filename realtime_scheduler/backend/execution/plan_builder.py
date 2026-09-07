@@ -13,6 +13,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from realtime_scheduler.backend.execution.runtime_snapshot import (
+    compact_runtime_snapshots,
+)
+
 
 FIRST_SLOT_ID = 1
 MAX_WAFERS_PER_JOB = 25
@@ -24,6 +28,8 @@ DUMMY_MATERIAL_LIMIT_LEVEL = 10000
 DUMMY_MATERIAL_USAGE_MIX = 2
 CJOB_TYPE_VALUES = {"NormalLot": 0, "HighestLot": 2, "HigherLot": 3}
 TASK_MODE_VALUES = {"Smart": 0, "Pipeline": 1, "Sequential": 2, "Concurrent": 3}
+# Aligner RouteStep 必须通过 NeedProcess 触发 AlignMove 规划。
+ALIGNER_NAME_MARKER = "aligner"
 
 
 @dataclass
@@ -35,6 +41,11 @@ class BuildState:
     job_names: set[str] = field(default_factory=set)
     task_ids: set[str] = field(default_factory=set)
     dummy_material_count: int = 0
+
+
+def _is_aligner_station(station_name: str) -> bool:
+    """判断 Route Visit 是否指向需要通过 NeedProcess 下发的 Aligner。"""
+    return ALIGNER_NAME_MARKER in station_name.casefold()
 
 
 def extract_init_data(raw: Any) -> Dict[str, Any]:
@@ -870,6 +881,10 @@ def build_route(
             else any(visit["ProcessRecipe"] for visit in visits)
             or has_product_recipe
         )
+        # Aligner 必须以 NeedProcess 标识，供标准算法和 HongYe 按 AlignMove
+        # 而非普通中转站处理。该规则优先于编辑器中可能遗留的 false。
+        if any(_is_aligner_station(visit["StationName"]) for visit in visits):
+            need_process = True
         route_steps.append({
             "StepID": step_id,
             "PostStepID": post_step_ids,
@@ -1270,7 +1285,7 @@ def build_round_update(
         ):
             materials.append(_dummy_material(slot_id, dummy_port, dummy_accessible_pms))
         build_state.dummy_material_count = dummy_material_count
-    return {
+    update = {
         "Scenario": 0,
         "ProcessRecipes": build_process_recipes(recipes, routes, cleans),
         "Materials": materials, "ProcessJobs": process_jobs, "ControlJobs": control_jobs,
@@ -1281,3 +1296,5 @@ def build_round_update(
         "Stations": deepcopy(dict(tool_topo.get("Stations") or {})),
         "InitialMoveID": int(tool_topo.get("InitialMoveID") or 0),
     }
+    compact_runtime_snapshots(update)
+    return update

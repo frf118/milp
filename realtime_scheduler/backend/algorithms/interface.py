@@ -1,9 +1,10 @@
-"""``other_alg`` 标准算法包的发现与 ``init/update`` 调用边界。
+"""``other_alg`` 标准算法包的发现及调度、回放动作接口调用边界。
 
 外部策略只能由服务扫描 ``alg/other_alg`` 下的目录包获得。算法包既可以
 保留交付目录中的 ``CT/infer`` 层，也可以把 ``infer``、``ropn_sa`` 和
 ``config`` 直接放在算法目录下。所有调用都在独占会话中执行，切换算法时
-会清理上一算法的同名 Python 模块。
+会清理上一算法的同名 Python 模块。``get_replay_actions`` 是可选接口，缺失
+时明确返回 ``None``。
 """
 
 from __future__ import annotations
@@ -224,7 +225,62 @@ def _prepare_src_namespace(entry_path: Path) -> None:
     algorithm_src_text = str(entry_path / "src")
     src_path = src_module.__path__  # type: ignore[attr-defined]
     if algorithm_src_text not in src_path:
-        src_path.append(algorithm_src_text)
+        # ``src.infer`` 是交付算法的正式入口。把算法路径置于首位，确保
+        # 之后重新解析子包时不会再次选中内置算法仓库的同名 infer 包。
+        src_path.insert(0, algorithm_src_text)
+
+
+def _unload_conflicting_src_infer_modules(entry_path: Path) -> None:
+    """卸载不属于当前交付包的 ``src.infer`` 模块。
+
+    ``src`` 顶层包可能被内置算法占用，且 Python 会直接复用已缓存的
+    ``src.infer.scheduler``，不会因 ``src.__path__`` 更新而重新查找入口。
+    保留顶层 ``src`` 以免影响内置模块，只清理其 infer 子树，让公司端入口
+    始终从当前 ``other_alg/<算法名>/src`` 加载。
+    """
+    algorithm_src_root = entry_path / "src"
+    for module_name, module in list(sys.modules.items()):
+        if module_name != "src.infer" and not module_name.startswith("src.infer."):
+            continue
+        if not isinstance(module, ModuleType) or not _module_belongs_to_root(
+            module, algorithm_src_root
+        ):
+            sys.modules.pop(module_name, None)
+
+
+def _capture_namespace_modules() -> dict[str, ModuleType]:
+    """保存本地算法可能已加载的 ``src`` 与 ``CT`` 模块树。"""
+    return {
+        module_name: module
+        for module_name, module in sys.modules.items()
+        if isinstance(module, ModuleType)
+        and (
+            module_name == "src"
+            or module_name.startswith("src.")
+            or module_name == "CT"
+            or module_name.startswith("CT.")
+        )
+    }
+
+
+def _restore_namespace_modules(snapshot: Mapping[str, ModuleType]) -> None:
+    """移除交付算法命名空间，并精确恢复会话前的本地模块缓存。"""
+    for module_name in tuple(sys.modules):
+        if (
+            module_name == "src"
+            or module_name.startswith("src.")
+            or module_name == "CT"
+            or module_name.startswith("CT.")
+        ):
+            sys.modules.pop(module_name, None)
+    sys.modules.update(snapshot)
+    for module_name in sorted(snapshot, key=lambda name: name.count(".")):
+        parent_name, separator, child_name = module_name.rpartition(".")
+        if not separator:
+            continue
+        parent = sys.modules.get(parent_name)
+        if isinstance(parent, ModuleType):
+            setattr(parent, child_name, snapshot[module_name])
 
 
 def _load_entry_module() -> ModuleType:
@@ -264,6 +320,7 @@ def _load_entry_module() -> ModuleType:
             sys.path.insert(0, search_root_text)
     if use_src_layout:
         _prepare_src_namespace(entry_path)
+        _unload_conflicting_src_infer_modules(entry_path)
     else:
         _prepare_ct_namespace(entry_path)
     importlib.invalidate_caches()
@@ -290,13 +347,28 @@ def _json_text(payload: Union[str, Mapping[str, Any]]) -> str:
 
 @contextmanager
 def session(algorithm_id: str) -> Iterator[None]:
-    """独占算法模块的全局 Scheduler，并在会话内固定算法 ID。"""
+    """独占运行一个标准算法，并隔离其与本地算法的同名包。
+
+    外部交付包和本地算法都可能使用顶层 ``src``。会话开始时保存本地
+    ``src``/``CT`` 模块树，再让外部算法从干净命名空间加载；结束时恢复快照。
+    因此外部算法的绝对导入不会误用本地代码，随后运行本地算法也不会引用
+    外部算法的残留模块。
+    """
+    global _ENTRY_MODULE, _ENTRY_ROOT, _ENTRY_REVISION
     with _SESSION_LOCK:
         previous = getattr(_ACTIVE_ALGORITHM, "algorithm_id", None)
         _ACTIVE_ALGORITHM.algorithm_id = algorithm_id
+        namespace_snapshot = _capture_namespace_modules()
+        _restore_namespace_modules({})
         try:
             yield
         finally:
+            if _ENTRY_ROOT is not None:
+                _unload_previous_algorithm(_ENTRY_ROOT)
+            _ENTRY_MODULE = None
+            _ENTRY_ROOT = None
+            _ENTRY_REVISION = None
+            _restore_namespace_modules(namespace_snapshot)
             _ACTIVE_ALGORITHM.algorithm_id = previous
 
 
@@ -321,3 +393,36 @@ def update(update_data: Union[str, Mapping[str, Any]]) -> JsonObject:
     if isinstance(output.get("Info"), dict):
         output = dict(output["Info"])
     return dict(output)
+
+
+def get_replay_actions(
+    replay_context: Union[str, Mapping[str, Any]],
+) -> Optional[JsonObject]:
+    """调用算法可选的拓扑回放动作诊断接口。
+
+    算法入口可以实现 ``get_replay_actions(json_text)``，按当前回放状态返回
+    ``actions``。每个动作只能是 ``pick``、``place`` 或 ``swap``，并可用
+    ``status`` 区分 ``enabled``、``physical-blocked`` 与
+    ``deadlock-blocked``。未实现该函数时返回 ``None``，调用方保持动作卡片
+    为空；这使旧算法包无需升级即可继续回放。
+
+    参数:
+        replay_context: 包含设备、计划、MoveList、MoveStates 与 CurrentTime 的
+            JSON 对象或 JSON 文本。
+
+    返回:
+        算法动作诊断对象；算法未提供接口时为 ``None``。
+    """
+    callback = getattr(_load_entry_module(), "get_replay_actions", None)
+    if not callable(callback):
+        return None
+    raw_output = callback(_json_text(replay_context))
+    if isinstance(raw_output, Mapping):
+        output = dict(raw_output)
+    else:
+        output = json.loads(raw_output)
+    if not isinstance(output, dict):
+        raise RuntimeError("标准算法 get_replay_actions 返回值不是 JSON 对象")
+    if isinstance(output.get("Info"), dict):
+        output = dict(output["Info"])
+    return output
