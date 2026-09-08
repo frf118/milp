@@ -215,6 +215,11 @@ async function requestSearchControl(command, actionKey = null) {
 }
 
 // src/workspace_visualizer.ts
+var ALL_ACTION_DIAGNOSTIC_STATUSES = [
+  "enabled",
+  "physical-blocked",
+  "deadlock-blocked"
+];
 var PICK_MOVE_TYPES = /* @__PURE__ */ new Set([0, 2]);
 var PLACE_MOVE_TYPES = /* @__PURE__ */ new Set([1, 3]);
 var SWAP_MOVE = 4;
@@ -351,6 +356,7 @@ function normalizeReplayActionDiagnostic(value) {
     sourceSlot: finiteNumber(value.sourceSlot),
     destination: String(value.destination ?? ""),
     destinationSlot: finiteNumber(value.destinationSlot),
+    duplicateCount: Math.max(0, Math.round(finiteNumber(value.duplicateCount))),
     earliestStart: finiteNumber(value.earliestStart),
     finishTime: finiteNumber(value.finishTime)
   };
@@ -448,6 +454,54 @@ function formatSeconds2(value) {
 function materialIds(move, field = "MatIDList") {
   return listValue(move[field]).map(String).filter(Boolean);
 }
+function normalizeLoadPortReplenishments(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+  const replayContext = payload.ReplayContext;
+  if (!replayContext || typeof replayContext !== "object" || Array.isArray(replayContext)) return [];
+  const updates = listValue(replayContext.updates).filter((update) => Boolean(update) && typeof update === "object" && !Array.isArray(update)).sort((left, right) => finiteNumber(left.CurrentTime) - finiteNumber(right.CurrentTime));
+  const knownTaskIdsByPort = /* @__PURE__ */ new Map();
+  const replenishments = [];
+  updates.forEach((update, updateIndex) => {
+    const materials = listValue(update.Materials).filter((material) => Boolean(material) && typeof material === "object" && !Array.isArray(material));
+    const currentByPortAndTask = /* @__PURE__ */ new Map();
+    for (const material of materials) {
+      const port = String(material.SrcPortName ?? "").trim();
+      const currentModule = String(material.CurrentModuleName ?? "").trim();
+      const taskId = String(material.TaskID ?? "").trim();
+      const wafer = String(material.ID ?? material.Name ?? "").trim();
+      const slot = Math.trunc(finiteNumber(material.SlotID));
+      if (!port || currentModule !== port || !taskId || !wafer || slot < 1) continue;
+      const byTask = currentByPortAndTask.get(port) ?? /* @__PURE__ */ new Map();
+      const taskMaterials = byTask.get(taskId) ?? [];
+      taskMaterials.push({ wafer, slot, taskId });
+      byTask.set(taskId, taskMaterials);
+      currentByPortAndTask.set(port, byTask);
+    }
+    for (const [port, byTask] of currentByPortAndTask) {
+      const knownTaskIds = knownTaskIdsByPort.get(port) ?? /* @__PURE__ */ new Set();
+      for (const [taskId, taskMaterials] of byTask) {
+        if (updateIndex > 0 && !knownTaskIds.has(taskId)) {
+          replenishments.push({
+            time: finiteNumber(update.CurrentTime),
+            moduleName: port,
+            materials: taskMaterials.sort((left, right) => left.slot - right.slot)
+          });
+        }
+        knownTaskIds.add(taskId);
+      }
+      knownTaskIdsByPort.set(port, knownTaskIds);
+    }
+  });
+  return replenishments;
+}
+function materialInstanceId(move, material, index) {
+  const taskIds = listValue(move.TaskID).map(String).filter(Boolean);
+  const taskId = taskIds[index] ?? taskIds[0] ?? "";
+  if (taskId) return `${material}\0${taskId}`;
+  const processJobs = listValue(move.PJobName).map(String).filter(Boolean);
+  const processJob = processJobs[index] ?? processJobs[0] ?? "";
+  return processJob ? `${material}\0${processJob}` : material;
+}
 function isCleaningMove(move) {
   if (move.MoveType === CLEAN_MOVE) return true;
   if (move.MoveType !== PROCESS_MOVE) return false;
@@ -477,6 +531,32 @@ function robotCapacity(definition, holdingCount = 0) {
 }
 function isDummyPortName(name) {
   return /DUMMY/i.test(name) && /PORT/i.test(name);
+}
+function splitWaferOrigin(origin) {
+  const trimmed = origin.trim();
+  const separator = trimmed.lastIndexOf(".");
+  if (separator <= 0 || separator === trimmed.length - 1) {
+    return { moduleName: trimmed, slotLabel: "" };
+  }
+  return {
+    moduleName: trimmed.slice(0, separator),
+    slotLabel: trimmed.slice(separator + 1)
+  };
+}
+function isDummyWaferOrigin(origin) {
+  const { moduleName } = splitWaferOrigin(origin);
+  return Boolean(moduleName) && isDummyPortName(moduleName);
+}
+var DUMMY_MATERIAL_ID_START = 1e5;
+function isDummyWafer(wafer, origin) {
+  if (isDummyWaferOrigin(origin)) return true;
+  const materialId = Number(wafer);
+  return Number.isInteger(materialId) && materialId >= DUMMY_MATERIAL_ID_START;
+}
+function waferSurfaceLabel(wafer, origin) {
+  if (isDummyWafer(wafer, origin) && wafer) return wafer;
+  if (!origin) return "\u6765\u6E90\u672A\u77E5";
+  return origin;
 }
 function isBufferModule(name, type = "") {
   return type.trim().toLowerCase() === "buffer" || /^BUF(?:FER)?(?:[_-]?\w+)?$/i.test(name.trim());
@@ -663,7 +743,7 @@ function stationSlotCapacity(device, name, defaultCapacity = 1) {
     ...declaredSlots
   );
 }
-function buildLoadPortSlots(records, device, time, initialLocations, processedMaterials) {
+function buildLoadPortSlots(records, device, time, initialLocations, processedMaterials, replenishments) {
   const names = /* @__PURE__ */ new Set();
   for (const [name, definition] of Object.entries(device?.Stations ?? {})) {
     if (isLoadPortName(name, String(definition?.Type ?? ""))) names.add(name);
@@ -696,17 +776,18 @@ function buildLoadPortSlots(records, device, time, initialLocations, processedMa
         if (indexedStation(move, "SrcStationList", index) !== name) return;
         const slot = indexedSlot(move, "SrcSlotList", index);
         if (!slot) return;
+        const instanceId = materialInstanceId(move, material, index);
         const history = slotMaterialHistory.get(slot) ?? [];
-        let generation = history.indexOf(material);
+        let generation = history.indexOf(instanceId);
         if (generation < 0) {
           generation = history.length;
-          history.push(material);
+          history.push(instanceId);
           slotMaterialHistory.set(slot, history);
         }
         const slots = generationSlots.get(generation) ?? /* @__PURE__ */ new Map();
-        if (!slots.has(slot)) slots.set(slot, material);
+        if (!slots.has(slot)) slots.set(slot, { wafer: material, instanceId });
         generationSlots.set(generation, slots);
-        materialGenerations.set(material, generation);
+        materialGenerations.set(instanceId, generation);
         if (generation > 0) {
           generationStartTimes.set(
             generation,
@@ -715,11 +796,28 @@ function buildLoadPortSlots(records, device, time, initialLocations, processedMa
         }
       });
     }
+    for (const replenishment of replenishments.filter((item) => item.moduleName === name)) {
+      const generations = replenishment.materials.map((material) => materialGenerations.get(`${material.wafer}\0${material.taskId}`) ?? materialGenerations.get(material.wafer) ?? [...materialGenerations.entries()].find(([instanceId]) => instanceId === material.wafer || instanceId.startsWith(`${material.wafer}\0`))?.[1]).filter((generation2) => generation2 !== void 0);
+      const generation = generations.length ? Math.max(...generations) : Math.max(...generationSlots.keys(), -1) + 1;
+      const replenishedSlots = generationSlots.get(generation) ?? /* @__PURE__ */ new Map();
+      for (const material of replenishment.materials) {
+        const declaredInstanceId = `${material.wafer}\0${material.taskId}`;
+        const instanceId = materialGenerations.has(declaredInstanceId) ? declaredInstanceId : [...materialGenerations.keys()].find((candidate) => candidate === material.wafer || candidate.startsWith(`${material.wafer}\0`)) ?? declaredInstanceId;
+        replenishedSlots.set(material.slot, { wafer: material.wafer, instanceId });
+        materialGenerations.set(instanceId, generation);
+        observedMaximum.set(name, Math.max(observedMaximum.get(name) ?? 0, material.slot));
+      }
+      generationSlots.set(generation, replenishedSlots);
+      generationStartTimes.set(
+        generation,
+        Math.min(generationStartTimes.get(generation) ?? Number.POSITIVE_INFINITY, replenishment.time)
+      );
+    }
     const activeGeneration = [...generationSlots.keys()].filter((generation) => generation === 0 || (generationStartTimes.get(generation) ?? Number.POSITIVE_INFINITY) <= time).reduce((latest, generation) => Math.max(latest, generation), 0);
     const occupancy = new Map(generationSlots.get(activeGeneration) ?? []);
     if (!occupancy.size && !generationSlots.size) {
       const legacyInitialMaterials = [...initialLocations.entries()].filter(([, location]) => location === name).map(([material]) => material).sort(naturalCompare);
-      legacyInitialMaterials.forEach((material, index) => occupancy.set(index + 1, material));
+      legacyInitialMaterials.forEach((material, index) => occupancy.set(index + 1, { wafer: material, instanceId: material }));
     }
     for (const move of records) {
       const materials = materialIds(move);
@@ -727,24 +825,26 @@ function buildLoadPortSlots(records, device, time, initialLocations, processedMa
         if (move.EndTime > time) continue;
         materials.forEach((material, index) => {
           if (indexedStation(move, "SrcStationList", index) !== name) return;
-          if ((materialGenerations.get(material) ?? 0) !== activeGeneration) return;
+          const instanceId = materialInstanceId(move, material, index);
+          if ((materialGenerations.get(instanceId) ?? 0) !== activeGeneration) return;
           const slot = indexedSlot(move, "SrcSlotList", index);
           if (slot) occupancy.delete(slot);
           else {
-            const current = [...occupancy.entries()].find(([, wafer]) => wafer === material);
+            const current = [...occupancy.entries()].find(([, wafer]) => wafer.instanceId === instanceId);
             if (current) occupancy.delete(current[0]);
           }
         });
       } else if (PLACE_MOVE_TYPES.has(move.MoveType) && move.EndTime <= time) {
         materials.forEach((material, index) => {
           if (indexedStation(move, "DestStationList", index) !== name) return;
-          if ((materialGenerations.get(material) ?? 0) !== activeGeneration) return;
+          const instanceId = materialInstanceId(move, material, index);
+          if ((materialGenerations.get(instanceId) ?? 0) !== activeGeneration) return;
           let slot = indexedSlot(move, "DestSlotList", index);
           if (!slot) {
             slot = 1;
             while (occupancy.has(slot)) slot += 1;
           }
-          occupancy.set(slot, material);
+          occupancy.set(slot, { wafer: material, instanceId });
           observedMaximum.set(name, Math.max(observedMaximum.get(name) ?? 0, slot));
         });
       }
@@ -756,13 +856,17 @@ function buildLoadPortSlots(records, device, time, initialLocations, processedMa
       Math.max(observedMaximum.get(name) ?? 0, occupiedMaximum, occupancy.size)
     );
     result.set(name, Array.from({ length: capacity }, (_, index) => {
-      const wafer = occupancy.get(index + 1) ?? "";
-      return { slot: index + 1, wafer, processed: Boolean(wafer && processedMaterials.has(wafer)) };
+      const occupied = occupancy.get(index + 1);
+      return {
+        slot: index + 1,
+        wafer: occupied?.wafer ?? "",
+        processed: Boolean(occupied && processedMaterials.has(occupied.instanceId))
+      };
     }));
   }
   return result;
 }
-function buildLoadLockSlots(records, device, time, initialLocations, processedMaterials) {
+function buildLoadLockSlots(records, device, time, initialLocations, processedMaterials, currentMaterialInstances) {
   const names = /* @__PURE__ */ new Set();
   for (const [name, definition] of Object.entries(device?.Stations ?? {})) {
     if (isLoadLockName(name, String(definition?.Type ?? ""))) names.add(name);
@@ -861,7 +965,8 @@ function buildLoadLockSlots(records, device, time, initialLocations, processedMa
     );
     result.set(name, Array.from({ length: capacity }, (_, index) => {
       const wafer = occupancy.get(index + 1) ?? "";
-      return { slot: index + 1, wafer, processed: Boolean(wafer && processedMaterials.has(wafer)) };
+      const instanceId = currentMaterialInstances.get(wafer) ?? wafer;
+      return { slot: index + 1, wafer, processed: Boolean(wafer && processedMaterials.has(instanceId)) };
     }));
   }
   return result;
@@ -874,7 +979,7 @@ function moveProgress(move, time) {
 function activeTarget(move) {
   return firstStation(move, "DestStationList") || firstStation(move, "SrcStationList") || String(listValue(move.StationList)[0] ?? "") || (!isRobotName(move.ModuleName) ? move.ModuleName : "");
 }
-function buildWorkspaceSnapshot(moves, device, requestedTime) {
+function buildWorkspaceSnapshot(moves, device, requestedTime, replenishments = []) {
   const records = normalizeMoves(moves);
   const endTime = records.reduce((maximum, move) => Math.max(maximum, move.EndTime), 0);
   const normalizedRequestedTime = requestedTime === Number.POSITIVE_INFINITY ? endTime : finiteNumber(requestedTime);
@@ -890,12 +995,21 @@ function buildWorkspaceSnapshot(moves, device, requestedTime) {
   const requiredProcesses = /* @__PURE__ */ new Map();
   for (const move of records) {
     if (move.MoveType !== PROCESS_MOVE) continue;
-    for (const material of materialIds(move)) {
-      requiredProcesses.set(material, (requiredProcesses.get(material) ?? 0) + 1);
-    }
+    materialIds(move).forEach((material, index) => {
+      const instanceId = materialInstanceId(move, material, index);
+      requiredProcesses.set(instanceId, (requiredProcesses.get(instanceId) ?? 0) + 1);
+    });
   }
   const completedProcesses = /* @__PURE__ */ new Map();
   const processedMaterials = /* @__PURE__ */ new Set();
+  const currentMaterialInstances = /* @__PURE__ */ new Map();
+  for (const move of records) {
+    materialIds(move).forEach((material, index) => {
+      if (!currentMaterialInstances.has(material)) {
+        currentMaterialInstances.set(material, materialInstanceId(move, material, index));
+      }
+    });
+  }
   const activeMoves = [];
   let completedMoves = 0;
   for (const [name, definition] of definitions) {
@@ -907,18 +1021,24 @@ function buildWorkspaceSnapshot(moves, device, requestedTime) {
   for (const move of records) {
     const active = move.StartTime <= time && time < move.EndTime;
     const completed = move.EndTime <= time;
+    if (move.StartTime <= time) {
+      materialIds(move).forEach((material, index) => {
+        currentMaterialInstances.set(material, materialInstanceId(move, material, index));
+      });
+    }
     if (active) activeMoves.push(move);
     if (completed) {
       completedMoves += 1;
       applyCompletedTransfer(move, locations);
       if (move.MoveType === PROCESS_MOVE) {
-        for (const material of materialIds(move)) {
-          const completed2 = (completedProcesses.get(material) ?? 0) + 1;
-          completedProcesses.set(material, completed2);
-          if (completed2 >= (requiredProcesses.get(material) ?? 1)) {
-            processedMaterials.add(material);
+        materialIds(move).forEach((material, index) => {
+          const instanceId = materialInstanceId(move, material, index);
+          const completed2 = (completedProcesses.get(instanceId) ?? 0) + 1;
+          completedProcesses.set(instanceId, completed2);
+          if (completed2 >= (requiredProcesses.get(instanceId) ?? 1)) {
+            processedMaterials.add(instanceId);
           }
-        }
+        });
       }
     }
     const doorVisualActive = move.StartTime <= time && time < Math.max(move.EndTime, move.StartTime + DOOR_VISUAL_MIN_SECONDS);
@@ -934,6 +1054,15 @@ function buildWorkspaceSnapshot(moves, device, requestedTime) {
       if (environment) environments.set(move.ModuleName, active ? `${environment}\u5207\u6362\u4E2D` : environment);
     }
   }
+  for (const replenishment of replenishments) {
+    if (replenishment.time > time) continue;
+    for (const material of replenishment.materials) {
+      currentMaterialInstances.set(material.wafer, `${material.wafer}\0${material.taskId}`);
+    }
+  }
+  const isProcessed = (material) => processedMaterials.has(
+    currentMaterialInstances.get(material) ?? material
+  );
   const robotTargets = /* @__PURE__ */ new Map();
   for (const move of activeMoves) {
     if (isRobotName(move.ModuleName, robotNameSet)) robotTargets.set(move.ModuleName, activeTarget(move));
@@ -952,8 +1081,22 @@ function buildWorkspaceSnapshot(moves, device, requestedTime) {
     wafersByLocation.set(location, wafers);
   }
   for (const wafers of wafersByLocation.values()) wafers.sort(naturalCompare);
-  const loadPortSlots = buildLoadPortSlots(records, device, time, initialLocations, processedMaterials);
-  const loadLockSlots = buildLoadLockSlots(records, device, time, initialLocations, processedMaterials);
+  const loadPortSlots = buildLoadPortSlots(
+    records,
+    device,
+    time,
+    initialLocations,
+    processedMaterials,
+    replenishments
+  );
+  const loadLockSlots = buildLoadLockSlots(
+    records,
+    device,
+    time,
+    initialLocations,
+    processedMaterials,
+    currentMaterialInstances
+  );
   const modules = [...definitions.entries()].map(([name, definition]) => {
     const moduleMoves = activeMoves.filter((move) => move.ModuleName === name || firstStation(move, "SrcStationList") === name || firstStation(move, "DestStationList") === name || listValue(move.StationList).map(String).includes(name));
     const primaryMove = moduleMoves.find(isCleaningMove) ?? moduleMoves.find((move) => move.MoveType === PROCESS_MOVE) ?? moduleMoves.find((move) => LOADLOCK_ENVIRONMENT_MOVE_TYPES.has(move.MoveType)) ?? moduleMoves.find((move) => [PREPARE_MOVE, COMPLETE_MOVE].includes(move.MoveType)) ?? moduleMoves[0];
@@ -972,7 +1115,7 @@ function buildWorkspaceSnapshot(moves, device, requestedTime) {
       status,
       door: doorStates.get(name) ?? "closed",
       wafers: wafersByLocation.get(name) ?? [],
-      processedWafers: (wafersByLocation.get(name) ?? []).filter((wafer) => processedMaterials.has(wafer)),
+      processedWafers: (wafersByLocation.get(name) ?? []).filter(isProcessed),
       loadPortSlots: loadPortSlots.get(name) ?? [],
       loadLockSlots: loadLockSlots.get(name) ?? [],
       slotCapacity: stationSlotCapacity(device, name, isCoolerModule(name, definition.type) ? 3 : 1),
@@ -993,7 +1136,7 @@ function buildWorkspaceSnapshot(moves, device, requestedTime) {
       capacity: robotCapacity(definition, wafers.length),
       environment: robotEnvironment(name, definition),
       wafers,
-      processedWafers: wafers.filter((wafer) => processedMaterials.has(wafer)),
+      processedWafers: wafers.filter(isProcessed),
       busy: Boolean(move),
       source: move ? firstStation(move, "SrcStationList") : "",
       target: robotTargets.get(name) ?? lastRobotTargets.get(name) ?? "",
@@ -1207,7 +1350,8 @@ function collectElements(root) {
     topologyPlayback: required("visualTopologyPlayback"),
     stage: required("visualDeviceStage"),
     /* 独立逻辑测试可使用精简页面夹具；真实页面始终提供该节点。 */
-    frontSlotOverview: root.getElementById("visualFrontSlotOverview") ?? { innerHTML: "" },
+    frontSlotOverview: root.getElementById("visualFrontSlotOverview") ?? { innerHTML: "", style: { setProperty() {
+    } } },
     decisionLens: required("visualDecisionLens"),
     actionStatusFilters: Array.from(root.querySelectorAll("[data-action-status-filter]")),
     activeMoves: required("visualActiveMoves"),
@@ -1360,7 +1504,9 @@ function renderWaferToken(wafer, origin, progress, processed = false) {
   const normalizedProgress = Math.max(0, Math.min(1, progress));
   const state2 = processed ? "processed" : "unprocessed";
   const originLabel = origin || "\u6765\u6E90\u672A\u77E5";
-  return `<span class="wafer-token wafer-${state2}" style="--wafer-progress:${normalizedProgress * 360}deg" title="\u6676\u5706 ${escapeHtml(wafer)}\uFF0C\u6765\u6E90 ${escapeHtml(originLabel)}\uFF0C${processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}"><span><b class="wafer-origin-label">${escapeHtml(originLabel)}</b></span></span>`;
+  const surfaceLabel = waferSurfaceLabel(wafer, origin);
+  const dummyClass = isDummyWafer(wafer, origin) ? " wafer-dummy" : "";
+  return `<span class="wafer-token wafer-${state2}${dummyClass}" style="--wafer-progress:${normalizedProgress * 360}deg" title="\u6676\u5706 ${escapeHtml(wafer)}\uFF0C\u6765\u6E90 ${escapeHtml(originLabel)}\uFF0C${processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}"><span><b class="wafer-origin-label">${escapeHtml(surfaceLabel)}</b></span></span>`;
 }
 function moduleDoorSides(module, role, layout = "single", roleIndex = 0, attachmentId = "") {
   if (module.door === "doorless") return [];
@@ -1421,7 +1567,7 @@ function visibleModuleSlots(module, kind) {
     processed: module.processedWafers.includes(module.wafers[index] ?? "")
   }));
 }
-function renderFrontSlotOverview(modules) {
+function renderFrontSlotOverview(modules, waferOrigins = {}) {
   const visibleModules = modules.filter((module) => !isTopologyHiddenModule(module));
   const moduleNameOrder = (left, right) => {
     const leftName = left.module.name.trim();
@@ -1444,9 +1590,13 @@ function renderFrontSlotOverview(modules) {
   ].filter((row) => row.length);
   const renderSlots = (slots, module) => slots.map((slot) => {
     const state2 = !slot.wafer ? "empty" : slot.processed ? "processed" : "unprocessed";
+    const dummy = Boolean(slot.wafer) && isDummyWafer(
+      slot.wafer,
+      waferOrigins[slot.wafer] ?? `${module.name}.${slot.slot}`
+    );
     const identity = `${module.name}.${slot.slot}`;
     const detail = slot.wafer ? `${identity} \xB7 \u6676\u5706 ${slot.wafer}\uFF0C${slot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `${identity} \xB7 \u7A7A\u69FD`;
-    return `<span class="front-slot is-${state2}" tabindex="0" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}"></span>`;
+    return `<span class="front-slot is-${state2}${dummy ? " is-dummy" : ""}" tabindex="0" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}"></span>`;
   }).join("");
   if (!slotRows.length) return "";
   const renderModule2 = ({ module, kind }) => {
@@ -1481,7 +1631,16 @@ function renderModule(module, waferOrigins, role, candidate, layout = "single", 
   const doors = moduleDoorSides(module, role, layout, roleIndex, attachmentId).map((side) => `<i class="chamber-door chamber-door-${side}"></i>`).join("");
   const accessibleStatus = `${module.name}\uFF0C${STATUS_LABELS[module.status]}\uFF0C${DOOR_LABELS[module.door]}`;
   const candidateLabel = candidate ? `${candidate.count} \u4E2A\u53EF\u884C\u52A8\u4F5C\uFF0C\u6700\u9AD8\u6A21\u578B\u504F\u597D ${(candidate.preference * 100).toFixed(0)}%` : "";
-  if (role === "port") return renderLoadPortTopView(module, wafers, accessibleStatus, candidate);
+  if (role === "port") {
+    const visibleSlot = visibleModuleSlots(module, "port").find((slot) => slot.wafer);
+    const portWafers = visibleSlot ? renderWaferToken(
+      visibleSlot.wafer,
+      waferOrigins[visibleSlot.wafer] ?? "",
+      waferProgress,
+      visibleSlot.processed
+    ) : "";
+    return renderLoadPortTopView(module, portWafers, accessibleStatus, candidate);
+  }
   if (role === "auxiliary" && isAlignerModule(module.name, module.type)) {
     return `<strong class="equipment-external-name equipment-external-name-aligner">${escapeHtml(module.name)}</strong>
       <article class="equipment-utility equipment-aligner status-${module.status} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
@@ -2228,7 +2387,22 @@ function primitiveDecisionBoundaryTimes(moves) {
     moves.filter((move) => PRIMITIVE_DECISION_COMPLETION_MOVE_TYPES.has(finiteNumber(move.MoveType, -1))).map((move) => finiteNumber(move.EndTime)).filter((time) => time >= 0)
   )].sort((left, right) => left - right);
 }
-function renderDecisionLens(decision, requestState = "idle", requestError = "", statusFilters = ["enabled"]) {
+function formatActionEndpoint(name, slot) {
+  const trimmed = name.trim();
+  if (!trimmed) return "";
+  return slot > 0 ? `${trimmed}#${slot}` : trimmed;
+}
+function formatActionPath(action) {
+  const kindLabels = { pick: "Pick", place: "Place", swap: "Swap" };
+  const materialId = action.materialIds[0] || "";
+  const kindLabel = kindLabels[action.kind];
+  const prefix = materialId ? `${kindLabel}(${materialId})` : kindLabel;
+  const source = formatActionEndpoint(action.source, action.sourceSlot);
+  const destination = formatActionEndpoint(action.destination, action.destinationSlot);
+  const path = [source, destination].filter(Boolean).join(" \u2192 ");
+  return path ? `${prefix} ${path}` : prefix;
+}
+function renderDecisionLens(decision, requestState = "idle", requestError = "", statusFilters = ALL_ACTION_DIAGNOSTIC_STATUSES) {
   if (!decision) {
     if (requestState === "loading") {
       return `
@@ -2256,20 +2430,15 @@ function renderDecisionLens(decision, requestState = "idle", requestError = "", 
     "physical-blocked": "\u7269\u7406\u62E6\u622A",
     "deadlock-blocked": "\u6B7B\u9501\u89C4\u5219\u62E6\u622A"
   };
-  const kindLabels = { pick: "Pick", place: "Place", swap: "Swap" };
   const visibleActions = decision.actionDiagnostics.filter((action) => statusFilters.includes(action.status));
   const cards = visibleActions.map((action) => {
-    const source = action.sourceSlot > 0 ? `${action.source} #${action.sourceSlot}` : action.source;
-    const destination = action.destinationSlot > 0 ? `${action.destination} #${action.destinationSlot}` : action.destination;
+    const reason = action.reason || statusLabels[action.status];
+    const duplicate = action.duplicateCount > 0 ? `<small>\u53E6 ${action.duplicateCount} \u7247\u76F8\u540C</small>` : "";
     return `
-      <li class="decision-candidate action-card action-status-${action.status}">
-        <span class="decision-tag action-kind">${kindLabels[action.kind]}</span>
-        <div class="decision-candidate-main">
-          <div class="decision-candidate-title"><strong>${escapeHtml(source || action.robot)} \u2192 ${escapeHtml(destination || "Robot hand")}</strong></div>
-          <small>${escapeHtml(action.robot || "Robot")} \xB7 ${action.materialIds.length ? `Material ${escapeHtml(action.materialIds.join(", "))}` : "\u65E0\u7269\u6599\u6807\u8BC6"}</small>
-          ${action.reason ? `<p class="action-block-reason">${escapeHtml(action.reason)}</p>` : ""}
-        </div>
-        <span class="decision-tag action-status">${statusLabels[action.status]}</span>
+      <li class="decision-candidate action-card action-status-${action.status}" tabindex="0" aria-label="${escapeHtml(`${formatActionPath(action)}\uFF0C${statusLabels[action.status]}`)}">
+        <strong class="action-card-path">${escapeHtml(formatActionPath(action))}</strong>
+        ${duplicate}
+        <span class="action-status-tooltip" role="tooltip">${escapeHtml(reason)}</span>
       </li>`;
   }).join("");
   const counts = decision.actionCounts;
@@ -2667,8 +2836,9 @@ var VisualizationWorkspace = class {
   analysisRoutes = [];
   analysisRounds = [];
   moves = [];
+  loadPortReplenishments = [];
   replayPlan = null;
-  actionStatusFilters = ["enabled"];
+  actionStatusFilters = [...ALL_ACTION_DIAGNOSTIC_STATUSES];
   liveDecision = null;
   liveDecisionKey = "";
   primitiveDecisionBoundaries = [];
@@ -2697,6 +2867,8 @@ var VisualizationWorkspace = class {
   constructor(root) {
     this.root = root;
     this.elements = collectElements(root);
+    const selectedFilters = this.elements.actionStatusFilters.filter((item) => item.checked).map((item) => item.value);
+    if (selectedFilters.length) this.actionStatusFilters = selectedFilters;
     this.bindEvents();
     this.updatePlayButton();
     this.setTopologyVisible(false);
@@ -2720,6 +2892,7 @@ var VisualizationWorkspace = class {
     await this.loadMoves(
       normalizeMovePayload(payload),
       normalizeDecisionTrace(payload),
+      normalizeLoadPortReplenishments(payload),
       file.name,
       "",
       "",
@@ -2751,6 +2924,7 @@ var VisualizationWorkspace = class {
       await this.loadMoves(
         normalizeMovePayload(payload),
         normalizeDecisionTrace(payload),
+        normalizeLoadPortReplenishments(payload),
         sourceName,
         resultUrl,
         resultId,
@@ -2786,6 +2960,8 @@ var VisualizationWorkspace = class {
     this.pause();
     this.liveSolving = true;
     this.moves = [];
+    this.loadPortReplenishments = [];
+    this.loadPortReplenishments = [];
     this.sourceName = sourceName;
     this.resultUrl = "";
     this.analysisResultId = "";
@@ -2919,11 +3095,12 @@ var VisualizationWorkspace = class {
       <span>\u8FD0\u884C\u4E00\u6B21\u8BA1\u5212\uFF0C\u6216\u5BFC\u5165\u5DF2\u6709\u7684 MoveList JSON \u6587\u4EF6\u540E\u67E5\u770B\u8BBE\u5907\u62D3\u6251\u5E76\u5F00\u59CB\u56DE\u653E\u3002</span>`;
   }
   /** 接收规范化后的 MoveList 并重置时间轴。 */
-  async loadMoves(moves, _decisionTrace, sourceName, resultUrl, analysisResultId, cpuTimeMs = null, recomputeCount = 0) {
+  async loadMoves(moves, _decisionTrace, loadPortReplenishments, sourceName, resultUrl, analysisResultId, cpuTimeMs = null, recomputeCount = 0) {
     if (!moves.length) throw new Error("MoveList \u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u5EFA\u7ACB\u53EF\u89C6\u5316\u56DE\u653E");
     this.pause();
     this.liveSolving = false;
     this.moves = moves;
+    this.loadPortReplenishments = loadPortReplenishments;
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(moves);
     this.liveDecision = null;
     this.liveDecisionKey = "";
@@ -2939,7 +3116,7 @@ var VisualizationWorkspace = class {
     this.cpuTimeMs = cpuTimeMs;
     this.recomputeCount = recomputeCount;
     this.bottleneckSummary = null;
-    const snapshot = buildWorkspaceSnapshot(this.moves, this.device, 0);
+    const snapshot = buildWorkspaceSnapshot(this.moves, this.device, 0, this.loadPortReplenishments);
     this.time = 0;
     this.elements.range.min = "0";
     this.elements.range.max = String(snapshot.endTime);
@@ -3053,7 +3230,12 @@ var VisualizationWorkspace = class {
   /** 绘制当前时间对应的设备快照。 */
   render(prebuiltSnapshot) {
     if (!this.moves.length && !this.liveSolving) return;
-    const snapshot = prebuiltSnapshot ?? buildWorkspaceSnapshot(this.moves, this.device, this.time);
+    const snapshot = prebuiltSnapshot ?? buildWorkspaceSnapshot(
+      this.moves,
+      this.device,
+      this.time,
+      this.loadPortReplenishments
+    );
     this.time = snapshot.time;
     this.elements.source.textContent = this.sourceName;
     this.elements.source.title = this.sourceName;
@@ -3087,7 +3269,10 @@ var VisualizationWorkspace = class {
     const topologyCanvas = this.elements.stage.querySelector(".reference-grid-canvas");
     const canvasHeight = topologyCanvas?.style.getPropertyValue("--topology-canvas-height") ?? "";
     this.elements.frontSlotOverview.style.setProperty("--topology-canvas-height", canvasHeight);
-    this.elements.frontSlotOverview.innerHTML = renderFrontSlotOverview(topologySnapshot.modules);
+    this.elements.frontSlotOverview.innerHTML = renderFrontSlotOverview(
+      topologySnapshot.modules,
+      topologySnapshot.waferOrigins
+    );
     const requestState = this.pendingReplayDecisionKeys.has(replayKey) ? "loading" : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
     this.elements.decisionLens.innerHTML = renderDecisionLens(
       currentDecision,
@@ -6996,11 +7181,15 @@ function renderAlgorithmMetadata() {
   };
   showAlgorithmDetails(state.strategy);
 }
+function readableLogFileName(testName) {
+  const readableTestName = String(testName || "\u5F53\u524D\u6D4B\u8BD5").replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_").replace(/^[ ._]+|[ ._]+$/g, "") || "\u5F53\u524D\u6D4B\u8BD5";
+  return `\u590D\u73B0\u65E5\u5FD7-${readableTestName}.json`;
+}
 function prepareLogDownload(result) {
   if (!result?.logUrl) return false;
   const link = document.getElementById("logButton");
   link.href = result.logUrl;
-  link.download = result.logFileName || "ct-input-log.json";
+  link.download = readableLogFileName(state.testCaseName);
   link.removeAttribute("aria-disabled");
   return true;
 }
@@ -7677,7 +7866,7 @@ function renderBatchItems(items) {
           <button class="batch-result-title" type="button" aria-pressed="${selected}" aria-label="\u67E5\u770B ${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)} \u7684\u8BE6\u7EC6\u6307\u6807"><strong title="${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}">${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}</strong></button>
           <div class="batch-result-meta">
             <span class="batch-status">${statusLabels[item.status] || "\u7B49\u5F85\u4E2D"}</span>
-            ${item.logUrl ? `<a class="btn" href="${escapeHtml3(item.logUrl)}" download>\u65E5\u5FD7</a>` : `<span class="btn" aria-disabled="true">\u65E5\u5FD7</span>`}
+            ${item.logUrl ? `<a class="btn" href="${escapeHtml3(item.logUrl)}" download="${escapeHtml3(readableLogFileName(item.testName || `\u6D4B\u8BD5-${index + 1}`))}">\u65E5\u5FD7</a>` : `<span class="btn" aria-disabled="true">\u65E5\u5FD7</span>`}
             ${item.resultUrl ? `<button class="btn primary" type="button" data-playback-result="${escapeHtml3(item.resultUrl)}" data-playback-name="${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}">\u56DE\u653E</button>` : `<span class="btn" aria-disabled="true">\u56DE\u653E</span>`}
             ${item.ganttUrl ? `<a class="btn" href="${escapeHtml3(item.ganttUrl)}" target="_blank">\u7518\u7279\u56FE</a>` : `<span class="btn" aria-disabled="true">\u7518\u7279\u56FE</span>`}
             ${failed ? `<button class="btn danger" type="button" data-batch-error="${index}" aria-label="\u67E5\u770B ${escapeHtml3(displayId)} \u7684\u62A5\u9519\u4FE1\u606F">\u62A5\u9519</button>` : ""}
@@ -7719,7 +7908,10 @@ function updateBatchLogDownload(result) {
     return;
   }
   button.href = `/api/run-batches/${encodeURIComponent(result.batchId)}/logs`;
-  button.download = `ct-batch-logs-${String(result.batchId).slice(0, 8)}.zip`;
+  const deviceName = String(result.deviceName || "\u5F53\u524D\u8BBE\u5907").replace(/\.json$/i, "");
+  const readableDeviceName = deviceName.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_") || "\u5F53\u524D\u8BBE\u5907";
+  const readableGroupName = String(result.group || "\u5F53\u524D\u6D4B\u8BD5\u7EC4").replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_") || "\u5F53\u524D\u6D4B\u8BD5\u7EC4";
+  button.download = `\u6279\u91CF\u590D\u73B0\u65E5\u5FD7-${readableDeviceName}-${readableGroupName}.zip`;
   button.removeAttribute("aria-disabled");
 }
 function showBatchResult(result) {
@@ -7753,7 +7945,7 @@ function showBatchResult(result) {
     if (first.logUrl) {
       const log = document.getElementById("logButton");
       log.href = first.logUrl;
-      log.download = first.logFileName;
+      log.download = readableLogFileName(first.testName);
       log.removeAttribute("aria-disabled");
     }
   }
@@ -7762,26 +7954,6 @@ function showBatchResult(result) {
   if (allGanttUrl) {
     allGantt.href = allGanttUrl;
     allGantt.removeAttribute("aria-disabled");
-  }
-}
-async function clearExportedArtifacts() {
-  if (!window.confirm("\u5C06\u5220\u9664\u5168\u90E8\u5DF2\u5BFC\u51FA\u7684\u7ED3\u679C\u548C\u590D\u73B0\u65E5\u5FD7\uFF0C\u4E14\u65E0\u6CD5\u6062\u590D\u3002\u662F\u5426\u7EE7\u7EED\uFF1F")) return;
-  const button = document.getElementById("clearExportsButton");
-  button.disabled = true;
-  try {
-    const response = await fetch("/api/exports", { method: "DELETE" });
-    const result = await response.json();
-    if (!response.ok || !result.ok) throw new Error(result.error || "\u6E05\u7406\u5931\u8D25");
-    resetRunResult();
-    const deleted = result.deleted || {};
-    writeTerminal(`$ \u5DF2\u6E05\u7406\u5BFC\u51FA\u6570\u636E
-  \u7ED3\u679C\uFF1A${Number(deleted.results) || 0} \u4E2A
-  \u590D\u73B0\u65E5\u5FD7\uFF1A${Number(deleted.logs) || 0} \u4E2A`);
-  } catch (error) {
-    writeTerminal(`$ \u6E05\u7406\u5BFC\u51FA\u6570\u636E\u5931\u8D25
-  ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true);
-  } finally {
-    button.disabled = false;
   }
 }
 function showResult(result) {
@@ -8231,7 +8403,6 @@ document.getElementById("searchTreeOptionsForm").addEventListener("submit", (eve
     document.getElementById("searchTreeCheckpointHint").textContent = error.message || "\u53C2\u6570\u4FDD\u5B58\u5931\u8D25";
   });
 });
-document.getElementById("clearExportsButton").addEventListener("click", clearExportedArtifacts);
 document.getElementById("batchOverviewButton").addEventListener("click", showCurrentBatchOverview);
 document.getElementById("testGroupAnalysisButton").addEventListener("click", () => {
   showTestGroupAnalysis().catch((error) => writeTerminal(`$ \u6D4B\u8BD5\u7EC4\u7ED3\u679C\u5206\u6790\u5931\u8D25

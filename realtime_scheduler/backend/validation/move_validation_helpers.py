@@ -74,24 +74,63 @@ def _station_access_error(robot: RobotState, station: StationState, start_time: 
 
 
 def _related_move(move: Mapping[str, Any], moves: Sequence[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
-    """查找紧接开门动作、访问同一站点的运输动作。"""
+    """查找与开门动作关联、访问同一站点的实际运输动作。
+
+    标准输出通常让 Pick/Place/Swap 紧接 Prepare 结束；外部算法也可能先并行
+    执行 PreTrans，再让实际运输动作通过 ``PreMoveID`` 依赖 Prepare。后者不能
+    只按时间相邻判断，否则级联 LoadLock 会退回全局 ``RelatedRobotType``，把
+    ``VTR_1/VTR_2`` 的局部访问侧判断反。依赖关系优先，时间相邻仅作兼容回退；
+    候选不唯一时不猜测。
+    """
     end_time = _number(move.get("EndTime"))
     station_name = _station_name(move)
     if end_time is None:
         return None
+
+    related_action = move.get("RelatedActionType")
+    action_by_move_type = {
+        PICK_MOVE: 1,
+        MULTI_PICK_MOVE: 1,
+        PLACE_MOVE: 0,
+        SWAP_MOVE: 2,
+    }
+    move_id = move.get("MoveID")
+    material_ids = {str(value) for value in _values(move, "MatIDList")}
+    dependency_candidates: List[Mapping[str, Any]] = []
+    adjacent_candidates: List[Mapping[str, Any]] = []
+
     for candidate in moves:
-        if abs((_number(candidate.get("StartTime")) or float("inf")) - end_time) > TIME_TOLERANCE:
-            continue
         move_type = candidate.get("MoveType")
+        candidate_action = action_by_move_type.get(move_type)
+        if candidate_action is None:
+            continue
+        if related_action in {0, 1, 2} and candidate_action != related_action:
+            continue
         stations = (
-            _values(candidate, "SrcStationList") if move_type == PICK_MOVE
+            _values(candidate, "SrcStationList") if move_type in {PICK_MOVE, MULTI_PICK_MOVE}
             else _values(candidate, "DestStationList") if move_type == PLACE_MOVE
             else _values(candidate, "StationList") if move_type == SWAP_MOVE
             else []
         )
-        if station_name in {str(value) for value in stations}:
-            return candidate
-    return None
+        if station_name not in {str(value) for value in stations}:
+            continue
+        candidate_materials = {
+            str(value) for value in _values(candidate, "MatIDList")
+        }
+        if material_ids and candidate_materials and not material_ids.intersection(candidate_materials):
+            continue
+        if isinstance(move_id, int) and move_id in _integer_values(candidate, "PreMoveID"):
+            dependency_candidates.append(candidate)
+            continue
+        candidate_start = _number(candidate.get("StartTime"))
+        if candidate_start is not None and abs(candidate_start - end_time) <= TIME_TOLERANCE:
+            adjacent_candidates.append(candidate)
+
+    if len(dependency_candidates) == 1:
+        return dependency_candidates[0]
+    if dependency_candidates:
+        return None
+    return adjacent_candidates[0] if len(adjacent_candidates) == 1 else None
 
 
 def _required_environment(state: MachineState, station: LoadLockState, move: Mapping[str, Any], related: Optional[Mapping[str, Any]]) -> Optional[str]:
@@ -723,7 +762,7 @@ def _validate_clean_start(
         for rule_pjob_name, variable_name, lower, task_name in rules:
             if rule_pjob_name and rule_pjob_name != pjob_name:
                 continue
-            value = float(station.state_variables.get(variable_name, 0.0))
+            value = state.wac_counter_value(station, pjob_name, variable_name)
             if value + TIME_TOLERANCE >= lower and not skipped(
                 _clean_validation_type(task_name)
             ):
@@ -754,7 +793,12 @@ def _validate_clean_start(
         return None
     names = {str(name).strip() for name in pjob_names if str(name).strip()}
     for _pjob, variable_name, lower, task_name in _wac_rules_for_clean_move(state, station.name, names, clean_task_name):
-        value = float(station.state_variables.get(variable_name, 0.0))
+        rule_pjob_name = _pjob or next(iter(sorted(names)), "")
+        value = state.wac_counter_value(
+            station,
+            rule_pjob_name,
+            variable_name,
+        )
         if value + TIME_TOLERANCE < lower:
             shown = str(int(value)) if value.is_integer() else str(value)
             return _issue(move, ValidationErrorCode.CLEAN_WAC_EARLY, f"{task_name} 未达到 Wac 阈值就执行 count={shown} PJob={next(iter(sorted(names)), '')}")

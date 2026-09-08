@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>调度平台</title>
   <link rel="stylesheet" href="/assets/katex.min.css?v=1.4.4">
-  <link rel="stylesheet" href="/assets/config_editor.css?v=1.5.40">
+  <link rel="stylesheet" href="/assets/config_editor.css?v=1.5.45">
 </head>
 <body>
   <a class="skip-link" href="#mainContent">跳到主要内容</a>
@@ -40,7 +40,7 @@
       <div class="sidebar-footer">
         <span class="sidebar-footer-label">系统状态</span>
         <div class="service-pill" id="serviceState">本地服务</div>
-        <span class="frontend-version">V1.5.40</span>
+        <span class="frontend-version">V1.5.45</span>
       </div>
     </aside>
 
@@ -147,7 +147,7 @@
                 <div id="resultErrorDetails" class="result-error-details" hidden></div>
                 <pre id="terminal"></pre>
               </div>
-              <div class="result-actions"><a class="btn" id="logButton" href="#" download aria-disabled="true">导出复现日志</a><button class="btn primary" id="workspaceResultButton" type="button" disabled>在结果分析中查看</button><a class="btn" id="ganttButton" href="#" target="_blank" aria-disabled="true">打开甘特图</a><button class="btn danger" id="clearExportsButton" type="button">清理导出数据</button></div>
+              <div class="result-actions"><a class="btn" id="logButton" href="#" download aria-disabled="true">导出复现日志</a><button class="btn primary" id="workspaceResultButton" type="button" disabled>在结果分析中查看</button><a class="btn" id="ganttButton" href="#" target="_blank" aria-disabled="true">打开甘特图</a></div>
             </div>
           </article>
         </div>
@@ -251,8 +251,8 @@
                     <div class="action-filter-controls" aria-label="动作筛选">
                       <span class="action-filter-label">显示</span>
                       <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="enabled" checked>使能动作</label>
-                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="physical-blocked">物理拦截</label>
-                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="deadlock-blocked">死锁规则拦截</label>
+                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="physical-blocked" checked>物理拦截</label>
+                      <label class="action-filter-check"><input type="checkbox" data-action-status-filter value="deadlock-blocked" checked>死锁规则拦截</label>
                     </div>
                     <div class="decision-lens-panel" id="visualDecisionLens" aria-live="polite"></div>
                     <ul id="visualActiveMoves" hidden></ul>
@@ -778,6 +778,6 @@
     </aside>
   </dialog>
 
-  <script type="module" src="/assets/config_editor.js?v=1.5.40"></script>
+  <script type="module" src="/assets/config_editor.js?v=1.5.45"></script>
 </body>
 </html>
