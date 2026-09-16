@@ -4,6 +4,31 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/test_draft_navigation.ts
+async function resolveTestDraft(dirty, choose, save, discard) {
+  if (!dirty) return true;
+  const choice = await choose();
+  if (choice === "cancel") return false;
+  if (choice === "save") await save();
+  else await discard();
+  return true;
+}
+function createDraftChoiceDialog(dialog) {
+  let pending = null;
+  return () => {
+    if (pending) return pending;
+    pending = new Promise((resolve) => {
+      dialog.returnValue = "cancel";
+      dialog.addEventListener("close", () => {
+        pending = null;
+        resolve(dialog.returnValue === "save" || dialog.returnValue === "discard" ? dialog.returnValue : "cancel");
+      }, { once: true });
+      dialog.showModal();
+    });
+    return pending;
+  };
+}
+
 // src/route_editor_logic.ts
 var route_editor_logic_exports = {};
 __export(route_editor_logic_exports, {
@@ -190,14 +215,6 @@ async function requestScheduleAnalysis(input) {
     bottleneck: result.bottleneck ?? null
   };
 }
-async function requestTestGroupAnalysis(cases) {
-  const result = await requestJson("/api/analysis/test-group", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cases })
-  });
-  return result.analysis;
-}
 async function requestReplayDecision(input) {
   const result = await requestJson("/api/analysis/replay-decision", {
     method: "POST",
@@ -206,12 +223,811 @@ async function requestReplayDecision(input) {
   });
   return result.decision;
 }
-async function requestSearchControl(command, actionKey = null) {
-  return requestJson("/api/search-control", {
+async function createTestGroupAnalysisJob(input) {
+  const result = await requestJson("/api/analysis-jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(actionKey ? { command, actionKey } : { command })
+    body: JSON.stringify(input)
   });
+  return result.job;
+}
+async function readTestGroupAnalysisJob(jobId) {
+  const result = await requestJson(`/api/analysis-jobs/${encodeURIComponent(jobId)}`, {
+    cache: "no-store"
+  });
+  return result.job;
+}
+async function cancelTestGroupAnalysisJob(jobId) {
+  const result = await requestJson(`/api/analysis-jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST"
+  });
+  return result.job;
+}
+async function requestDeadlockDiagnostic(input) {
+  const response = await fetch("/api/analysis/deadlock-diagnostic", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result?.error || `\u670D\u52A1\u8FD4\u56DE ${response.status}`);
+  }
+  const disposition = response.headers.get("Content-Disposition") ?? "";
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const fallbackName = disposition.match(/filename="([^"]+)"/i)?.[1];
+  return {
+    blob: await response.blob(),
+    fileName: encodedName ? decodeURIComponent(encodedName) : fallbackName || "deadlock-diagnostic.json"
+  };
+}
+
+// src/wafer_dispatch_progress.ts
+var PICK_TYPES = /* @__PURE__ */ new Set([0, 2]);
+var SWAP_TYPE = 4;
+var DUMMY_MATERIAL_ID_START = 1e5;
+var timelineCache = /* @__PURE__ */ new WeakMap();
+function values(value) {
+  return Array.isArray(value) ? value : [];
+}
+function escape(value) {
+  return String(value ?? "\u2014").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+}
+function isPort(name, device) {
+  const type = String(device?.Stations?.[name]?.Type ?? "").toLowerCase();
+  return ["loadport", "dummyport"].includes(type) || /^(LP\d*|P\d+|.*PORT)$/i.test(name);
+}
+function instanceKey(move, wafer, index) {
+  const tasks = values(move.TaskID);
+  const jobs = values(move.PJobName);
+  const batch = tasks[index] ?? tasks[0] ?? jobs[index] ?? jobs[0];
+  return batch == null ? wafer : `${wafer}\0${batch}`;
+}
+function waferDispatchProgress(moves, time, device) {
+  const cached = timelineCache.get(moves);
+  if (cached && cached.device === device) {
+    const progress = /* @__PURE__ */ new Map();
+    for (const [key, events] of cached.steps) {
+      let lower = 0;
+      let upper = events.length;
+      while (lower < upper) {
+        const middle = Math.floor((lower + upper) / 2);
+        if (events[middle].time <= time) lower = middle + 1;
+        else upper = middle;
+      }
+      if (lower > 0) progress.set(key, events[lower - 1].step);
+    }
+    return { departures: cached.departures.filter((event) => event.time <= time), progress };
+  }
+  const stepEvents = /* @__PURE__ */ new Map();
+  const processJobs = /* @__PURE__ */ new Map();
+  const targets = /* @__PURE__ */ new Map();
+  const departures = [];
+  const cycles = /* @__PURE__ */ new Map();
+  const completed = [...moves].sort((a, b) => Number(a.EndTime) - Number(b.EndTime) || Number(a.MoveID) - Number(b.MoveID));
+  for (const move of completed) {
+    const swap = Number(move.MoveType) === SWAP_TYPE;
+    const groups = swap ? [["RecvMatList", "RecvMatStepIDList"], ["SendMatList", "SendMatStepIDList"]] : [["MatIDList", "StepIDList"]];
+    for (const [groupIndex, [materials, steps]] of groups.entries()) values(move[materials]).forEach((id, index) => {
+      const step = values(move[steps])[index];
+      if (step !== void 0 && step !== null) {
+        const key = instanceKey(move, String(id), index + (swap && groupIndex === 1 ? values(move.RecvMatList).length : 0));
+        const events = stepEvents.get(key) ?? [];
+        events.push({ time: Number(move.EndTime), step: String(step) });
+        stepEvents.set(key, events);
+        const jobIndex = index + (swap && groupIndex === 1 ? values(move.RecvMatList).length : 0);
+        const job = values(move.PJobName)[jobIndex] ?? values(move.PJobName)[0];
+        if (job != null) processJobs.set(key, String(job));
+        const stepTargets = targets.get(key) ?? /* @__PURE__ */ new Map();
+        if (move.CurState) stepTargets.set(String(step), String(move.CurState));
+        targets.set(key, stepTargets);
+      }
+    });
+    if (!PICK_TYPES.has(Number(move.MoveType)) && !swap) continue;
+    values(move[swap ? "RecvMatList" : "MatIDList"]).forEach((id, index) => {
+      const source = String(values(move[swap ? "StationList" : "SrcStationList"])[index] ?? "");
+      if (!isPort(source, device)) return;
+      const wafer = String(id);
+      const key = instanceKey(move, wafer, index);
+      const cycle = (cycles.get(key) ?? 0) + 1;
+      cycles.set(key, cycle);
+      departures.push({ wafer, key, source, cycle, time: Number(move.EndTime), moveId: Number(move.MoveID) });
+    });
+  }
+  timelineCache.set(moves, { departures, steps: stepEvents, sequences: plannedSteps(moves), device, processJobs, targets });
+  return waferDispatchProgress(moves, time, device);
+}
+function plannedSteps(moves) {
+  const result = /* @__PURE__ */ new Map();
+  for (const move of [...moves].sort((a, b) => Number(a.EndTime) - Number(b.EndTime) || Number(a.MoveID) - Number(b.MoveID))) {
+    const groups = Number(move.MoveType) === SWAP_TYPE ? [["RecvMatList", "RecvMatStepIDList"], ["SendMatList", "SendMatStepIDList"]] : [["MatIDList", "StepIDList"]];
+    groups.forEach(([materials, steps], groupIndex) => values(move[materials]).forEach((id, index) => {
+      const step = values(move[steps])[index];
+      if (step == null) return;
+      const offset = groupIndex === 1 ? values(move.RecvMatList).length : 0;
+      const key = instanceKey(move, String(id), index + offset);
+      const sequence = result.get(key) ?? [];
+      if (!sequence.includes(String(step))) sequence.push(String(step));
+      result.set(key, sequence);
+    }));
+  }
+  return result;
+}
+function renderWaferDispatchProgress(moves, snapshot, device, resolveRoute) {
+  const { departures, progress } = waferDispatchProgress(moves, snapshot.time, device);
+  const locations = /* @__PURE__ */ new Map();
+  for (const item of [...snapshot.modules, ...snapshot.robots]) for (const wafer of item.wafers) locations.set(String(wafer), item.name);
+  const latest = new Map(departures.map((event, index) => [event.wafer, index]));
+  const active = departures.map((event, index) => ({ event, index })).filter(({ event, index }) => {
+    return latest.get(event.wafer) === index;
+  });
+  if (!active.length) return '<p class="wafer-progress-note">\u5F53\u524D\u6CA1\u6709\u5DF2\u8FDB\u5165\u6D41\u7A0B\u7684\u6676\u5706\u3002</p>';
+  const sequences = timelineCache.get(moves).sequences;
+  const rows = active.map(({ event, index }) => {
+    const dummy = /dummy/i.test(event.source) || Number(event.wafer) >= DUMMY_MATERIAL_ID_START;
+    const step = progress.get(event.key);
+    const sequence = sequences.get(event.key) ?? [];
+    const current = sequence.indexOf(step ?? "");
+    const label = dummy ? event.wafer : snapshot.waferOrigins[event.wafer] || event.wafer;
+    const cached = timelineCache.get(moves);
+    const route = resolveRoute?.(cached.processJobs.get(event.key) ?? "");
+    const stages = values(route?.stages);
+    const nodes = sequence.map((id, position) => {
+      const stage = stages.find((stage2) => String(stage2.stepId) === id);
+      const resources = stage ? values(stage.visits).map((visit) => String(visit.stationName ?? "")) : [cached.targets.get(event.key)?.get(id) ?? ""];
+      const known = resources.filter(Boolean);
+      const robot = known.length > 0 && known.every((name) => Boolean(device?.Robots?.[name]));
+      const kind = known.length ? robot ? "robot" : "station" : "unknown";
+      const description = `${kind === "robot" ? "RobotStep" : kind === "station" ? "StationStep" : "\u7C7B\u578B\u672A\u77E5"} \xB7 ${known.join("/") || "\u672A\u77E5\u6A21\u5757"} \xB7 ${position < current ? "\u5DF2\u8D8A\u8FC7" : position === current ? "\u5F53\u524D\u6B65\u9AA4" : "\u540E\u7EED\u6B65\u9AA4"}`;
+      return `<li class="wafer-step step-${kind} ${position < current ? "is-past" : position === current ? "is-current" : "is-future"}" ${position === current ? 'aria-current="step"' : ""} title="${escape(description)}" aria-label="${escape(description)}"><span aria-hidden="true">${kind === "unknown" ? "?" : ""}</span></li>`;
+    }).join("");
+    return `<article class="wafer-progress-item${dummy ? " is-dummy" : ""}" aria-label="${escape(label)}\uFF0C\u53D1\u7247\u987A\u5E8F ${index + 1}\uFF0C\u5F53\u524D Step ${escape(step)}">
+      <div class="wafer-progress-heading"><strong title="MatID ${escape(event.wafer)}">${escape(label)}</strong>${dummy ? '<small class="dummy-badge">DUMMY</small>' : ""}<span class="wafer-location" title="${escape(locations.get(event.wafer) ?? event.source)}">${escape(locations.get(event.wafer) ?? event.source)}</span></div>
+      ${nodes ? `<ol class="wafer-step-track" aria-label="MoveList \u4E2D\u7684\u6B65\u9AA4\u987A\u5E8F">${nodes}</ol>` : '<p class="wafer-progress-note">\u6B65\u9AA4\u672A\u77E5</p>'}
+    </article>`;
+  }).join("");
+  return `<div class="wafer-progress-scroll">${rows}</div>`;
+}
+function updateWaferProgressPanel(panel, html) {
+  if (panel.dataset.progressMarkup === html) return;
+  panel.innerHTML = html;
+  panel.dataset.progressMarkup = html;
+  const scroller = panel.querySelector(".wafer-progress-scroll");
+  if (scroller) scroller.scrollTop = scroller.scrollHeight;
+}
+
+// src/replay_throughput.ts
+var chartSources = /* @__PURE__ */ new WeakMap();
+function completedThroughputCount(points, time) {
+  let left = 0;
+  let right = points.length;
+  while (left < right) {
+    const middle = Math.floor((left + right) / 2);
+    if (points[middle].completedAt <= time) left = middle + 1;
+    else right = middle;
+  }
+  return left;
+}
+function updateReplayThroughput(root, time, redraw) {
+  const panel = root.getElementById("visualPerformance");
+  if (!panel) return;
+  const range = panel.querySelector("#throughputRangeSelect")?.value ?? "wafer:30";
+  const mode = panel.querySelector("#throughputMetricSelect")?.value ?? "rolling";
+  const windowSize = panel.querySelector("#throughputWindowSize")?.value ?? "5";
+  const activeKey = mode === "rolling" ? `rolling-${windowSize}` : "cumulative";
+  let currentValue;
+  panel.querySelectorAll("[data-throughput-points]").forEach((chart) => {
+    let source = chartSources.get(chart);
+    if (!source) {
+      source = { points: JSON.parse(chart.dataset.throughputPoints), key: "" };
+      chartSources.set(chart, source);
+    }
+    const count = completedThroughputCount(source.points, time);
+    const latest = count ? source.points[count - 1] : void 0;
+    if (chart.dataset.throughputChart === activeKey) currentValue = latest?.throughputPerHour;
+    const canvas = chart.querySelector(".throughput-chart-canvas");
+    const key = `${count}:${range}:${canvas?.clientWidth ?? 0}`;
+    if (source.key === key) return;
+    source.key = key;
+    const points = source.points.slice(0, count);
+    chart.dataset.throughputPoints = JSON.stringify(points);
+    if (points.length) redraw(chart, range);
+    else if (canvas) canvas.innerHTML = '<div class="analysis-empty-state">\u5F53\u524D\u65F6\u523B\u6837\u672C\u4E0D\u8DB3</div>';
+    const summary = panel.querySelector(`[data-throughput-summary="${chart.dataset.throughputChart}"]`);
+    if (summary) {
+      const average = points.length ? points.reduce((sum, point) => sum + point.throughputPerHour, 0) / points.length : 0;
+      summary.innerHTML = latest ? `<span><small>\u622A\u81F3\u5F53\u524D</small><b>${latest.throughputPerHour.toFixed(1)}</b><em>\u7247/h</em></span><span><small>\u5E73\u5747</small><b>${average.toFixed(1)}</b><em>\u7247/h</em></span>` : "<span><small>\u622A\u81F3\u5F53\u524D</small><b>\u2014</b><em>\u6837\u672C\u4E0D\u8DB3</em></span>";
+    }
+  });
+  const value = root.querySelector("#visualReplayKpis .is-primary .performance-kpi-value");
+  if (value) {
+    const content = `<strong>${currentValue === void 0 ? "\u2014" : currentValue.toFixed(1)}</strong>${currentValue === void 0 ? "" : "<small>\u7247/h</small>"}`;
+    if (value.innerHTML !== content) value.innerHTML = content;
+  }
+}
+
+// src/analysis_workspace.ts
+var WINDOW_TITLES = { throughput: "\u4EA7\u80FD\u5206\u6790", bottleneck: "\u74F6\u9888\u5206\u6790", residence: "\u9A7B\u7559\u65F6\u95F4\u5206\u6790" };
+var controllers = /* @__PURE__ */ new WeakMap();
+function isAnalysisViewVisible(name, selected) {
+  return name === "throughput" || name === selected;
+}
+function mountAnalysisWorkspace(panel, redrawThroughput) {
+  if (!panel.querySelector("[data-analysis-window]")) return;
+  let controller = controllers.get(panel);
+  if (!controller) {
+    controller = new AnalysisWorkspaceController(panel, redrawThroughput);
+    controllers.set(panel, controller);
+  }
+  controller.mount();
+}
+var AnalysisWorkspaceController = class {
+  /** 委托标签点击和方向键导航；尺寸观察仅重绘现有曲线。 */
+  constructor(panel, redrawThroughput) {
+    this.panel = panel;
+    panel.ownerDocument.defaultView?.addEventListener("resize", () => this.updateExpandedLayout());
+    panel.ownerDocument.defaultView?.addEventListener("scroll", () => this.updateExpandedLayout(), true);
+    this.resizeObserver = new ResizeObserver(() => {
+      const range = panel.querySelector("#throughputRangeSelect")?.value ?? "wafer:30";
+      panel.querySelectorAll("[data-throughput-points]").forEach((chart) => {
+        if (!chart.hidden) redrawThroughput(chart, range);
+      });
+      this.updateExpandedLayout();
+    });
+    panel.addEventListener("click", (event) => {
+      const toggle = event.target.closest("[data-analysis-toggle]");
+      if (toggle) {
+        this.expanded = !this.expanded;
+        this.select(this.selected, false);
+        toggle.focus({ preventScroll: true });
+        return;
+      }
+      const tab = event.target.closest("[data-analysis-tab]");
+      if (!tab) return;
+      this.select(tab.dataset.analysisTab, true);
+    });
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        const window2 = event.target.closest("[data-analysis-window]");
+        if (window2?.dataset.expanded === "true") {
+          this.expanded = false;
+          this.select(this.selected, false);
+          this.panel.querySelector(`[data-analysis-window="${this.selected}"] [data-analysis-toggle]`)?.focus();
+          event.preventDefault();
+        }
+        return;
+      }
+      if (!event.target.matches?.("[data-analysis-tab]")) return;
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === "Home" ? "bottleneck" : event.key === "End" ? "residence" : this.selected === "bottleneck" ? "residence" : "bottleneck";
+      this.select(next, true);
+    });
+  }
+  panel;
+  selected = "bottleneck";
+  expanded = false;
+  topLayer = 1e3;
+  resizeObserver;
+  /** 创建紧凑标题栏，保留筛选控件节点及其事件，右侧标签与控件同栏。 */
+  mount() {
+    this.resizeObserver.disconnect();
+    this.panel.classList.add("analysis-fixed-workspace");
+    this.panel.querySelectorAll("[data-analysis-window]").forEach((window2) => {
+      const name = window2.dataset.analysisWindow;
+      if (window2.querySelector(".analysis-window-titlebar")) {
+        this.resizeObserver.observe(window2);
+        return;
+      }
+      const body = this.panel.ownerDocument.createElement("div");
+      body.className = "analysis-window-body";
+      while (window2.firstChild) body.append(window2.firstChild);
+      window2.append(body);
+      const tabs = name === "throughput" ? `<h3>${WINDOW_TITLES[name]}</h3>` : `<div class="analysis-view-tabs" role="tablist" aria-label="\u53F3\u4FA7\u5206\u6790\u89C6\u56FE">${["bottleneck", "residence"].map((view) => `<button type="button" role="tab" id="analysis-tab-${name}-${view}" data-analysis-tab="${view}" aria-controls="analysis-view-${view}">${WINDOW_TITLES[view]}</button>`).join("")}</div>`;
+      window2.insertAdjacentHTML("afterbegin", `<header class="analysis-window-titlebar">${tabs}</header>`);
+      const titlebar = window2.querySelector(".analysis-window-titlebar");
+      const controls = body.querySelector(".analysis-section-head");
+      if (controls) {
+        Array.from(controls.children).forEach((control) => {
+          if (!control.classList.contains("analysis-section-title")) titlebar.append(control);
+        });
+        controls.remove();
+      }
+      window2.id = `analysis-view-${name}`;
+      body.id = `analysis-body-${name}`;
+      if (name !== "throughput") titlebar.insertAdjacentHTML("beforeend", `<button type="button" class="analysis-window-toggle" data-analysis-toggle aria-controls="analysis-body-throughput analysis-body-bottleneck analysis-body-residence">\u5C55\u5F00\u5168\u90E8</button>`);
+      window2.setAttribute("role", name === "throughput" ? "region" : "tabpanel");
+      if (name === "throughput") window2.setAttribute("aria-label", WINDOW_TITLES[name]);
+      else window2.setAttribute("aria-labelledby", `analysis-tab-${name}-${name}`);
+      this.resizeObserver.observe(window2);
+    });
+    this.select(this.selected, false);
+    this.resizeObserver.observe(this.panel);
+  }
+  /** 切换右侧可见视图并同步可访问状态；可选将焦点移到新视图的当前标签。 */
+  select(selected, focus) {
+    this.selected = selected;
+    this.panel.querySelectorAll("[data-analysis-window]").forEach((window2) => {
+      const name = window2.dataset.analysisWindow;
+      window2.hidden = !isAnalysisViewVisible(window2.dataset.analysisWindow, selected);
+      const expanded = this.expanded;
+      window2.dataset.expanded = String(expanded);
+      window2.querySelector(".analysis-window-body").hidden = !expanded;
+      this.panel.querySelectorAll("[data-analysis-toggle]").forEach((toggle) => {
+        toggle.textContent = expanded ? "\u6700\u5C0F\u5316" : "\u5C55\u5F00\u5168\u90E8";
+        toggle.setAttribute("aria-expanded", String(expanded));
+      });
+      if (expanded && !window2.hidden) {
+        window2.style.zIndex = String(++this.topLayer);
+      } else window2.removeAttribute("style");
+      window2.querySelectorAll("[data-analysis-tab]").forEach((tab) => {
+        const active = tab.dataset.analysisTab === selected;
+        tab.setAttribute("aria-selected", String(active));
+        tab.tabIndex = active ? 0 : -1;
+      });
+    });
+    this.updateExpandedLayout();
+    if (focus) this.panel.querySelector(`[data-analysis-window="${selected}"] [data-analysis-tab="${selected}"]`)?.focus({ preventScroll: true });
+  }
+  /** 依据可见工作区更新展开窗口位置和高度；隐藏时保留有效位置，重新显示后重新测量。 */
+  updateExpandedLayout() {
+    if (!this.expanded || !this.panel.getClientRects().length) return;
+    const bounds = this.panel.getBoundingClientRect();
+    if (bounds.width <= 0) return;
+    const narrow = this.panel.ownerDocument.defaultView.innerWidth <= 1100;
+    this.panel.querySelectorAll("[data-analysis-window]").forEach((window2) => {
+      if (window2.hidden) return;
+      const name = window2.dataset.analysisWindow;
+      const width = narrow ? bounds.width : bounds.width * (name === "throughput" ? 1.15 / 2.15 : 1 / 2.15);
+      window2.style.setProperty("--analysis-overlay-left", `${name === "throughput" || narrow ? bounds.left : bounds.right - width}px`);
+      window2.style.setProperty("--analysis-overlay-width", `${width}px`);
+    });
+    this.updateExpandedHeight();
+  }
+  /** 用右侧实际内容末端确定两窗共享高度，避免正文伸展产生的空白计入高度。 */
+  updateExpandedHeight() {
+    if (!this.expanded) return;
+    const window2 = this.panel.querySelector(`[data-analysis-window="${this.selected}"]`);
+    if (!window2 || window2.hidden) return;
+    const body = window2.querySelector(".analysis-window-body");
+    const header = window2.querySelector(".analysis-window-titlebar");
+    const contentBottom = Math.max(body.getBoundingClientRect().top, ...Array.from(body.children).filter((child) => child.getClientRects().length > 0).map((child) => child.getBoundingClientRect().bottom));
+    const windowBorderHeight = 2;
+    const height = Math.ceil(header.getBoundingClientRect().height + contentBottom - body.getBoundingClientRect().top + body.scrollTop + windowBorderHeight);
+    this.panel.style.setProperty("--analysis-overlay-height", `${height}px`);
+  }
+};
+
+// src/replay_inspector_dock.ts
+var mountedDocks = /* @__PURE__ */ new WeakSet();
+function setReplayInspectorExpanded(dock, expanded) {
+  dock.querySelectorAll("[data-replay-dock-window]").forEach((window2) => setReplayDockExpanded(window2, expanded));
+}
+function observeAnalysisBoundary(dock) {
+  const workspace = dock.closest(".topology-playback");
+  const panel = workspace?.querySelector(".replay-analysis-panel");
+  if (!workspace || !panel) return;
+  let pending = false;
+  const update = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      const bounds = workspace.getBoundingClientRect();
+      if (!bounds.height) return;
+      const expanded = panel.querySelector('.analysis-window[data-expanded="true"]:not([hidden])');
+      const boundary = (expanded || panel).getBoundingClientRect().top;
+      dock.style.bottom = `${Math.max(0, bounds.bottom - boundary)}px`;
+    });
+  };
+  new MutationObserver(update).observe(panel, { subtree: true, childList: true, attributes: true });
+  const resizeObserver = new ResizeObserver(update);
+  resizeObserver.observe(workspace);
+  resizeObserver.observe(panel);
+  window.addEventListener("resize", update);
+  update();
+}
+function setReplayDockExpanded(window2, expanded) {
+  const body = window2.querySelector(".replay-dock-window-body");
+  const toggle = window2.querySelector("[data-replay-dock-toggle]");
+  if (!body || !toggle) return;
+  window2.dataset.expanded = String(expanded);
+  body.hidden = !expanded;
+  const title = window2.querySelector("h3")?.textContent || "\u5C55\u5F00";
+  toggle.textContent = expanded ? "\u6700\u5C0F\u5316" : title;
+  toggle.setAttribute("aria-expanded", String(expanded));
+}
+function mountReplayInspectorDock(dock) {
+  dock.querySelectorAll("[data-replay-dock-window]").forEach((window2) => setReplayDockExpanded(window2, false));
+  if (mountedDocks.has(dock)) return;
+  mountedDocks.add(dock);
+  observeAnalysisBoundary(dock);
+  dock.addEventListener("click", (event) => {
+    const toggle = event.target.closest("[data-replay-dock-toggle]");
+    const window2 = toggle?.closest("[data-replay-dock-window]");
+    if (!toggle || !window2) return;
+    setReplayInspectorExpanded(dock, window2.dataset.expanded !== "true");
+    toggle.focus({ preventScroll: true });
+  });
+  dock.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const window2 = event.target.closest("[data-replay-dock-window]");
+    if (!window2 || window2.dataset.expanded !== "true") return;
+    setReplayInspectorExpanded(dock, false);
+    window2.querySelector("[data-replay-dock-toggle]")?.focus({ preventScroll: true });
+    event.preventDefault();
+  });
+}
+
+// src/topology_robot_mechanism.ts
+var REST_REACH = 58;
+var ATR_RETRACTED_REACH = 42;
+var CLAW_SCALE = 0.8;
+var ARM_SEPARATION = 44;
+var CLAW_SEPARATION = 18;
+var SHOULDER_SEPARATION = 16;
+var EXTENDED_ELBOW_RATIO = 0.12;
+var CLAW_STEM_OFFSET = 23;
+var CLAW_PATH = "M -23 -4 L -15 -4 Q -8 -4 -7 -14 L 14 -20 L 16 -18 L -1 -12 Q -8 0 -1 12 L 16 18 L 14 20 L -7 14 Q -8 4 -15 4 L -23 4 Z";
+var HANDOFF_PROGRESS = 0.5;
+var SWAP_MOVE = 4;
+function values2(value) {
+  return Array.isArray(value) ? value : [];
+}
+function configuredRobotArms(definition) {
+  const arms = Object.entries(definition.ArmInfo ?? {}).filter(([, arm]) => arm && typeof arm === "object").map(([name, arm]) => ({
+    name,
+    enabled: arm.IsEnable !== false,
+    slots: [...new Set(values2(arm.SlotIDs).map(Number).filter((slot) => Number.isInteger(slot) && slot > 0))]
+  }));
+  if (arms.length) return arms;
+  const declaredSlots = values2(definition.Slots).map(Number).filter((slot) => Number.isInteger(slot) && slot > 0);
+  const slots = declaredSlots.length ? declaredSlots : Array.from({ length: Math.max(1, Math.floor(Number(definition.Capacity) || 1)) }, (_, index) => index + 1);
+  return slots.map((slot) => ({ name: `Arm${slot}`, enabled: true, slots: [slot] }));
+}
+function transferStages(move) {
+  const type = Number(move.MoveType);
+  const stage = (kind, slots, materials, stations, stationSlots) => values2(move[materials]).map((wafer, index) => ({
+    kind,
+    wafer: String(wafer),
+    robotSlot: Number(values2(move[slots])[index] ?? 0),
+    station: String(values2(move[stations])[index] ?? values2(move[stations])[0] ?? ""),
+    stationSlot: Number(values2(move[stationSlots])[index] ?? 0)
+  }));
+  if (type === SWAP_MOVE) {
+    const pick = stage("pick", "RecvSlotList", "RecvMatList", "StationList", "StnSendSlotList");
+    const place = stage("place", "SendSlotList", "SendMatList", "StationList", "StnRecvSlotList");
+    return Number(move.SwapMode) === 1 ? [place, pick] : [pick, place];
+  }
+  if (type === 0 || type === 2) return [stage("pick", "RobotSlotList", "MatIDList", "SrcStationList", "SrcSlotList")];
+  if (type === 1 || type === 3) return [stage("place", "RobotSlotList", "MatIDList", "DestStationList", "DestSlotList")];
+  return [];
+}
+function robotSlotWafers(moves, time, name, heldWafers) {
+  const byWafer = /* @__PURE__ */ new Map();
+  const relevant = moves.filter((move) => move.ModuleName === name);
+  for (const move of relevant) {
+    for (const transfer of transferStages(move).flat()) {
+      if (transfer.robotSlot > 0 && !byWafer.has(transfer.wafer)) byWafer.set(transfer.wafer, transfer.robotSlot);
+    }
+  }
+  for (const move of [...relevant].sort((a, b) => Number(a.EndTime) - Number(b.EndTime))) {
+    if (Number(move.EndTime) > time) continue;
+    for (const transfer of transferStages(move).flat()) {
+      if (transfer.kind === "pick" && transfer.robotSlot > 0) byWafer.set(transfer.wafer, transfer.robotSlot);
+    }
+  }
+  return Object.fromEntries(heldWafers.filter((wafer) => byWafer.has(wafer)).map((wafer) => [byWafer.get(wafer), wafer]));
+}
+function robotArmAnimation(definitions, slotWafers, move, time) {
+  const arms = definitions.map((arm) => ({
+    ...arm,
+    progress: null,
+    target: "",
+    wafers: Object.fromEntries(arm.slots.map((slot) => [slot, slotWafers[slot] ?? ""]))
+  }));
+  const transfers = [];
+  if (!move) return { arms, transfers };
+  const stages = transferStages(move);
+  const duration = Number(move.EndTime) - Number(move.StartTime);
+  const progress = duration > 0 ? Math.max(0, Math.min(1, (time - Number(move.StartTime)) / duration)) : 1;
+  stages.forEach((stage, index) => {
+    const localProgress = progress * stages.length - index;
+    for (const transfer of stage) {
+      const enabledSlots = arms.filter((arm2) => arm2.enabled).flatMap((arm2) => arm2.slots);
+      const slot = transfer.robotSlot || (enabledSlots.length === 1 ? enabledSlots[0] : 0);
+      const arm = arms.find((arm2) => arm2.enabled && arm2.slots.includes(slot));
+      if (!arm) continue;
+      if (localProgress >= 0 && localProgress < 1) {
+        arm.progress = localProgress;
+        arm.target = transfer.station;
+      }
+      if (localProgress >= HANDOFF_PROGRESS) {
+        arm.wafers[slot] = transfer.kind === "pick" ? transfer.wafer : "";
+        transfers.push({ ...transfer, robotSlot: slot });
+      }
+    }
+  });
+  return { arms, transfers };
+}
+function robotTransferReach(distance, progress, restReach = REST_REACH) {
+  return restReach + (distance - restReach) * extensionFraction(progress);
+}
+function extensionFraction(progress) {
+  if (progress === null) return 0;
+  const bounded = Math.max(0, Math.min(1, progress));
+  const phase = Math.min(1, bounded * 3, (1 - bounded) * 3);
+  return phase * phase * (3 - 2 * phase);
+}
+function robotArmGeometry(reach, index, count, progress, targetSeparation = 0) {
+  const side = index < (count - 1) / 2 ? -1 : 1;
+  const shoulder = (index - (count - 1) / 2) * SHOULDER_SEPARATION;
+  const fraction = extensionFraction(progress);
+  const tipY = (index - (count - 1) / 2) * (ARM_SEPARATION * (1 - fraction) + targetSeparation * fraction);
+  const bend = (1 - fraction) / 2 + fraction * EXTENDED_ELBOW_RATIO;
+  return {
+    shoulder,
+    tipY,
+    elbowX: reach / 2 - side * (tipY - shoulder) * bend,
+    elbowY: (shoulder + tipY) / 2 + side * reach * bend
+  };
+}
+function renderParallelRobotArms(arms, distance, renderWafer, escape2, targetGeometry, occlusions = [], maskPrefix = "robot", mechanism = "articulated", stackedArms = false) {
+  const waferLayers = [];
+  const moving = arms.some((arm) => extensionFraction(arm.progress) > 0);
+  const markup = arms.map((arm, index) => {
+    const geometry = arm.target ? targetGeometry?.(arm.target) : void 0;
+    const visibleProgress = targetGeometry && arm.target && !geometry ? null : arm.progress;
+    const reach = robotTransferReach(
+      geometry?.distance ?? distance,
+      visibleProgress,
+      mechanism === "telescopic" ? ATR_RETRACTED_REACH : REST_REACH
+    );
+    const { shoulder, elbowX, elbowY, tipY } = robotArmGeometry(reach, stackedArms ? 0 : index, stackedArms ? 1 : arms.length, visibleProgress);
+    const verticalSlots = mechanism === "telescopic";
+    const visibleSlots = verticalSlots ? arm.slots.slice(0, 1) : arm.slots;
+    const faded = stackedArms && moving && !extensionFraction(visibleProgress);
+    const hidden = stackedArms && !moving && index > 0;
+    const clawSpacing = CLAW_SEPARATION;
+    const branches = stackedArms ? visibleSlots.map((slot, slotIndex) => {
+      const branchIndex = (geometry?.slotSpacing ?? 0) < 0 ? visibleSlots.length - 1 - slotIndex : slotIndex;
+      const shape = robotArmGeometry(
+        reach,
+        branchIndex,
+        visibleSlots.length,
+        visibleProgress,
+        Math.abs(geometry?.slotSpacing ?? ARM_SEPARATION)
+      );
+      const angle = Math.atan2(shape.tipY - shape.elbowY, reach - shape.elbowX);
+      const mountX2 = reach - CLAW_STEM_OFFSET * CLAW_SCALE * Math.cos(angle);
+      const mountY2 = shape.tipY - CLAW_STEM_OFFSET * CLAW_SCALE * Math.sin(angle);
+      return { ...shape, slot, angle, path: `M 0 ${shape.shoulder} L ${shape.elbowX} ${shape.elbowY} L ${mountX2} ${mountY2}` };
+    }) : [];
+    const clawAngle = mechanism === "telescopic" || stackedArms ? 0 : Math.atan2(tipY - elbowY, reach - elbowX);
+    const mountX = reach - CLAW_STEM_OFFSET * CLAW_SCALE * Math.cos(clawAngle);
+    const mountY = tipY - CLAW_STEM_OFFSET * CLAW_SCALE * Math.sin(clawAngle);
+    const linkPath = stackedArms ? branches.map((branch) => branch.path).join(" ") : mechanism === "telescopic" ? `M 0 ${tipY} L ${mountX} ${mountY}` : `M 0 ${shoulder} L ${elbowX} ${elbowY} L ${mountX} ${mountY}`;
+    const wristHalfWidth = (visibleSlots.length - 1) * clawSpacing / 2;
+    const wristPath = !stackedArms && visibleSlots.length > 1 ? ` M ${mountX} ${mountY - wristHalfWidth} V ${mountY + wristHalfWidth}` : "";
+    const claws = visibleSlots.map((slot, slotIndex) => {
+      const branch = branches[slotIndex];
+      const y = branch?.tipY ?? tipY + (slotIndex - (visibleSlots.length - 1) / 2) * clawSpacing;
+      return `<g class="parallel-robot-claw" data-robot-slot="${slot}" transform="translate(${reach} ${y}) rotate(${(branch?.angle ?? clawAngle) * 180 / Math.PI}) scale(${CLAW_SCALE})">
+        <path d="${CLAW_PATH}"/>
+      </g>`;
+    }).join("");
+    const waferSlots = verticalSlots ? arm.slots.filter((slot) => arm.wafers[slot]).slice(0, 1) : arm.slots;
+    const wafers = waferSlots.map((slot, slotIndex) => {
+      if (stackedArms && !moving && arms.slice(0, index).some((upper) => upper.wafers[upper.slots[slotIndex]])) return "";
+      const wafer = arm.wafers[slot];
+      const y = branches[slotIndex]?.tipY ?? tipY + (slotIndex - (waferSlots.length - 1) / 2) * clawSpacing;
+      return wafer ? `<span class="parallel-robot-wafers" data-held-slot="${slot}" style="left:${reach}px;top:${y}px">${renderWafer(wafer)}</span>` : "";
+    }).join("");
+    const localAngle = geometry?.angle ?? 0;
+    waferLayers.push(`<div class="parallel-robot-wafer-layer" style="--robot-arm-local-angle:${localAngle}deg;opacity:${faded ? 0.3 : 1}">${wafers}</div>`);
+    const maskId = `robot-mask-${Array.from(maskPrefix).map((character) => character.codePointAt(0)).join("-")}-${index}`;
+    const radians = localAngle * Math.PI / 180;
+    const holes = occlusions.map((point) => `<circle cx="${point.x * Math.cos(radians) + point.y * Math.sin(radians)}" cy="${-point.x * Math.sin(radians) + point.y * Math.cos(radians)}" r="${point.radius}" fill="black"/>`).join("");
+    return `<div class="parallel-robot-arm${arm.progress === null ? "" : " is-transferring"}${arm.enabled ? "" : " is-disabled"}" data-arm="${escape2(arm.name)}" style="--robot-reach:${reach.toFixed(2)}px;--robot-arm-local-angle:${localAngle}deg;${hidden ? "visibility:hidden;" : faded ? "opacity:.3;" : ""}">
+      <svg class="parallel-robot-arms" overflow="visible" aria-hidden="true">
+        <defs><mask id="${maskId}" maskUnits="userSpaceOnUse" x="-2000" y="-2000" width="4000" height="4000"><rect x="-2000" y="-2000" width="4000" height="4000" fill="white"/>${holes}</mask></defs>
+        <g mask="url(#${maskId})"><path class="parallel-robot-link" d="${linkPath}${wristPath}"/>
+        <path class="parallel-robot-link-inset" d="${linkPath}${wristPath}"/>
+        ${mechanism === "telescopic" ? `<path class="parallel-robot-slide" d="M 0 ${tipY} H ${reach / 2}"/>` : stackedArms ? branches.map((branch) => `<circle class="parallel-robot-joint" cx="${branch.elbowX}" cy="${branch.elbowY}" r="4"/>`).join("") : `<circle class="parallel-robot-joint" cx="${elbowX}" cy="${elbowY}" r="4"/>`}${claws}</g>
+      </svg></div>`;
+  }).join("");
+  return `<div class="parallel-robot-mechanism">${markup}${waferLayers.join("")}</div>`;
+}
+
+// src/topology_transfer_projection.ts
+function projectTopologyTransfers(snapshot, device) {
+  const modules = snapshot.modules.map((module) => ({
+    ...module,
+    wafers: [...module.wafers],
+    processedWafers: [...module.processedWafers],
+    loadPortSlots: module.loadPortSlots.map((slot) => ({ ...slot })),
+    loadLockSlots: module.loadLockSlots.map((slot) => ({ ...slot })),
+    processSlots: module.processSlots?.map((slot) => ({ ...slot }))
+  }));
+  const animations = /* @__PURE__ */ new Map();
+  for (const robot of snapshot.robots) {
+    const definition = device?.Robots?.[robot.name];
+    const arms = definition ? configuredRobotArms(definition) : robot.arms ?? configuredRobotArms({ Capacity: robot.capacity });
+    const slots = arms.flatMap((arm) => arm.slots);
+    const slotWafers = { ...robot.slotWafers };
+    if (slots.length === 1 && robot.wafers.length === 1 && !Object.keys(slotWafers).length) {
+      slotWafers[slots[0]] = robot.wafers[0];
+    }
+    const move = snapshot.activeMoves.find((move2) => move2.ModuleName === robot.name);
+    const preparation = robot.environment === "atmosphere" ? robot.railMotion?.preparationFraction ?? 0 : 0;
+    const alignedMove = move && preparation ? {
+      ...move,
+      StartTime: Number(move.StartTime) + (Number(move.EndTime) - Number(move.StartTime)) * preparation
+    } : move;
+    const animation = robotArmAnimation(
+      arms,
+      slotWafers,
+      alignedMove && snapshot.time < Number(alignedMove.StartTime) ? void 0 : alignedMove,
+      snapshot.time
+    );
+    animations.set(robot.name, animation.arms);
+    for (const transfer of animation.transfers) {
+      const module = modules.find((module2) => module2.name === transfer.station);
+      if (!module) continue;
+      const processed = robot.processedWafers.includes(transfer.wafer);
+      if (transfer.kind === "pick") {
+        module.wafers = module.wafers.filter((wafer) => wafer !== transfer.wafer);
+      } else if (!module.wafers.includes(transfer.wafer)) {
+        module.wafers.push(transfer.wafer);
+        if (processed) module.processedWafers.push(transfer.wafer);
+      }
+      for (const slot of [...module.loadPortSlots, ...module.loadLockSlots, ...module.processSlots ?? []]) {
+        if (transfer.kind === "pick" && slot.wafer === transfer.wafer) {
+          slot.wafer = "";
+          slot.processed = false;
+        } else if (transfer.kind === "place" && slot.slot === transfer.stationSlot) {
+          slot.wafer = transfer.wafer;
+          slot.processed = processed;
+        }
+      }
+    }
+  }
+  return { modules, animations };
+}
+
+// src/topology_loadlock_doors.ts
+var PREPARE = 6;
+var COMPLETE = 7;
+var TRANSFERS = /* @__PURE__ */ new Set([0, 1, 2, 3, 4]);
+var TIME_TOLERANCE = 1e-6;
+var RELATED_ATMOSPHERE = 0;
+var RELATED_VACUUM = 1;
+function values3(value) {
+  return value == null ? [] : Array.isArray(value) ? value : [value];
+}
+function robotKind(name, device) {
+  const type = String(device?.Robots?.[name]?.Type ?? "");
+  if (/HighVTM/i.test(type) || /VTR[_-]?2/i.test(name)) return "upper";
+  if (/ATM/i.test(type) || /ATR|ATM/i.test(name)) return "atmosphere";
+  if (/VTM|VAC/i.test(type) || /VTR|VAC/i.test(name)) return "vacuum";
+  return void 0;
+}
+function indexTransfers(moves) {
+  const index = { byId: /* @__PURE__ */ new Map(), dependents: /* @__PURE__ */ new Map(), starts: /* @__PURE__ */ new Map(), ends: /* @__PURE__ */ new Map() };
+  const append = (map, key, move) => {
+    const entries = map.get(key) ?? [];
+    entries.push(move);
+    map.set(key, entries);
+  };
+  for (const move of moves) {
+    if (!TRANSFERS.has(Number(move.MoveType))) continue;
+    if (move.MoveID !== void 0) index.byId.set(move.MoveID, move);
+    for (const id of values3(move.PreMoveID)) append(index.dependents, Number(id), move);
+    const stations = new Set([...values3(move.SrcStationList), ...values3(move.DestStationList), ...values3(move.StationList)].map(String));
+    for (const station2 of stations) {
+      append(index.starts, `${station2}:${Math.round(Number(move.StartTime) / TIME_TOLERANCE)}`, move);
+      append(index.ends, `${station2}:${Math.round(Number(move.EndTime) / TIME_TOLERANCE)}`, move);
+    }
+  }
+  return index;
+}
+function relatedRobot(door, index) {
+  const explicit = String(door.Robot ?? "");
+  if (explicit) return explicit;
+  const closing = door.MoveType === COMPLETE;
+  const boundary = Number(closing ? door.StartTime : door.EndTime);
+  const bucket = Math.round(boundary / TIME_TOLERANCE);
+  const dependencies = closing ? values3(door.PreMoveID).map((id) => index.byId.get(Number(id))).filter((move) => Boolean(move)) : index.dependents.get(Number(door.MoveID)) ?? [];
+  const adjacent = [-1, 0, 1].flatMap((offset) => (closing ? index.ends : index.starts).get(`${door.ModuleName}:${bucket + offset}`) ?? []);
+  const matches = (move) => {
+    const stations = [...values3(move.SrcStationList), ...values3(move.DestStationList), ...values3(move.StationList)];
+    if (!stations.map(String).includes(String(door.ModuleName))) return false;
+    const materials = values3(door.MatIDList).map(String);
+    const transported = values3(move.MatIDList).map(String);
+    return !materials.length || !transported.length || materials.some((material) => transported.includes(material));
+  };
+  const related = dependencies.filter(matches);
+  const selected = related.length ? related : adjacent.filter((move) => matches(move) && Math.abs(Number(closing ? move.EndTime : move.StartTime) - boundary) <= TIME_TOLERANCE);
+  const robots = [...new Set(selected.map((move) => String(move.Robot || move.ModuleName || "")).filter(Boolean))];
+  return robots.length === 1 ? robots[0] : void 0;
+}
+function projectLoadLockDoors(moves, device, time, names) {
+  const result = /* @__PURE__ */ new Map();
+  const transfers = indexTransfers(moves);
+  for (const name of names) {
+    const station2 = device?.Stations?.[name];
+    const preparations = values3(station2?.PrePrepareTime);
+    const linkedNames = preparations.flatMap((item) => [String(item.LastItem ?? ""), String(item.CurrentItem ?? "")]);
+    const bridge = linkedNames.some((robot) => robotKind(robot, device) === "upper") || /^(UBR|DBR)$/i.test(name);
+    const doors = { top: "closed", bottom: "closed", topLabel: bridge ? "\u4E0A\u7EA7\u771F\u7A7A\u4FA7" : "\u771F\u7A7A\u4FA7", bottomLabel: bridge ? "\u4E0B\u7EA7\u771F\u7A7A\u4FA7" : "\u5927\u6C14\u4FA7" };
+    const sideForRobot = (robot) => {
+      const kind = robotKind(robot, device);
+      if (bridge) return kind === "upper" ? "top" : kind === "vacuum" ? "bottom" : void 0;
+      return kind === "atmosphere" ? "bottom" : kind === "vacuum" || kind === "upper" ? "top" : void 0;
+    };
+    let previousSide;
+    let environmentRobot = String(station2?.LastItem ?? "");
+    for (const move of moves) {
+      if (move.ModuleName !== name || Number(move.StartTime) > time) continue;
+      if (move.MoveType === 10 && Number(move.EndTime) <= time) environmentRobot = String(move.CurState ?? "");
+      if (move.MoveType !== PREPARE && move.MoveType !== COMPLETE) continue;
+      const robot = relatedRobot(move, transfers);
+      let side = robot ? sideForRobot(robot) : void 0;
+      if (!side && move.MoveType === COMPLETE) side = previousSide;
+      if (!side && !bridge) side = move.RelatedRobotType === RELATED_ATMOSPHERE ? "bottom" : move.RelatedRobotType === RELATED_VACUUM ? "top" : void 0;
+      if (!side) side = sideForRobot(environmentRobot);
+      const completed = Number(move.EndTime) <= time;
+      if (side) {
+        doors[side] = move.MoveType === PREPARE ? completed ? "open" : "opening" : completed ? "closed" : "closing";
+        previousSide = side;
+      } else {
+        doors.top = doors.bottom = move.MoveType === COMPLETE && completed ? "closed" : "unknown";
+      }
+    }
+    result.set(name, doors);
+  }
+  return result;
+}
+
+// src/topology_atmosphere_rail.ts
+var PRE_TRANS_MOVE = 5;
+var RAIL_PREPARATION_FRACTION = 0.25;
+function station(move, field) {
+  return Array.isArray(move[field]) ? String(move[field][0] ?? "") : "";
+}
+function atmosphereRailMotion(moves, robot, time) {
+  let previousTarget = "";
+  for (const move of moves.filter((move2) => move2.ModuleName === robot).sort((left, right) => Number(left.StartTime) - Number(right.StartTime))) {
+    if (Number(move.StartTime) > time) break;
+    const target = station(move, "DestStationList") || station(move, "SrcStationList") || station(move, "StationList");
+    if (!target) continue;
+    if (Number(move.EndTime) > time) {
+      const source = Number(move.MoveType) === PRE_TRANS_MOVE ? station(move, "SrcStationList") || previousTarget : previousTarget;
+      const preparationFraction = Number(move.MoveType) < PRE_TRANS_MOVE && source !== target ? RAIL_PREPARATION_FRACTION : 0;
+      const progress = (time - Number(move.StartTime)) / (Number(move.EndTime) - Number(move.StartTime));
+      return {
+        source,
+        target,
+        preparationFraction,
+        progress: Number(move.MoveType) === PRE_TRANS_MOVE ? progress : preparationFraction ? Math.min(1, progress / preparationFraction) : 1
+      };
+    }
+    previousTarget = target;
+  }
+  return { source: previousTarget, target: previousTarget, progress: 1, preparationFraction: 0 };
+}
+
+// src/topology_robot_slots.ts
+function renderRobotSlotRow(robot, dual, renderSlots, escape2) {
+  const arms = robot.arms ?? configuredRobotArms({ Capacity: robot.capacity });
+  const combined = dual && robot.environment === "vacuum";
+  const slots = (ids) => ids.map((slot) => ({
+    slot,
+    wafer: robot.slotWafers?.[slot] ?? "",
+    processed: robot.processedWafers.includes(robot.slotWafers?.[slot] ?? "")
+  }));
+  const boards = combined ? `<div class="front-module front-robot-combined"><strong>${escape2(robot.name)}</strong><div class="front-slot-board front-robot-combined-board" style="--front-slot-count:${arms.length}">${arms.map((arm) => `<div class="front-robot-arm-pair" role="group" aria-label="${escape2(arm.name)}">${renderSlots(slots(arm.slots))}</div>`).join("")}</div></div>` : arms.map((arm) => `<div class="front-module"><strong>${escape2(robot.name)}${dual ? "" : ` \xB7 ${escape2(arm.name)}`}</strong><div class="front-slot-board" style="--front-slot-count:${arm.slots.length}" role="group" aria-label="${escape2(robot.name + " " + arm.name)}">${renderSlots(slots(arm.slots))}</div></div>`).join("");
+  return `<div class="front-slot-row front-slot-row-robot" data-robot="${escape2(robot.name)}">${boards}</div>`;
 }
 
 // src/workspace_visualizer.ts
@@ -222,14 +1038,14 @@ var ALL_ACTION_DIAGNOSTIC_STATUSES = [
 ];
 var PICK_MOVE_TYPES = /* @__PURE__ */ new Set([0, 2]);
 var PLACE_MOVE_TYPES = /* @__PURE__ */ new Set([1, 3]);
-var SWAP_MOVE = 4;
-var DECISION_COMPLETION_MOVE_TYPES = /* @__PURE__ */ new Set([...PLACE_MOVE_TYPES, SWAP_MOVE]);
+var SWAP_MOVE2 = 4;
+var DECISION_COMPLETION_MOVE_TYPES = /* @__PURE__ */ new Set([...PLACE_MOVE_TYPES, SWAP_MOVE2]);
 var PRIMITIVE_DECISION_COMPLETION_MOVE_TYPES = /* @__PURE__ */ new Set([
   ...PICK_MOVE_TYPES,
   ...PLACE_MOVE_TYPES,
-  SWAP_MOVE
+  SWAP_MOVE2
 ]);
-var PRE_TRANS_MOVE = 5;
+var PRE_TRANS_MOVE2 = 5;
 var PREPARE_MOVE = 6;
 var COMPLETE_MOVE = 7;
 var PROCESS_MOVE = 9;
@@ -239,7 +1055,6 @@ var VENT_MOVE = 13;
 var CLEAN_MOVE = 14;
 var LOADLOCK_ENVIRONMENT_MOVE_TYPES = /* @__PURE__ */ new Set([PRE_PREPARE_MOVE, PUMP_MOVE, VENT_MOVE]);
 var PLAYBACK_FRAME_INTERVAL_MS = 40;
-var DOOR_VISUAL_MIN_SECONDS = 0.7;
 var DEFAULT_PLAYBACK_SPEED = 4;
 var PERFORMANCE_DISPLAY_TOLERANCE = 1e-6;
 var DEFAULT_LOAD_PORT_CAPACITY = 25;
@@ -547,11 +1362,11 @@ function isDummyWaferOrigin(origin) {
   const { moduleName } = splitWaferOrigin(origin);
   return Boolean(moduleName) && isDummyPortName(moduleName);
 }
-var DUMMY_MATERIAL_ID_START = 1e5;
+var DUMMY_MATERIAL_ID_START2 = 1e5;
 function isDummyWafer(wafer, origin) {
   if (isDummyWaferOrigin(origin)) return true;
   const materialId = Number(wafer);
-  return Number.isInteger(materialId) && materialId >= DUMMY_MATERIAL_ID_START;
+  return Number.isInteger(materialId) && materialId >= DUMMY_MATERIAL_ID_START2;
 }
 function waferSurfaceLabel(wafer, origin) {
   if (isDummyWafer(wafer, origin) && wafer) return wafer;
@@ -642,10 +1457,10 @@ function collectRobotNames(moves, device) {
 function initialMaterialLocations(moves) {
   const locations = /* @__PURE__ */ new Map();
   for (const move of moves) {
-    if (move.MoveType === SWAP_MOVE) {
-      const station = String(listValue(move.StationList)[0] ?? "");
+    if (move.MoveType === SWAP_MOVE2) {
+      const station2 = String(listValue(move.StationList)[0] ?? "");
       for (const material of materialIds(move, "RecvMatList")) {
-        if (!locations.has(material)) locations.set(material, station);
+        if (!locations.has(material)) locations.set(material, station2);
       }
       for (const material of materialIds(move, "SendMatList")) {
         if (!locations.has(material)) locations.set(material, move.ModuleName);
@@ -666,7 +1481,7 @@ function initialMaterialOrigins(moves) {
     origins.set(material, slot > 0 ? `${module}.${slot}` : module);
   };
   for (const move of moves) {
-    if (move.MoveType === SWAP_MOVE) {
+    if (move.MoveType === SWAP_MOVE2) {
       materialIds(move, "RecvMatList").forEach((material, index) => {
         setOrigin(
           material,
@@ -703,10 +1518,10 @@ function applyCompletedTransfer(move, locations) {
     }
     return;
   }
-  if (move.MoveType === SWAP_MOVE) {
-    const station = String(listValue(move.StationList)[0] ?? "");
+  if (move.MoveType === SWAP_MOVE2) {
+    const station2 = String(listValue(move.StationList)[0] ?? "");
     for (const material of materialIds(move, "RecvMatList")) locations.set(material, move.ModuleName);
-    for (const material of materialIds(move, "SendMatList")) locations.set(material, station);
+    for (const material of materialIds(move, "SendMatList")) locations.set(material, station2);
   }
 }
 function indexedStation(move, field, index) {
@@ -866,42 +1681,43 @@ function buildLoadPortSlots(records, device, time, initialLocations, processedMa
   }
   return result;
 }
-function buildLoadLockSlots(records, device, time, initialLocations, processedMaterials, currentMaterialInstances) {
+function buildReplayStationSlots(records, device, time, initialLocations, processedMaterials, currentMaterialInstances) {
+  const isSlottedStation = (name, type) => isLoadLockName(name, type) || type.toLowerCase() === "multiprocesschamber";
   const names = /* @__PURE__ */ new Set();
   for (const [name, definition] of Object.entries(device?.Stations ?? {})) {
-    if (isLoadLockName(name, String(definition?.Type ?? ""))) names.add(name);
+    if (isSlottedStation(name, String(definition?.Type ?? ""))) names.add(name);
   }
   for (const location of initialLocations.values()) {
-    if (isLoadLockName(location, String(device?.Stations?.[location]?.Type ?? ""))) names.add(location);
+    if (isSlottedStation(location, String(device?.Stations?.[location]?.Type ?? ""))) names.add(location);
   }
-  const initialByLock = /* @__PURE__ */ new Map();
+  const initialByStation = /* @__PURE__ */ new Map();
   const observedMaximum = /* @__PURE__ */ new Map();
-  const occupyInitial = (lock, slot, material) => {
-    if (!lock || !slot || !material || initialLocations.get(material) !== lock) return;
-    names.add(lock);
-    const occupancy = initialByLock.get(lock) ?? /* @__PURE__ */ new Map();
+  const occupyInitial = (station2, slot, material) => {
+    if (!station2 || !slot || !material || initialLocations.get(material) !== station2) return;
+    names.add(station2);
+    const occupancy = initialByStation.get(station2) ?? /* @__PURE__ */ new Map();
     if (!occupancy.has(slot)) occupancy.set(slot, material);
-    initialByLock.set(lock, occupancy);
-    observedMaximum.set(lock, Math.max(observedMaximum.get(lock) ?? 0, slot));
+    initialByStation.set(station2, occupancy);
+    observedMaximum.set(station2, Math.max(observedMaximum.get(station2) ?? 0, slot));
   };
   for (const move of records) {
     if (PICK_MOVE_TYPES.has(move.MoveType)) {
       materialIds(move).forEach((material, index) => {
         const source = indexedStation(move, "SrcStationList", index);
-        if (!isLoadLockName(source, String(device?.Stations?.[source]?.Type ?? ""))) return;
+        if (!isSlottedStation(source, String(device?.Stations?.[source]?.Type ?? ""))) return;
         occupyInitial(source, indexedSlot(move, "SrcSlotList", index), material);
       });
-    } else if (move.MoveType === SWAP_MOVE) {
+    } else if (move.MoveType === SWAP_MOVE2) {
       materialIds(move, "RecvMatList").forEach((material, index) => {
-        const station = indexedStation(move, "StationList", index);
-        if (!isLoadLockName(station, String(device?.Stations?.[station]?.Type ?? ""))) return;
-        occupyInitial(station, indexedSlot(move, "StnSendSlotList", index), material);
+        const station2 = indexedStation(move, "StationList", index);
+        if (!isSlottedStation(station2, String(device?.Stations?.[station2]?.Type ?? ""))) return;
+        occupyInitial(station2, indexedSlot(move, "StnSendSlotList", index), material);
       });
     }
   }
   const result = /* @__PURE__ */ new Map();
   for (const name of names) {
-    const occupancy = new Map(initialByLock.get(name) ?? []);
+    const occupancy = new Map(initialByStation.get(name) ?? []);
     const initialMaterials = [...initialLocations.entries()].filter(([, location]) => location === name).map(([material]) => material).sort(naturalCompare);
     const assigned = new Set(occupancy.values());
     let fallbackSlot = 1;
@@ -935,7 +1751,7 @@ function buildLoadLockSlots(records, device, time, initialLocations, processedMa
           occupancy.set(slot, material);
           observedMaximum.set(name, Math.max(observedMaximum.get(name) ?? 0, slot));
         });
-      } else if (move.MoveType === SWAP_MOVE) {
+      } else if (move.MoveType === SWAP_MOVE2) {
         materialIds(move, "RecvMatList").forEach((material, index) => {
           if (indexedStation(move, "StationList", index) !== name) return;
           const slot = indexedSlot(move, "StnSendSlotList", index);
@@ -991,6 +1807,7 @@ function buildWorkspaceSnapshot(moves, device, requestedTime, replenishments = [
   const waferOrigins = initialMaterialOrigins(records);
   const locations = new Map(initialLocations);
   const doorStates = /* @__PURE__ */ new Map();
+  const loadLockDoors = projectLoadLockDoors(records, device, time, [...definitions].filter(([name, definition]) => isLoadLockName(name, definition.type)).map(([name]) => name));
   const environments = /* @__PURE__ */ new Map();
   const requiredProcesses = /* @__PURE__ */ new Map();
   for (const move of records) {
@@ -1041,7 +1858,7 @@ function buildWorkspaceSnapshot(moves, device, requestedTime, replenishments = [
         });
       }
     }
-    const doorVisualActive = move.StartTime <= time && time < Math.max(move.EndTime, move.StartTime + DOOR_VISUAL_MIN_SECONDS);
+    const doorVisualActive = move.StartTime <= time && time < move.EndTime;
     if (move.MoveType === PREPARE_MOVE) {
       if (doorVisualActive) doorStates.set(move.ModuleName, "opening");
       else if (completed) doorStates.set(move.ModuleName, "open");
@@ -1089,7 +1906,7 @@ function buildWorkspaceSnapshot(moves, device, requestedTime, replenishments = [
     processedMaterials,
     replenishments
   );
-  const loadLockSlots = buildLoadLockSlots(
+  const stationSlotSnapshots = buildReplayStationSlots(
     records,
     device,
     time,
@@ -1114,10 +1931,12 @@ function buildWorkspaceSnapshot(moves, device, requestedTime, replenishments = [
       type: definition.type,
       status,
       door: doorStates.get(name) ?? "closed",
+      loadLockDoors: loadLockDoors.get(name),
       wafers: wafersByLocation.get(name) ?? [],
       processedWafers: (wafersByLocation.get(name) ?? []).filter(isProcessed),
       loadPortSlots: loadPortSlots.get(name) ?? [],
-      loadLockSlots: loadLockSlots.get(name) ?? [],
+      loadLockSlots: isLoadLockName(name, definition.type) ? stationSlotSnapshots.get(name) ?? [] : [],
+      processSlots: definition.type.toLowerCase() === "multiprocesschamber" ? stationSlotSnapshots.get(name) : void 0,
       slotCapacity: stationSlotCapacity(device, name, isCoolerModule(name, definition.type) ? 3 : 1),
       activeMoveName: primaryMove ? isCleaningMove(primaryMove) ? "\u6E05\u6D01" : MOVE_NAMES[primaryMove.MoveType] ?? `\u52A8\u4F5C ${primaryMove.MoveType}` : "",
       progress: primaryMove ? moveProgress(primaryMove, time) : 0,
@@ -1134,15 +1953,18 @@ function buildWorkspaceSnapshot(moves, device, requestedTime, replenishments = [
       name,
       type: String(definition.Type ?? ""),
       capacity: robotCapacity(definition, wafers.length),
+      arms: configuredRobotArms(definition),
+      slotWafers: robotSlotWafers(records, time, name, wafers),
       environment: robotEnvironment(name, definition),
+      railMotion: robotEnvironment(name, definition) === "atmosphere" ? atmosphereRailMotion(records, name, time) : void 0,
       wafers,
       processedWafers: wafers.filter(isProcessed),
       busy: Boolean(move),
       source: move ? firstStation(move, "SrcStationList") : "",
       target: robotTargets.get(name) ?? lastRobotTargets.get(name) ?? "",
       activeMoveName: move ? MOVE_NAMES[move.MoveType] ?? `\u52A8\u4F5C ${move.MoveType}` : "",
-      isPreTrans: move?.MoveType === PRE_TRANS_MOVE,
-      preTransProgress: move?.MoveType === PRE_TRANS_MOVE ? moveProgress(move, time) : 1
+      isPreTrans: move?.MoveType === PRE_TRANS_MOVE2,
+      preTransProgress: move?.MoveType === PRE_TRANS_MOVE2 ? moveProgress(move, time) : 1
     };
   });
   return {
@@ -1201,7 +2023,7 @@ function replayMaterialProgress(records) {
     });
   };
   for (const move of [...records].sort((left, right) => left.EndTime - right.EndTime || left.MoveID - right.MoveID)) {
-    if (move.MoveType === SWAP_MOVE) {
+    if (move.MoveType === SWAP_MOVE2) {
       const received = materialIds(move, "RecvMatList");
       update(move, received, "RecvMatStepIDList");
       update(move, materialIds(move, "SendMatList"), "SendMatStepIDList", received.length);
@@ -1226,7 +2048,7 @@ function hasConsistentTransferReplay(records, device) {
   const locations = initialMaterialLocations(records);
   const robotNames = new Set(Object.keys(device.Robots ?? {}));
   const locationCount = (location) => [...locations.values()].filter((current) => current === location).length;
-  const orderedTransfers = records.filter((move) => PICK_MOVE_TYPES.has(move.MoveType) || PLACE_MOVE_TYPES.has(move.MoveType) || move.MoveType === SWAP_MOVE).sort((left, right) => left.EndTime - right.EndTime || left.MoveID - right.MoveID);
+  const orderedTransfers = records.filter((move) => PICK_MOVE_TYPES.has(move.MoveType) || PLACE_MOVE_TYPES.has(move.MoveType) || move.MoveType === SWAP_MOVE2).sort((left, right) => left.EndTime - right.EndTime || left.MoveID - right.MoveID);
   for (const move of orderedTransfers) {
     if (PICK_MOVE_TYPES.has(move.MoveType)) {
       const materials = materialIds(move);
@@ -1254,15 +2076,15 @@ function hasConsistentTransferReplay(records, device) {
     const received = materialIds(move, "RecvMatList");
     const sent = materialIds(move, "SendMatList");
     for (let index = 0; index < received.length; index += 1) {
-      const station = indexedStation(move, "StationList", index);
-      if (!station || locations.get(received[index]) !== station) return false;
+      const station2 = indexedStation(move, "StationList", index);
+      if (!station2 || locations.get(received[index]) !== station2) return false;
       locations.set(received[index], move.ModuleName);
     }
     for (let index = 0; index < sent.length; index += 1) {
-      const station = indexedStation(move, "StationList", index);
-      if (!station || locations.get(sent[index]) !== move.ModuleName) return false;
-      if (locationCount(station) >= stationCapacity(device, station)) return false;
-      locations.set(sent[index], station);
+      const station2 = indexedStation(move, "StationList", index);
+      if (!station2 || locations.get(sent[index]) !== move.ModuleName) return false;
+      if (locationCount(station2) >= stationCapacity(device, station2)) return false;
+      locations.set(sent[index], station2);
     }
   }
   return true;
@@ -1285,18 +2107,6 @@ function detectTerminalPlaybackDeadlock(moves, device, plan) {
     });
     return blocked.length === targets.length ? blocked : [];
   };
-  const unfinishedCleaningBlockers = (targets) => targets.flatMap((target) => {
-    const occupants = modules.get(target)?.wafers ?? [];
-    return occupants.flatMap((wafer) => {
-      const latestCleaningMove = [...records].filter((move) => move.MoveType === PROCESS_MOVE && move.ModuleName === target && materialIds(move).includes(wafer) && isCleaningMove(move)).sort((left, right) => right.EndTime - left.EndTime || right.MoveID - left.MoveID)[0];
-      if (!latestCleaningMove || latestCleaningMove.IsLastCleanTaskMove !== false) return [];
-      return [{
-        target,
-        wafer,
-        taskName: String(latestCleaningMove.CleanTaskName || latestCleaningMove.ProcessRecipe || "\u6E05\u6D17\u4EFB\u52A1")
-      }];
-    });
-  });
   for (const robot of snapshot.robots) {
     const held = [...robot.wafers].sort(naturalCompare);
     if (robot.capacity === 1 && held.length === 1) {
@@ -1307,18 +2117,6 @@ function detectTerminalPlaybackDeadlock(moves, device, plan) {
         Code: "DEADLOCK.SINGLE_ARM_TARGET_FULL",
         Category: "single-arm-target-full",
         Message: `${robot.name} \u7684\u552F\u4E00\u624B\u81C2\u6301\u6709\u6676\u5706 ${held[0]}\uFF0C\u76EE\u6807 ${targets.join("\u3001")} \u88AB\u6676\u5706 ${occupants.join("\u3001")} \u5360\u7528\uFF1B\u5B83\u6CA1\u6709\u7A7A\u624B\u63A5\u8D70\u8154\u5185\u6676\u5706\uFF0C\u6301\u7247\u53C8\u5FC5\u987B\u7B49\u76EE\u6807\u817E\u7A7A\u624D\u80FD\u653E\u4E0B\uFF0C\u5F62\u6210\u76F8\u4E92\u7B49\u5F85\u3002`
-      };
-    }
-    if (robot.capacity === 2 && held.length === 1) {
-      const targets = blockingTargets(robot, held[0]);
-      if (!targets.length) continue;
-      const occupants = [...new Set(targets.flatMap((target) => modules.get(target)?.wafers ?? []))].sort(naturalCompare);
-      const cleaningBlockers = unfinishedCleaningBlockers(targets);
-      const reason = cleaningBlockers.length ? cleaningBlockers.map((blocker) => `${blocker.target} \u88AB\u5C1A\u672A\u5B8C\u6210\u6574\u7EC4 ${blocker.taskName} \u7684\u6E05\u6D17\u7247 ${blocker.wafer} \u5360\u7528\uFF1B\u6676\u5706 ${held[0]} \u5728\u6E05\u6D17\u5B8C\u6210\u524D\u7981\u6B62\u8FDB\u5165\uFF0C\u4E0D\u80FD\u76F4\u63A5\u6362\u7247\u3002`).join("") : `\u76F4\u63A5\u6362\u7247\u4F1A\u8BA9\u8154\u5185\u6676\u5706 ${occupants.join("\u3001")} \u8F6C\u5230 ${robot.name} \u7684\u7B2C\u4E8C\u53EA\u624B\u81C2\uFF0C\u4F46\u56DE\u653E\u7EC8\u70B9\u6CA1\u6709\u80FD\u5C06\u8FD9\u4E9B\u6676\u5706\u7EE7\u7EED\u653E\u4E0B\u7684\u5408\u6CD5\u540E\u7EE7\u51FA\u53E3\uFF0C\u6362\u7247\u94FE\u65E0\u6CD5\u95ED\u5408\u3002`;
-      return {
-        Code: "DEADLOCK.DUAL_ARM_SINGLE_HELD_TARGET_FULL",
-        Category: "dual-arm-single-held-target-full",
-        Message: `${robot.name} \u5DF2\u6301\u6709\u6676\u5706 ${held[0]}\u3002${reason}\u8154\u5185\u7247\u53C8\u53EA\u80FD\u7531 ${robot.name} \u53D6\u51FA\uFF0C\u5F62\u6210\u6301\u7247\u7B49\u5F85\u95ED\u73AF\u3002`
       };
     }
     if (robot.capacity === 2 && held.length === 2) {
@@ -1366,8 +2164,9 @@ function collectElements(root) {
     speed: required("visualSpeed"),
     fileInput: required("visualFileInput"),
     importButton: root.getElementById("visualImportButton"),
+    exportDiagnosticButton: root.getElementById("visualExportDeadlockDiagnostic"),
     openGantt: required("visualOpenGantt"),
-    resultButton: required("workspaceResultButton"),
+    resultButton: root.getElementById("workspaceResultButton"),
     performance: required("visualPerformance"),
     performanceWindow: required("performanceWindow")
   };
@@ -1485,7 +2284,7 @@ function expandDualProcessChambers(modules) {
       continue;
     }
     for (let index = 0; index < module.slotCapacity; index += 1) {
-      const wafer = module.wafers[index] ?? "";
+      const wafer = module.processSlots ? module.processSlots.find((slot) => slot.slot === index + 1)?.wafer ?? "" : module.wafers[index] ?? "";
       expanded.push({
         view: {
           ...module,
@@ -1510,7 +2309,7 @@ function renderWaferToken(wafer, origin, progress, processed = false) {
 }
 function moduleDoorSides(module, role, layout = "single", roleIndex = 0, attachmentId = "") {
   if (module.door === "doorless") return [];
-  if (role === "lock") return [];
+  if (role === "lock") return ["top", "bottom"];
   if (role === "port") return ["top"];
   const name = module.name.trim().toUpperCase();
   if (role === "process" && attachmentId) {
@@ -1567,7 +2366,7 @@ function visibleModuleSlots(module, kind) {
     processed: module.processedWafers.includes(module.wafers[index] ?? "")
   }));
 }
-function renderFrontSlotOverview(modules, waferOrigins = {}) {
+function renderFrontSlotOverview(modules, waferOrigins = {}, robots = [], layout = "single", device) {
   const visibleModules = modules.filter((module) => !isTopologyHiddenModule(module));
   const moduleNameOrder = (left, right) => {
     const leftName = left.module.name.trim();
@@ -1582,6 +2381,20 @@ function renderFrontSlotOverview(modules, waferOrigins = {}) {
   const loadPorts = visibleModules.filter((module) => isLoadPortName(module.name, module.type)).map((module) => ({ module, kind: "port" })).sort(moduleNameOrder);
   const coolers = visibleModules.filter((module) => isCoolerModule(module.name, module.type)).map((module) => ({ module, kind: "cooler" })).sort(moduleNameOrder);
   const loadLocks = visibleModules.filter((module) => isLoadLockName(module.name, module.type)).map((module) => ({ module, kind: "lock" })).sort(moduleNameOrder);
+  const bridgeNames = layout === "cascade" ? cascadeBridgeLoadLockNames(
+    Object.keys(device?.Stations ?? {}).filter((name) => loadLocks.some((item) => item.module.name === name)),
+    device,
+    robots.filter((robot) => robot.environment === "vacuum").map((robot) => robot.name)
+  ) : /* @__PURE__ */ new Set();
+  const lockPosition = (item) => moduleTopologyPosition(
+    item.module,
+    "lock",
+    0,
+    loadLocks.map((item2) => item2.module),
+    layout,
+    bridgeNames
+  );
+  if (robots.length && layout !== "dual") loadLocks.sort((left, right) => lockPosition(left).topPixels - lockPosition(right).topPixels || lockPosition(left).leftPercent - lockPosition(right).leftPercent);
   const splitRows = (items, columns) => Array.from({ length: Math.ceil(items.length / columns) }, (_, index) => items.slice(index * columns, (index + 1) * columns));
   const slotRows = [
     ...splitRows(loadLocks, 2),
@@ -1595,10 +2408,10 @@ function renderFrontSlotOverview(modules, waferOrigins = {}) {
       waferOrigins[slot.wafer] ?? `${module.name}.${slot.slot}`
     );
     const identity = `${module.name}.${slot.slot}`;
-    const detail = slot.wafer ? `${identity} \xB7 \u6676\u5706 ${slot.wafer}\uFF0C${slot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `${identity} \xB7 \u7A7A\u69FD`;
+    const detail = slot.wafer ? `${identity} \xB7 \u6676\u5706 ${waferSurfaceLabel(slot.wafer, waferOrigins[slot.wafer] ?? "")}\uFF0C${slot.processed ? "\u5DF2\u52A0\u5DE5" : "\u672A\u52A0\u5DE5"}` : `${identity} \xB7 \u7A7A\u69FD`;
     return `<span class="front-slot is-${state2}${dummy ? " is-dummy" : ""}" tabindex="0" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}"></span>`;
   }).join("");
-  if (!slotRows.length) return "";
+  if (!slotRows.length && !robots.length) return "";
   const renderModule2 = ({ module, kind }) => {
     const slots = visibleModuleSlots(module, kind);
     return `<div class="front-module">
@@ -1606,7 +2419,24 @@ function renderFrontSlotOverview(modules, waferOrigins = {}) {
       <div class="front-slot-board" style="--front-slot-count:${slots.length}" role="group" aria-label="${escapeHtml(`${module.name} \u6B63\u89C6\u69FD\u4F4D`)}">${renderSlots(slots, module)}</div>
     </div>`;
   };
-  const content = slotRows.map((row) => `<div class="front-slot-row front-slot-row-${row[0].kind}" style="--front-row-module-count:${row.length}">${row.map(renderModule2).join("")}</div>`).join("");
+  const positionedRows = slotRows.map((row) => {
+    const role = row[0].kind === "port" ? "port" : row[0].kind === "lock" ? "lock" : "auxiliary";
+    const peers = visibleModules.filter((module) => role === "port" ? isLoadPortName(module.name, module.type) : role === "lock" ? isLoadLockName(module.name, module.type) : isCoolerModule(module.name, module.type));
+    return {
+      top: moduleTopologyPosition(row[0].module, role, peers.indexOf(row[0].module), peers, layout, bridgeNames).topPixels,
+      category: role === "lock" ? 1 : role === "port" ? 2 : 3,
+      markup: `<div class="front-slot-row front-slot-row-${row[0].kind}" style="--front-row-module-count:${row.length}">${row.map(renderModule2).join("")}</div>`
+    };
+  });
+  for (const robot of robots) {
+    const peers = robots.filter((item) => item.environment === robot.environment);
+    positionedRows.push({
+      top: robotTopologyPosition(peers.indexOf(robot), peers.length, robot.environment, layout).topPixels,
+      category: 0,
+      markup: renderRobotSlotRow(robot, layout === "dual", (slots) => renderSlots(slots, robot), escapeHtml)
+    });
+  }
+  const content = positionedRows.sort((a, b) => layout === "dual" ? a.category - b.category || (a.category === 0 ? a.top - b.top : 0) : a.top - b.top).map((row) => row.markup).join("");
   return `<div class="topology-front-content" role="group" aria-label="\u8BBE\u5907\u6B63\u89C6\u69FD\u4F4D">${content}</div>`;
 }
 function renderLoadPortTopView(module, wafers, accessibleStatus, candidate) {
@@ -1617,9 +2447,8 @@ function renderLoadPortTopView(module, wafers, accessibleStatus, candidate) {
   const isDummy = isDummyPortName(module.name) || module.type.trim().toLowerCase() === "dummyport";
   return `<strong class="equipment-external-name equipment-external-name-port">${escapeHtml(module.name)}</strong>
     <article class="equipment-card equipment-port-top-view status-${module.status} door-${module.door} ${isDummy ? "is-dummy-port" : ""} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""}" aria-label="${escapeHtml(`${accessibleStatus}\uFF0C\u4FEF\u89C6\u88C5\u8F7D\u53F0\uFF0C\u5171 ${slots.length} \u4E2A\u69FD\u4F4D\uFF0C\u672A\u52A0\u5DE5 ${unprocessed}\uFF0C\u5DF2\u52A0\u5DE5 ${processed}${candidateLabel}`)}">
-      <span class="port-top-gate" aria-hidden="true"></span>
       <span class="port-top-cassette ${wafers ? "is-occupied" : "is-empty"}">${wafers || "<i></i>"}</span>
-    </article>`;
+    </article>${module.door === "doorless" ? "" : `<div class="external-module-doors door-${module.door}" title="${escapeHtml(DOOR_LABELS[module.door])}"><i class="external-module-door external-module-door-top"></i></div>`}`;
 }
 function renderModule(module, waferOrigins, role, candidate, layout = "single", roleIndex = 0, attachmentId = "") {
   const waferProgress = module.status === "processing" ? module.progress : 0;
@@ -1628,7 +2457,12 @@ function renderModule(module, waferOrigins, role, candidate, layout = "single", 
   const wafers = module.wafers.slice(0, visibleWaferCount).map((wafer) => renderWaferToken(wafer, waferOrigins[wafer] ?? "", waferProgress, processedWafers.has(wafer))).join("");
   const layerCount = role === "lock" && module.loadLockSlots.length ? module.loadLockSlots.filter((slot) => slot.wafer).length : module.wafers.length;
   const overflow = layerCount > visibleWaferCount ? `<span class="wafer-more">+ ${layerCount - visibleWaferCount}</span>` : "";
-  const doors = moduleDoorSides(module, role, layout, roleIndex, attachmentId).map((side) => `<i class="chamber-door chamber-door-${side}"></i>`).join("");
+  const doors = moduleDoorSides(module, role, layout, roleIndex, attachmentId).map((side) => {
+    const state2 = role === "lock" && (side === "top" || side === "bottom") ? module.loadLockDoors?.[side] ?? "closed" : module.door;
+    const direction = role === "lock" ? side === "top" ? module.loadLockDoors?.topLabel ?? "\u771F\u7A7A\u4FA7" : module.loadLockDoors?.bottomLabel ?? "\u5927\u6C14\u4FA7" : "";
+    const label = state2 === "unknown" ? "\u5F00\u95E8\u65B9\u5411\u672A\u77E5" : DOOR_LABELS[state2];
+    return `<i class="external-module-door external-module-door-${side} door-${state2}" title="${escapeHtml(`${direction}${label}`)}"></i>`;
+  }).join("");
   const accessibleStatus = `${module.name}\uFF0C${STATUS_LABELS[module.status]}\uFF0C${DOOR_LABELS[module.door]}`;
   const candidateLabel = candidate ? `${candidate.count} \u4E2A\u53EF\u884C\u52A8\u4F5C\uFF0C\u6700\u9AD8\u6A21\u578B\u504F\u597D ${(candidate.preference * 100).toFixed(0)}%` : "";
   if (role === "port") {
@@ -1681,8 +2515,8 @@ function renderModule(module, waferOrigins, role, candidate, layout = "single", 
   const article = `
     <article class="equipment-card equipment-${role} status-${module.status} door-${module.door} ${module.loadLockPhase ? `loadlock-${module.loadLockPhase}` : ""} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" style="--module-progress:${Math.round(module.progress * 100)}%;--loadlock-atmosphere:${Math.max(0, Math.min(100, atmosphereLevel)).toFixed(1)}%;--loadlock-atmosphere-ratio:${Math.max(0, Math.min(1, atmosphereLevel / 100)).toFixed(3)}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `\uFF0C${candidateLabel}` : ""}`)}">
        ${bodyMarkup}
-      <div class="chamber-doors" aria-hidden="true">${role === "lock" ? '<i class="loadlock-top-gate loadlock-top-gate-vacuum"></i><i class="loadlock-top-gate loadlock-top-gate-atmosphere"></i>' : doors}</div>
-    </article>`;
+    </article>
+    <div class="external-module-doors door-${module.door}" title="${escapeHtml(DOOR_LABELS[module.door])}">${doors}</div>`;
   if (role === "process" || role === "auxiliary" || role === "lock") {
     return `<strong class="equipment-external-name">${escapeHtml(module.name)}</strong>${article}`;
   }
@@ -1690,7 +2524,7 @@ function renderModule(module, waferOrigins, role, candidate, layout = "single", 
 }
 var ROBOT_DOUBLE_HOLD_CAPACITY = 2;
 var ROBOT_DISPLAY_WAFER_LIMIT = 2;
-function renderRobotHub(robot, waferOrigins, environment, angleDegrees) {
+function renderRobotHub(robot, waferOrigins, environment, angleDegrees, mechanismMarkup) {
   const visibleWafers = robot.wafers.slice(0, ROBOT_DISPLAY_WAFER_LIMIT);
   const capacityLabel = robot.capacity >= ROBOT_DOUBLE_HOLD_CAPACITY ? "\u53CC\u7247\u673A\u68B0\u624B" : "\u5355\u69FD\u673A\u68B0\u624B";
   const holdingLabel = robot.wafers.length ? `\uFF0C\u6301\u6709 ${robot.wafers.length} \u7247\u6676\u5706 ${robot.wafers.join("\u3001")}` : "\uFF0C\u69FD\u4F4D\u4E3A\u7A7A";
@@ -1699,15 +2533,14 @@ function renderRobotHub(robot, waferOrigins, environment, angleDegrees) {
   const overflow = robot.wafers.length > ROBOT_DISPLAY_WAFER_LIMIT ? `<span class="robot-held-overflow">+${robot.wafers.length - ROBOT_DISPLAY_WAFER_LIMIT}</span>` : "";
   return `
     <article class="robot-hub robot-hub-${environment} ${robot.busy ? "is-busy" : ""}" style="--robot-arm-angle:${angleDegrees.toFixed(1)}deg" aria-label="${escapeHtml(robot.name)}\uFF0C${capacityLabel}\uFF0C${robot.busy ? "\u5DE5\u4F5C\u4E2D" : "\u5F85\u547D"}${holdingLabel}">
-      <span class="robot-environment-badge">${escapeHtml(robot.name)}</span>
       <div class="robot-mechanism" aria-hidden="true">
         <span class="robot-base"><i></i></span>
-        <span class="robot-arm">
+        ${mechanismMarkup === void 0 ? `<span class="robot-arm">
           <i class="robot-arm-beam"></i>
           <span class="robot-end-effector ${visibleWafers.length ? "is-occupied" : "is-empty"}">
             <span class="robot-held-wafers">${waferMarkup}${overflow}</span>
           </span>
-        </span>
+        </span>` : mechanismMarkup}
       </div>
     </article>`;
 }
@@ -1718,9 +2551,11 @@ var TOPOLOGY_ITEM_SIZE = 96;
 var TOPOLOGY_PROCESS_WIDTH = 82;
 var TOPOLOGY_PROCESS_HEIGHT = 82;
 var TOPOLOGY_ROBOT_SIZE = 132;
+var TOPOLOGY_WAFER_OCCLUSION_RADII = { process: 24, port: 21, lock: 21, cooler: 16, aligner: 15 };
 var TOPOLOGY_LOADLOCK_WIDTH = 82;
 var TOPOLOGY_LOADLOCK_HEIGHT = 82;
 var TOPOLOGY_LOADLOCK_BRIDGE_GAP = 2;
+var TOPOLOGY_EXTERNAL_DOOR_CLEARANCE = 7;
 var TOPOLOGY_CASCADE_FRAME_WIDTH = 240;
 var TOPOLOGY_CASCADE_VTR1_HEIGHT = 128;
 var TOPOLOGY_TIGHT_LOADLOCK_ATTACHMENT_OFFSET = (TOPOLOGY_LOADLOCK_WIDTH + 1) / TOPOLOGY_CASCADE_FRAME_WIDTH;
@@ -1770,8 +2605,8 @@ var TOPOLOGY_MACHINE_FRAMES = {
       id: "vacuum-vtr-1",
       label: "",
       centerLeftPercent: 50,
-      /* 上移 8px，使 UBR/DBR 同时贴合 VTR_2 底边与 VTR_1 顶边。 */
-      centerTopPixels: 496,
+      /* 桥接腔上下两侧均预留外置门空间。 */
+      centerTopPixels: 496 + 2 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
       widthPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
       heightPixels: TOPOLOGY_CASCADE_VTR1_HEIGHT,
       shape: "flat"
@@ -1785,7 +2620,7 @@ var TOPOLOGY_ATMOSPHERE_FRAMES = {
     label: "",
     centerLeftPercent: 50,
     /* LoadLock 作为真空与大气框架之间的桥接腔。 */
-    centerTopPixels: 547,
+    centerTopPixels: 547 + 2 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
     widthPixels: 425,
     heightPixels: 150,
     shape: "atmosphere"
@@ -1794,7 +2629,7 @@ var TOPOLOGY_ATMOSPHERE_FRAMES = {
     id: "atmosphere-main",
     label: "",
     centerLeftPercent: 50,
-    centerTopPixels: 547,
+    centerTopPixels: 547 + 2 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
     widthPixels: 425,
     heightPixels: 150,
     shape: "atmosphere"
@@ -1803,7 +2638,7 @@ var TOPOLOGY_ATMOSPHERE_FRAMES = {
     id: "atmosphere-main",
     label: "",
     centerLeftPercent: 50,
-    centerTopPixels: 717,
+    centerTopPixels: 717 + 4 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
     widthPixels: 425,
     heightPixels: 150,
     shape: "atmosphere"
@@ -1836,12 +2671,12 @@ function topologyFrameAttachment(frame, attachmentId, side, offset, widthPixels,
   const horizontalOffset = offset * frameWidthPercent / 2;
   const verticalOffset = offset * frame.heightPixels / 2;
   return {
-    leftPercent: side === "left" ? frame.centerLeftPercent - frameWidthPercent / 2 - halfWidthPercent : side === "right" ? frame.centerLeftPercent + frameWidthPercent / 2 + halfWidthPercent : frame.centerLeftPercent + horizontalOffset,
-    topPixels: Math.round(side === "top" ? frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2 : side === "bottom" ? frame.centerTopPixels + frame.heightPixels / 2 + heightPixels / 2 : frame.centerTopPixels + verticalOffset),
+    leftPercent: side === "left" ? frame.centerLeftPercent - frameWidthPercent / 2 - halfWidthPercent - TOPOLOGY_EXTERNAL_DOOR_CLEARANCE / TOPOLOGY_VIEWBOX_WIDTH * 100 : side === "right" ? frame.centerLeftPercent + frameWidthPercent / 2 + halfWidthPercent + TOPOLOGY_EXTERNAL_DOOR_CLEARANCE / TOPOLOGY_VIEWBOX_WIDTH * 100 : frame.centerLeftPercent + horizontalOffset,
+    topPixels: Math.round(side === "top" ? frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2 - TOPOLOGY_EXTERNAL_DOOR_CLEARANCE : side === "bottom" ? frame.centerTopPixels + frame.heightPixels / 2 + heightPixels / 2 + TOPOLOGY_EXTERNAL_DOOR_CLEARANCE : frame.centerTopPixels + verticalOffset),
     widthPixels,
     heightPixels,
     attachmentId,
-    fixedLeftOffsetPixels: side === "left" ? -frame.widthPixels / 2 - widthPixels / 2 : side === "right" ? frame.widthPixels / 2 + widthPixels / 2 : horizontalOffset / 100 * TOPOLOGY_VIEWBOX_WIDTH
+    fixedLeftOffsetPixels: side === "left" ? -frame.widthPixels / 2 - widthPixels / 2 - TOPOLOGY_EXTERNAL_DOOR_CLEARANCE : side === "right" ? frame.widthPixels / 2 + widthPixels / 2 + TOPOLOGY_EXTERNAL_DOOR_CLEARANCE : horizontalOffset / 100 * TOPOLOGY_VIEWBOX_WIDTH
   };
 }
 function topologyVacuumAtmosphereLoadLockBridge(layout, lockIndex, atmosphereOffset) {
@@ -1866,7 +2701,7 @@ function topologyVacuumAtmosphereLoadLockBridge(layout, lockIndex, atmosphereOff
   );
   return {
     ...vacuumAttachment,
-    /* 两端框架的中心距由常量固定；保留大气锚点的纵坐标以表达两侧同时相切。 */
+    /* 两端框架的中心距由常量固定；保留大气锚点的纵坐标以表达两侧相同的门条间距。 */
     topPixels: atmosphereAttachment.topPixels,
     attachmentId: `${vacuumAttachment.attachmentId}|${atmosphereAttachment.attachmentId}`
   };
@@ -1880,11 +2715,11 @@ function topologyTightLoadLockOffsets(count, frameWidthPixels) {
     (_, index) => (index - (count - 1) / 2) * offsetStep
   );
 }
-function topologyFrameInteriorCorner(frame, attachmentId, horizontal, widthPixels, heightPixels) {
+function topologyFrameUpperUtilityAttachment(frame, attachmentId, horizontal, widthPixels, heightPixels) {
   const horizontalOffset = frame.widthPixels / 2 - TOPOLOGY_ATMOSPHERE_INTERIOR_INSET - widthPixels / 2;
   return {
     leftPercent: frame.centerLeftPercent + (horizontal === "left" ? -horizontalOffset : horizontalOffset) / TOPOLOGY_VIEWBOX_WIDTH * 100,
-    topPixels: frame.centerTopPixels - frame.heightPixels / 2 + TOPOLOGY_ATMOSPHERE_INTERIOR_INSET + heightPixels / 2,
+    topPixels: frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2 - TOPOLOGY_LOADLOCK_BRIDGE_GAP,
     widthPixels,
     heightPixels,
     attachmentId,
@@ -1909,9 +2744,9 @@ function detectTopologyLayout(modules, robotCount) {
 function detectDeviceTopologyLayout(device) {
   const robotCount = Object.keys(device?.Robots ?? {}).length;
   if (robotCount > 2) return "cascade";
-  const hasMultiProcessChamber = Object.values(device?.Stations ?? {}).some((station) => {
-    const type = String(station.Type ?? "");
-    return isMultiProcessChamberType(type) || /process|chamber/i.test(type) && finiteNumber(station.Capacity, 1) > 1;
+  const hasMultiProcessChamber = Object.values(device?.Stations ?? {}).some((station2) => {
+    const type = String(station2.Type ?? "");
+    return isMultiProcessChamberType(type) || /process|chamber/i.test(type) && finiteNumber(station2.Capacity, 1) > 1;
   });
   return hasMultiProcessChamber ? "dual" : "single";
 }
@@ -1923,8 +2758,8 @@ function configurationReferencesName(value, name) {
 }
 function cascadeBridgeLoadLockNames(orderedLoadLockNames, device, vacuumRobotNames) {
   const structurallyLinked = orderedLoadLockNames.filter((loadLockName) => {
-    const station = device?.Stations?.[loadLockName];
-    const linkedVacuumRobots = vacuumRobotNames.filter((robotName) => configurationReferencesName(station, robotName) || configurationReferencesName(device?.Robots?.[robotName], loadLockName));
+    const station2 = device?.Stations?.[loadLockName];
+    const linkedVacuumRobots = vacuumRobotNames.filter((robotName) => configurationReferencesName(station2, robotName) || configurationReferencesName(device?.Robots?.[robotName], loadLockName));
     return linkedVacuumRobots.length >= 2;
   });
   if (structurallyLinked.length) return new Set(structurallyLinked);
@@ -2085,18 +2920,34 @@ function moduleTopologyPosition(module, role, index, roleModules, layout, bridge
     };
   }
   if (isAlignerModule(module.name, module.type)) {
-    return topologyFrameInteriorCorner(
+    if (layout === "dual") return topologyFrameAttachment(
       topologyAtmosphereFrame(layout),
-      "atmosphere-aligner-top-left@inside",
+      "atmosphere-aligner@left",
+      "left",
+      0,
+      TOPOLOGY_ALIGNER_WIDTH,
+      TOPOLOGY_ALIGNER_HEIGHT
+    );
+    return topologyFrameUpperUtilityAttachment(
+      topologyAtmosphereFrame(layout),
+      "atmosphere-aligner-top-left@top",
       "left",
       TOPOLOGY_ALIGNER_WIDTH,
       TOPOLOGY_ALIGNER_HEIGHT
     );
   }
   if (role === "auxiliary" && isCoolerModule(module.name, module.type)) {
-    return topologyFrameInteriorCorner(
+    if (layout === "dual") return topologyFrameAttachment(
       topologyAtmosphereFrame(layout),
-      "atmosphere-cooler-top-right@inside",
+      "atmosphere-cooler@right",
+      "right",
+      0,
+      TOPOLOGY_COOLER_WIDTH,
+      TOPOLOGY_COOLER_HEIGHT
+    );
+    return topologyFrameUpperUtilityAttachment(
+      topologyAtmosphereFrame(layout),
+      "atmosphere-cooler-top-right@top",
       "right",
       TOPOLOGY_COOLER_WIDTH,
       TOPOLOGY_COOLER_HEIGHT
@@ -2231,13 +3082,14 @@ function isModuleFilteredOut(module, hiddenFilters) {
   return hiddenFilters.has("aligner") && (/^(AL|ALIGNER)$/.test(normalized) || type === "aligner") || hiddenFilters.has("cooler") && (/^(CL|COOL(?:ER)?)$/.test(normalized) || type === "cooler");
 }
 function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
-  const visibleModules = snapshot.modules.filter((module) => !isTopologyHiddenModule(module) && !isModuleFilteredOut(module, hiddenFilters));
+  const layout = device ? detectDeviceTopologyLayout(device) : detectTopologyLayout(snapshot.modules, snapshot.robots.length);
+  const projection = projectTopologyTransfers(snapshot, device);
+  const visibleModules = projection.modules.filter((module) => !isTopologyHiddenModule(module) && !isModuleFilteredOut(module, hiddenFilters));
   const groups = topologyGroups(visibleModules);
   const destinations = candidateDestinations(decision);
   const atmosphereRobots = snapshot.robots.filter((robot) => robot.environment === "atmosphere" || !robot.environment && /^(ATR|ATM)/i.test(robot.name));
   const atmosphereNames = new Set(atmosphereRobots.map((robot) => robot.name));
   const vacuumRobots = snapshot.robots.filter((robot) => !atmosphereNames.has(robot.name));
-  const layout = device ? detectDeviceTopologyLayout(device) : detectTopologyLayout(visibleModules, snapshot.robots.length);
   const machineFrames = TOPOLOGY_MACHINE_FRAMES[layout].map((frame) => ({ ...frame }));
   const processChamberViews = layout === "dual" ? expandDualProcessChambers(groups.processModules) : groups.processModules.map((module) => ({ view: module, sourceName: module.name }));
   const processSourceNames = new Map(processChamberViews.map((item) => [item.view.name, item.sourceName]));
@@ -2338,10 +3190,26 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
     renderModuleGroup(groups.auxiliaryModules, "auxiliary")
   ].join("");
   const renderRobotGroup = (robots, environment) => robots.map((robot) => {
-    const position = robotPositions.get(robot.name);
-    if (!position) return "";
+    const originalPosition = robotPositions.get(robot.name);
+    if (!originalPosition) return "";
+    const position = { ...originalPosition };
+    if (environment === "atmosphere" && robot.railMotion?.target) {
+      const motion = robot.railMotion;
+      const source = modulePositions.get(motion.source);
+      const destination = modulePositions.get(motion.target);
+      const sourceX = source?.fixedLeftOffsetPixels ?? (source ? (source.leftPercent - 50) / 100 * TOPOLOGY_VIEWBOX_WIDTH : 0);
+      const destinationX = destination?.fixedLeftOffsetPixels ?? (destination ? (destination.leftPercent - 50) / 100 * TOPOLOGY_VIEWBOX_WIDTH : sourceX);
+      const progress = motion.progress * motion.progress * (3 - 2 * motion.progress);
+      const offset = sourceX + (destinationX - sourceX) * progress;
+      position.fixedLeftOffsetPixels = offset;
+      position.leftPercent = 50 + offset / TOPOLOGY_VIEWBOX_WIDTH * 100;
+    }
+    const activeMove = snapshot.activeMoves.find((move) => move.ModuleName === robot.name);
+    const transferring = activeMove && (PICK_MOVE_TYPES.has(activeMove.MoveType) || PLACE_MOVE_TYPES.has(activeMove.MoveType) || activeMove.MoveType === SWAP_MOVE2);
     const target = robot.target || decisionTargetForRobot(robot, decision);
-    const targetPosition = robotTargetTopologyPosition(robot, target, modulePositions);
+    const pairedLoadLock = (station2) => layout === "dual" && environment === "vacuum" && /^(LA|LB|LC|LD)$/i.test(station2) && Boolean(activeMove) && ["RobotSlotList", "RecvSlotList", "SendSlotList"].some((field) => listValue(activeMove?.[field]).length >= 2);
+    const transferPosition = (station2) => pairedLoadLock(station2) ? robotTargetTopologyPosition(robot, "LA", modulePositions) : modulePositions.get(station2);
+    const targetPosition = transferring ? transferPosition(target) : robotTargetTopologyPosition(robot, target, modulePositions);
     const targetAngle = targetPosition ? Math.atan2(
       targetPosition.topPixels - position.topPixels,
       targetPosition.leftPercent / 100 * TOPOLOGY_VIEWBOX_WIDTH - position.leftPercent / 100 * TOPOLOGY_VIEWBOX_WIDTH
@@ -2359,8 +3227,46 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
       }
     }
     const angleDegrees = armAngle * 180 / Math.PI;
+    const distance = targetPosition ? Math.hypot(
+      targetPosition.topPixels - position.topPixels,
+      (targetPosition.leftPercent - position.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH
+    ) : 0;
+    const mechanism = renderParallelRobotArms(
+      projection.animations.get(robot.name) ?? [],
+      distance,
+      (wafer) => `<span class="robot-held-wafer robot-held-wafer-0">${renderWaferToken(
+        wafer,
+        snapshot.waferOrigins[wafer] ?? "",
+        0,
+        robot.processedWafers.includes(wafer) || snapshot.modules.some((module) => module.processedWafers.includes(wafer))
+      )}</span>`,
+      escapeHtml,
+      (station2) => {
+        const target2 = transferPosition(station2);
+        if (!target2) return void 0;
+        const dx = (target2.leftPercent - position.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH;
+        const dy = target2.topPixels - position.topPixels;
+        const firstChamber = modulePositions.get(pairedLoadLock(station2) ? "LA" : `${station2}-1`);
+        const secondChamber = modulePositions.get(pairedLoadLock(station2) ? "LB" : `${station2}-2`);
+        const targetRadians = Math.atan2(dy, dx);
+        const slotSpacing = firstChamber && secondChamber ? -(secondChamber.leftPercent - firstChamber.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH * Math.sin(targetRadians) + (secondChamber.topPixels - firstChamber.topPixels) * Math.cos(targetRadians) : void 0;
+        return { distance: Math.hypot(dx, dy), angle: targetRadians * 180 / Math.PI - angleDegrees, slotSpacing };
+      },
+      [...processChamberViews.map((item) => item.view), ...groups.loadLocks, ...groups.loadPorts, ...groups.auxiliaryModules].filter((module) => module.wafers.length > 0).flatMap((module) => {
+        const location = modulePositions.get(module.name);
+        if (!location) return [];
+        const dx = (location.leftPercent - position.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH;
+        const dy = location.topPixels - position.topPixels;
+        const type = module.type.toLowerCase();
+        const radius = type.includes("loadport") || type.includes("dummyport") ? TOPOLOGY_WAFER_OCCLUSION_RADII.port : type.includes("loadlock") ? TOPOLOGY_WAFER_OCCLUSION_RADII.lock : type.includes("cooler") ? TOPOLOGY_WAFER_OCCLUSION_RADII.cooler : type.includes("aligner") ? TOPOLOGY_WAFER_OCCLUSION_RADII.aligner : TOPOLOGY_WAFER_OCCLUSION_RADII.process;
+        return [{ x: dx * Math.cos(armAngle) + dy * Math.sin(armAngle), y: -dx * Math.sin(armAngle) + dy * Math.cos(armAngle), radius }];
+      }),
+      robot.name,
+      environment === "atmosphere" ? "telescopic" : "articulated",
+      layout === "dual" && environment === "vacuum"
+    );
     const fixedLeft = position.fixedLeftOffsetPixels === void 0 ? "" : `;--fixed-left:calc(50% ${position.fixedLeftOffsetPixels < 0 ? "-" : "+"} ${Math.abs(position.fixedLeftOffsetPixels)}px)`;
-    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px${fixedLeft}">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees)}</div>`;
+    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px${fixedLeft}">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees, mechanism)}</div>`;
   }).join("");
   const robotMarkup = renderRobotGroup(vacuumRobots, "vacuum") + renderRobotGroup(atmosphereRobots, "atmosphere");
   return `
@@ -2376,6 +3282,7 @@ function renderEquipmentTopology(snapshot, decision, hiddenFilters, device) {
         </div>
         ${machineAreaMarkup}
         ${machineFrameMarkup}
+        ${atmosphereRobots.length ? `<div class="topology-atmosphere-rail" aria-label="\u5927\u6C14\u673A\u68B0\u624B\u8F68\u9053" style="top:${atmosphereFrame.centerTopPixels}px;width:${atmosphereFrame.widthPixels - TOPOLOGY_ATMOSPHERE_INTERIOR_INSET * 2}px"></div>` : ""}
         ${attachmentPointMarkup}
         ${moduleMarkup}
         ${robotMarkup}
@@ -2394,9 +3301,9 @@ function formatActionEndpoint(name, slot) {
 }
 function formatActionPath(action) {
   const kindLabels = { pick: "Pick", place: "Place", swap: "Swap" };
-  const materialId = action.materialIds[0] || "";
+  const materialIds2 = action.materialIds.filter(Boolean).join(",");
   const kindLabel = kindLabels[action.kind];
-  const prefix = materialId ? `${kindLabel}(${materialId})` : kindLabel;
+  const prefix = materialIds2 ? `${kindLabel}(${materialIds2})` : kindLabel;
   const source = formatActionEndpoint(action.source, action.sourceSlot);
   const destination = formatActionEndpoint(action.destination, action.destinationSlot);
   const path = [source, destination].filter(Boolean).join(" \u2192 ");
@@ -2501,31 +3408,20 @@ function groupedBottleneckResources(performance2) {
 }
 function renderBottleneckAnalysis(performance2) {
   const { window: window2 } = performance2;
-  const confidenceLabels = { high: "\u8BC1\u636E\u8F83\u5F3A", medium: "\u8BC1\u636E\u4E2D\u7B49", low: "\u8BC1\u636E\u8F83\u5F31" };
-  const resourceKindLabels = {
-    robot: "\u673A\u68B0\u624B",
-    process: "\u5DE5\u827A\u8154",
-    loadlock: "LoadLock",
-    loadport: "LoadPort",
-    auxiliary: "\u8F85\u52A9\u6A21\u5757"
-  };
   const displayedResources = groupedBottleneckResources(performance2).slice(0, 3);
   const resourceRows = (items) => items.map((resource, index) => {
     const candidate = resource.candidate;
     const evidenceScore = candidate ? Math.round(candidate.score * 100) : null;
-    const evidenceLabel = candidate ? confidenceLabels[candidate.confidence] : "\u672A\u5165\u9009\u5019\u9009";
-    const resourceLabel = resource.memberNames.length > 1 ? `${resourceKindLabels[resource.kind]} \xB7 ${resource.memberNames.length} \u53F0\u5E73\u5747` : resourceKindLabels[resource.kind];
     return `
       <li class="resource-utilization-row">
         <div class="resource-utilization-summary">
           <div class="resource-utilization-name">
             <span>${index + 1}</span>
-            <div><strong>${escapeHtml(resource.name)}</strong><small>${escapeHtml(resourceLabel)}</small></div>
+            <div><strong>${escapeHtml(resource.name)}</strong></div>
           </div>
           <strong class="resource-utilization-percent">${formatPercent(resource.utilization)}</strong>
           <div class="utilization-track" aria-label="${escapeHtml(resource.name)} \u5360\u7528\u7387 ${formatPercent(resource.utilization)}">${renderCategoryBars(resource, window2.duration)}</div>
-          <div class="resource-evidence-score"><strong>${evidenceScore ?? "\u2014"}</strong><small>${evidenceLabel}</small></div>
-          <span aria-hidden="true"></span>
+          <div class="resource-evidence-score" aria-label="\u74F6\u9888\u8BC1\u636E\u5F97\u5206 ${evidenceScore ?? "\u65E0\u5019\u9009\u5206\u6570"}"><strong>${evidenceScore ?? "\u2014"}</strong></div>
         </div>
       </li>`;
   }).join("");
@@ -2551,9 +3447,9 @@ function renderResidenceMetricChart(samples, kind) {
     robot: { title: "\u673A\u5668\u624B\u9A7B\u7559\u65F6\u95F4", label: "\u673A\u5668\u624B\u9A7B\u7559", value: (sample) => sample.robotDwellSeconds ?? 0 }
   };
   const metric = definitions[kind];
-  const values = samples.map(metric.value);
-  const meanSeconds = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const maximumSeconds = Math.max(...values, 1);
+  const values4 = samples.map(metric.value);
+  const meanSeconds = values4.reduce((sum, value) => sum + value, 0) / values4.length;
+  const maximumSeconds = Math.max(...values4, 1);
   const plotHeight = 150;
   const scaleMaximum = maximumSeconds * 1.08;
   const meanHeight = Math.min(meanSeconds / scaleMaximum * plotHeight, plotHeight);
@@ -2590,12 +3486,12 @@ function renderWaferResidenceChart(performance2) {
   const systemValues = samples.map((sample) => sample.duration);
   const chamberValues = samples.map((sample) => sample.chamberDwellSeconds ?? 0);
   const robotValues = samples.map((sample) => sample.robotDwellSeconds ?? 0);
-  const metricSummary = (values, label) => {
-    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
-    const deviation = Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+  const metricSummary = (values4, label) => {
+    const mean = values4.reduce((sum, value) => sum + value, 0) / values4.length;
+    const deviation = Math.sqrt(values4.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values4.length);
     const upperControlLimit = mean + deviation * 2;
-    const abnormalCount = values.filter((value) => value > upperControlLimit).length;
-    return `<span><small>\u5E73\u5747</small><b>${formatSeconds2(mean)}</b><em>s</em></span><span><small>\u6700\u5927</small><b>${formatSeconds2(Math.max(...values))}</b><em>s</em></span><span class="${abnormalCount ? "is-warning" : ""}"><small>\u504F\u9AD8\u6BD4\u4F8B</small><b>${(abnormalCount / values.length * 100).toFixed(1)}</b><em>%</em></span><span><small>\u6837\u672C</small><b>${values.length}</b><em>\u7247</em></span><span class="visually-hidden">${label}</span>`;
+    const abnormalCount = values4.filter((value) => value > upperControlLimit).length;
+    return `<span><small>\u5E73\u5747</small><b>${formatSeconds2(mean)}</b><em>s</em></span><span><small>\u6700\u5927</small><b>${formatSeconds2(Math.max(...values4))}</b><em>s</em></span><span class="${abnormalCount ? "is-warning" : ""}"><small>\u504F\u9AD8\u6BD4\u4F8B</small><b>${(abnormalCount / values4.length * 100).toFixed(1)}</b><em>%</em></span><span><small>\u6837\u672C</small><b>${values4.length}</b><em>\u7247</em></span><span class="visually-hidden">${label}</span>`;
   };
   const summary = (kind, content) => `<div class="analysis-compact-stats residence-chart-summary" data-residence-summary="${kind}"${kind === "system" ? "" : " hidden"}>${content}</div>`;
   return `
@@ -2650,8 +3546,9 @@ function simplifyThroughputPoints(points) {
   selected.push(points[points.length - 1]);
   return selected;
 }
-function renderThroughputSvg(points, title) {
-  const width = 760;
+function renderThroughputSvg(points, title, chartWidth = 760) {
+  if (!points.length) return '<div class="analysis-empty-state">\u5F53\u524D\u65F6\u523B\u6837\u672C\u4E0D\u8DB3</div>';
+  const width = Math.max(240, chartWidth);
   const height = 174;
   const left = 12;
   const right = 12;
@@ -2662,9 +3559,9 @@ function renderThroughputSvg(points, title) {
   const allValues = points.map((point) => Math.max(0, Number(point.throughputPerHour) || 0));
   const mean = allValues.reduce((sum, value) => sum + value, 0) / allValues.length;
   const displayPoints = simplifyThroughputPoints(points);
-  const values = displayPoints.map((point) => Math.max(0, Number(point.throughputPerHour) || 0));
-  const observedMinimum = Math.min(...values);
-  const observedMaximum = Math.max(...values);
+  const values4 = displayPoints.map((point) => Math.max(0, Number(point.throughputPerHour) || 0));
+  const observedMinimum = Math.min(...values4);
+  const observedMaximum = Math.max(...values4);
   const spread = Math.max(observedMaximum - observedMinimum, Math.max(mean * 0.04, 1));
   const padding = Math.max(1, spread * 0.18);
   const step = spread > 20 ? 5 : spread > 8 ? 2 : 1;
@@ -2676,7 +3573,7 @@ function renderThroughputSvg(points, title) {
   const indexRange = Math.max(1, lastIndex - firstIndex);
   const coordinates = displayPoints.map((point, index) => ({
     x: left + (point.completedWaferIndex - firstIndex) / indexRange * usableWidth,
-    y: top + (1 - (values[index] - minimum) / yRange) * usableHeight
+    y: top + (1 - (values4[index] - minimum) / yRange) * usableHeight
   }));
   const linePath = coordinates.length === 1 ? `M ${coordinates[0].x.toFixed(2)} ${coordinates[0].y.toFixed(2)}` : coordinates.reduce((path, point, index) => {
     if (index === 0) return `M ${point.x.toFixed(2)} ${point.y.toFixed(2)}`;
@@ -2685,13 +3582,14 @@ function renderThroughputSvg(points, title) {
   const latest = displayPoints[displayPoints.length - 1];
   const yForValue = (value) => top + (1 - (value - minimum) / yRange) * usableHeight;
   const meanY = yForValue(mean);
-  const labelStride = Math.max(1, Math.ceil(displayPoints.length / MAXIMUM_THROUGHPUT_VALUE_LABELS));
+  const labelCapacity = Math.min(MAXIMUM_THROUGHPUT_VALUE_LABELS, Math.max(3, Math.floor(width / 60)));
+  const labelStride = Math.max(1, Math.ceil(displayPoints.length / labelCapacity));
   const pointTargets = displayPoints.map((point, index) => {
     const coordinate = coordinates[index];
-    const value = values[index];
-    const previousValue = values[index - 1] ?? value;
-    const nextValue = values[index + 1] ?? value;
-    const isLocalMinimum = index > 0 && index < values.length - 1 && value <= previousValue && value <= nextValue;
+    const value = values4[index];
+    const previousValue = values4[index - 1] ?? value;
+    const nextValue = values4[index + 1] ?? value;
+    const isLocalMinimum = index > 0 && index < values4.length - 1 && value <= previousValue && value <= nextValue;
     const labelY = isLocalMinimum ? Math.min(top + usableHeight - 4, coordinate.y + 17) : Math.max(top + 10, coordinate.y - 9);
     const labelClass = isLocalMinimum ? "throughput-chart-value is-below" : "throughput-chart-value";
     const showLabel = index === 0 || index === displayPoints.length - 1 || index % labelStride === 0;
@@ -2725,7 +3623,7 @@ function updateThroughputChartRange(chart, range) {
   const points = filterThroughputPoints(JSON.parse(rawPoints), range);
   const canvas = chart.querySelector(".throughput-chart-canvas");
   if (!canvas || !points.length) return;
-  canvas.innerHTML = renderThroughputSvg(points, title);
+  canvas.innerHTML = renderThroughputSvg(points, title, canvas.clientWidth || 760);
 }
 function renderThroughputChart(performance2) {
   const timeline = performance2.throughputTimeline;
@@ -2766,7 +3664,7 @@ function renderThroughputChart(performance2) {
       <div class="analysis-section-title"><strong>\u4EA7\u80FD\u5206\u6790</strong></div>
       <div class="analysis-filter-group">
       <label class="analysis-filter throughput-metric-control"><select id="throughputMetricSelect" aria-label="\u9009\u62E9\u4EA7\u80FD\u53E3\u5F84">
-        <option value="cumulative">\u7D2F\u8BA1\u4EA7\u80FD\uFF08\u516C\u53F8\u53E3\u5F84\uFF09</option>
+        <option value="cumulative">\u7D2F\u8BA1\u4EA7\u80FD\uFF08\u4ECE 0 \u5F00\u59CB\uFF09</option>
         <option value="rolling" selected>\u6ED1\u52A8\u7A97\u53E3</option>
       </select></label>
       <label class="analysis-filter throughput-window-control" data-throughput-window-control><select id="throughputWindowSize" aria-label="\u6ED1\u52A8\u7A97\u53E3\u5927\u5C0F">${windowOptions.map((windowSize) => `<option value="${windowSize}"${windowSize === defaultWindow ? " selected" : ""}>${windowSize} \u7247</option>`).join("")}</select></label>
@@ -2815,15 +3713,15 @@ function renderSchedulePerformance(performance2) {
       </div>
     </section>
 
-    <section class="result-card throughput-analysis-card">
+    <section class="analysis-window throughput-analysis-card" data-analysis-window="throughput">
       ${renderThroughputChart(performance2)}
     </section>
 
-    <section class="result-card bottleneck-analysis-card">
+    <section class="analysis-window bottleneck-analysis-card" data-analysis-window="bottleneck">
       ${renderBottleneckAnalysis(performance2)}
     </section>
 
-    <section class="result-card wafer-residence-card">
+    <section class="analysis-window wafer-residence-card" data-analysis-window="residence">
       ${renderWaferResidenceChart(performance2)}
     </section>
 
@@ -2838,6 +3736,8 @@ var VisualizationWorkspace = class {
   moves = [];
   loadPortReplenishments = [];
   replayPlan = null;
+  actionsEnabled = false;
+  waferProgressEnabled = false;
   actionStatusFilters = [...ALL_ACTION_DIAGNOSTIC_STATUSES];
   liveDecision = null;
   liveDecisionKey = "";
@@ -2870,8 +3770,22 @@ var VisualizationWorkspace = class {
     const selectedFilters = this.elements.actionStatusFilters.filter((item) => item.checked).map((item) => item.value);
     if (selectedFilters.length) this.actionStatusFilters = selectedFilters;
     this.bindEvents();
+    const inspectorDock = root.querySelector(".replay-inspector-dock");
+    if (inspectorDock) mountReplayInspectorDock(inspectorDock);
     this.updatePlayButton();
     this.setTopologyVisible(false);
+  }
+  /** 按设备类型设置原始画布尺寸，固定 100% 比例；外层负责居中与页面滚动。 */
+  configureTopologyCanvas() {
+    const canvas = this.elements.stage.closest(".topology-unified-canvas");
+    if (!canvas) return;
+    const slotOverviewWidth = 180;
+    const compactMachineWidth = 700;
+    const layout = this.elements.stage.querySelector(".equipment-schematic")?.dataset.topologyLayout;
+    const machineWidth = layout === "dual" ? TOPOLOGY_VIEWBOX_WIDTH : compactMachineWidth;
+    const fullCanvasWidth = slotOverviewWidth + machineWidth;
+    canvas.style.width = `${fullCanvasWidth}px`;
+    canvas.style.gridTemplateColumns = `${slotOverviewWidth}px ${machineWidth}px`;
   }
   /** 更新当前设备拓扑；已有 MoveList 会立即按新拓扑重绘。 */
   setDevice(device) {
@@ -2917,7 +3831,11 @@ var VisualizationWorkspace = class {
         if (replayContext && typeof replayContext === "object" && !Array.isArray(replayContext)) {
           const embeddedPlan = replayContext.plan;
           if (embeddedPlan && typeof embeddedPlan === "object" && !Array.isArray(embeddedPlan)) {
-            this.setReplayPlan(embeddedPlan);
+            const plan = embeddedPlan;
+            this.device = plan.device || this.device;
+            this.analysisRoutes = structuredClone(plan.routes || []);
+            this.analysisRounds = structuredClone(plan.rounds || []);
+            this.setReplayPlan(plan);
           }
         }
       }
@@ -2953,6 +3871,9 @@ var VisualizationWorkspace = class {
     this.liveDecisionKey = "";
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     this.replayDecisionRequestVersion += 1;
+    if (this.elements.exportDiagnosticButton) {
+      this.elements.exportDiagnosticButton.disabled = !this.replayPlan || !this.moves.length;
+    }
     if (this.moves.length) this.render();
   }
   /** 在完整 MoveList 返回前显示初始拓扑，并进入增量求解状态。 */
@@ -2978,6 +3899,7 @@ var VisualizationWorkspace = class {
     this.elements.playButton.disabled = true;
     this.elements.openGantt.href = "#";
     this.elements.openGantt.setAttribute("aria-disabled", "true");
+    if (this.elements.exportDiagnosticButton) this.elements.exportDiagnosticButton.disabled = true;
     this.showSingleResult();
     this.setTopologyVisible(true);
     this.render(buildWorkspaceSnapshot([], this.device, 0));
@@ -2988,6 +3910,9 @@ var VisualizationWorkspace = class {
     const previousTime = this.time;
     this.pause();
     this.moves = normalizeMovePayload({ MoveList: rawMoves });
+    if (this.elements.exportDiagnosticButton) {
+      this.elements.exportDiagnosticButton.disabled = !this.replayPlan;
+    }
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     const latestSnapshot = buildWorkspaceSnapshot(
       this.moves,
@@ -3030,12 +3955,9 @@ var VisualizationWorkspace = class {
   getTerminalDeadlock() {
     return detectTerminalPlaybackDeadlock(this.moves, this.device, this.replayPlan);
   }
-  /** 切换到工作台标签。 */
+  /** 单次结果入口直接进入回放诊断；结果分析页仅用于测试组报告。 */
   show() {
-    if (this.moves.length) this.showSingleResult();
-    const tab = this.root.querySelector('[data-tab-target="workspace"]');
-    tab?.click();
-    this.elements.performanceWindow.focus({ preventScroll: true });
+    this.showPlayback();
   }
   /** 显示测试组统计，并隐藏当前单例诊断；独立回放页保留已加载的数据。 */
   showGroupAnalysis(markup) {
@@ -3071,7 +3993,7 @@ var VisualizationWorkspace = class {
     this.bottleneckSummary = null;
     this.analysisRequestVersion += 1;
     this.time = 0;
-    this.elements.resultButton.disabled = true;
+    if (this.elements.resultButton) this.elements.resultButton.disabled = true;
     this.elements.range.disabled = false;
     this.elements.playButton.disabled = false;
     this.elements.openGantt.href = "#";
@@ -3087,7 +4009,7 @@ var VisualizationWorkspace = class {
     this.elements.empty.innerHTML = `
       <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="3"/><path d="M8 9h8M8 13h5"/></svg>
       <strong>\u7B49\u5F85\u5206\u6790\u6570\u636E</strong>
-      <span>\u8FD0\u884C\u4E00\u6B21\u8BA1\u5212\uFF0C\u6216\u5728\u62D3\u6251\u56DE\u653E\u754C\u9762\u5BFC\u5165\u5DF2\u6709\u7684 MoveList JSON \u6587\u4EF6\u540E\u67E5\u770B\u7ED3\u679C\u5206\u6790\u3002</span>`;
+      <span>\u6279\u91CF\u8FD0\u884C\u6D4B\u8BD5\u7EC4\u540E\uFF0C\u5728\u7ED3\u679C\u9884\u89C8\u4E2D\u9009\u62E9\u201C\u6D4B\u8BD5\u7EC4\u7ED3\u679C\u5206\u6790\u201D\u3002\u5355\u6B21\u6D4B\u8BD5\u8BF7\u4F7F\u7528\u56DE\u653E\u8BCA\u65AD\u3002</span>`;
     this.elements.playbackEmpty.classList.remove("is-loading", "is-error");
     this.elements.playbackEmpty.innerHTML = `
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="m7 7.3 2.8 2.8M17 7.3l-2.8 2.8M7 16.7l2.8-2.8M17 16.7l-2.8-2.8"/></svg>
@@ -3126,7 +4048,10 @@ var VisualizationWorkspace = class {
     this.elements.playButton.disabled = false;
     this.elements.openGantt.href = resultUrl ? `/movelist_gantt_viewer.html?src=${encodeURIComponent(resultUrl)}` : "#";
     this.elements.openGantt.setAttribute("aria-disabled", resultUrl ? "false" : "true");
-    this.elements.resultButton.disabled = false;
+    if (this.elements.exportDiagnosticButton) {
+      this.elements.exportDiagnosticButton.disabled = !this.replayPlan;
+    }
+    if (this.elements.resultButton) this.elements.resultButton.disabled = false;
     this.showSingleResult();
     this.setTopologyVisible(true);
     this.render(snapshot);
@@ -3134,7 +4059,23 @@ var VisualizationWorkspace = class {
   }
   /** 绑定文件、时间轴、播放和快捷控制事件。 */
   bindEvents() {
+    this.elements.performance.addEventListener("change", () => {
+      updateReplayThroughput(this.root, this.time, updateThroughputChartRange);
+    });
+    this.root.getElementById("visualWaferProgressEnabled")?.addEventListener("change", (event) => {
+      this.waferProgressEnabled = event.target.checked;
+      this.render();
+    });
+    this.root.getElementById("visualActionsEnabled")?.addEventListener("change", (event) => {
+      this.actionsEnabled = event.target.checked;
+      this.replayDecisionRequestVersion += 1;
+      this.pendingReplayDecisionKeys.clear();
+      this.render();
+    });
     this.elements.importButton?.addEventListener("click", () => this.elements.fileInput.click());
+    this.elements.exportDiagnosticButton?.addEventListener("click", () => {
+      void this.exportDeadlockDiagnostic();
+    });
     this.elements.fileInput.addEventListener("change", () => {
       const file = this.elements.fileInput.files?.item(0);
       if (!file) return;
@@ -3161,10 +4102,45 @@ var VisualizationWorkspace = class {
       this.performanceWindowMode = this.elements.performanceWindow.value === "full" ? "full" : "steady";
       void this.renderPerformance();
     });
-    this.elements.resultButton.addEventListener("click", () => this.show());
+    this.elements.resultButton?.addEventListener("click", () => this.show());
     this.elements.openGantt.addEventListener("click", (event) => {
       if (this.elements.openGantt.getAttribute("aria-disabled") === "true") event.preventDefault();
     });
+  }
+  /** 导出当前回放帧及算法候选动作，供离线复现死锁。 */
+  async exportDeadlockDiagnostic() {
+    if (!this.moves.length || !this.replayPlan) {
+      this.showError("\u5F53\u524D MoveList \u7F3A\u5C11\u5B8C\u6574\u8BA1\u5212\uFF0C\u65E0\u6CD5\u91CD\u5EFA Machine \u8BCA\u65AD\u4E0A\u4E0B\u6587");
+      return;
+    }
+    const button = this.elements.exportDiagnosticButton;
+    if (button) button.disabled = true;
+    try {
+      const snapshot = buildWorkspaceSnapshot(
+        this.moves,
+        this.device,
+        this.time,
+        this.loadPortReplenishments
+      );
+      const result = await requestDeadlockDiagnostic({
+        resultId: this.analysisResultId || void 0,
+        moves: this.analysisResultId ? void 0 : this.moves,
+        plan: this.analysisResultId ? void 0 : this.replayPlan,
+        time: this.time,
+        includeActions: this.actionsEnabled,
+        snapshot
+      });
+      const downloadUrl = URL.createObjectURL(result.blob);
+      const link = this.root.createElement("a");
+      link.href = downloadUrl;
+      link.download = result.fileName;
+      link.click();
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      this.showError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (button) button.disabled = false;
+    }
   }
   /** 从当前时间开始播放；到达末尾时自动回到起点。 */
   play() {
@@ -3213,12 +4189,10 @@ var VisualizationWorkspace = class {
     this.elements.playButton.setAttribute("aria-label", this.playing ? "\u6682\u505C\u56DE\u653E" : "\u64AD\u653E\u56DE\u653E");
     this.elements.playButton.classList.toggle("is-playing", this.playing);
   }
-  /** 切换单例分析模式，测试组统计与单例诊断不会同时出现。 */
+  /** 单次结果只更新回放，不改变首页已经生成的批量报告。 */
   showSingleResult() {
     this.elements.toolbar.hidden = false;
-    this.elements.groupAnalysis.hidden = true;
-    this.elements.empty.hidden = true;
-    this.elements.content.hidden = false;
+    this.elements.content.hidden = true;
     this.elements.playbackEmpty.hidden = true;
   }
   /** 统一切换独立回放页中的概要、时间轴、拓扑与当前动作。 */
@@ -3252,8 +4226,8 @@ var VisualizationWorkspace = class {
       this.liveDecision = cachedDecision;
       this.liveDecisionKey = replayKey;
     }
-    const currentDecision = cachedDecision ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null);
-    if (this.replayPlan && !this.liveSolving && !cachedDecision && this.liveDecisionKey !== replayKey && !this.pendingReplayDecisionKeys.has(replayKey) && this.replayDecisionErrorKey !== replayKey) {
+    const currentDecision = this.actionsEnabled ? cachedDecision ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null) : null;
+    if (this.actionsEnabled && this.replayPlan && !this.liveSolving && !cachedDecision && this.liveDecisionKey !== replayKey && !this.pendingReplayDecisionKeys.has(replayKey) && this.replayDecisionErrorKey !== replayKey) {
       void this.refreshReplayDecision(replayKey, replayTime);
     }
     const topologySnapshot = snapshotWithFullDeviceModules(
@@ -3271,15 +4245,32 @@ var VisualizationWorkspace = class {
     this.elements.frontSlotOverview.style.setProperty("--topology-canvas-height", canvasHeight);
     this.elements.frontSlotOverview.innerHTML = renderFrontSlotOverview(
       topologySnapshot.modules,
-      topologySnapshot.waferOrigins
+      topologySnapshot.waferOrigins,
+      topologySnapshot.robots,
+      this.device ? detectDeviceTopologyLayout(this.device) : detectTopologyLayout(topologySnapshot.modules, topologySnapshot.robots.length),
+      this.device
     );
+    this.configureTopologyCanvas();
     const requestState = this.pendingReplayDecisionKeys.has(replayKey) ? "loading" : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
-    this.elements.decisionLens.innerHTML = renderDecisionLens(
+    this.elements.decisionLens.innerHTML = !this.actionsEnabled ? "" : renderDecisionLens(
       currentDecision,
       requestState,
       this.replayDecisionErrorMessage,
       this.actionStatusFilters
     );
+    const progressPanel = this.root.getElementById("visualWaferProgress");
+    if (progressPanel) {
+      progressPanel.hidden = !this.waferProgressEnabled;
+      updateWaferProgressPanel(progressPanel, this.waferProgressEnabled ? renderWaferDispatchProgress(
+        this.moves,
+        snapshot,
+        this.device,
+        (job) => routeByPJobName(this.replayPlan, job)
+      ) : "");
+    }
+    const filters = this.root.querySelector(".action-filter-controls");
+    if (filters) filters.hidden = !this.actionsEnabled;
+    if (this.analysis) updateReplayThroughput(this.root, this.time, updateThroughputChartRange);
     this.elements.activeMoves.innerHTML = snapshot.activeMoves.length ? snapshot.activeMoves.map((move) => `
         <li>
           <span class="active-move-id">#${finiteNumber(move.MoveID)}</span>
@@ -3346,6 +4337,11 @@ var VisualizationWorkspace = class {
   async renderPerformance() {
     if (!this.moves.length) return;
     const requestVersion = ++this.analysisRequestVersion;
+    this.analysis = null;
+    for (const id of ["visualReplayKpis"]) {
+      const container = this.root.getElementById(id);
+      if (container) container.textContent = "\u6B63\u5728\u8BA1\u7B97\u6307\u6807\u2026";
+    }
     this.elements.performance.innerHTML = `
       <section class="result-card analysis-skeleton" aria-label="\u6B63\u5728\u52A0\u8F7D\u7ED3\u679C\u5206\u6790">
         <div class="analysis-skeleton-head"><i></i><span></span></div>
@@ -3366,6 +4362,26 @@ var VisualizationWorkspace = class {
       this.analysis = analysis;
       this.bottleneckSummary = result.bottleneck;
       this.elements.performance.innerHTML = renderSchedulePerformance(analysis);
+      const overview = this.elements.performance.querySelector(".overview-card");
+      const kpis = this.root.getElementById("visualReplayKpis");
+      if (overview) {
+        if (kpis) {
+          kpis.innerHTML = overview.outerHTML;
+          const labels = kpis.querySelectorAll(".performance-kpi-label > span:first-child");
+          ["\u4EA7\u80FD \xB7 \u622A\u81F3\u5F53\u524D", "\u5E73\u5747\u91CD\u7B97 \xB7 \u6574\u6B21", "\u74F6\u9888\u5229\u7528\u7387 \xB7 \u7EDF\u8BA1\u7A97", "LoadLock \u6548\u7387 \xB7 \u6574\u6B21"].forEach((label, index) => {
+            if (labels[index]) labels[index].textContent = label;
+          });
+          const help = kpis.querySelector(".is-primary .performance-kpi-help");
+          if (help) {
+            help.setAttribute("aria-label", "\u622A\u81F3\u56DE\u653E\u65F6\u523B\u7684\u4EA7\u80FD\uFF0C\u4E0E\u4E0B\u65B9\u8D8B\u52BF\u56FE\u6240\u9009\u53E3\u5F84\u4E00\u81F4\uFF1B\u6837\u672C\u4E0D\u8DB3\u65F6\u4E0D\u663E\u793A\u6570\u503C");
+            const tooltip = help.querySelector(".performance-kpi-tooltip");
+            if (tooltip) tooltip.textContent = help.getAttribute("aria-label");
+          }
+        }
+        overview.remove();
+      }
+      mountAnalysisWorkspace(this.elements.performance, updateThroughputChartRange);
+      updateReplayThroughput(this.root, this.time, updateThroughputChartRange);
       const windowSlot = this.elements.performance.querySelector(".bottleneck-window-slot");
       if (windowSlot) {
         this.elements.performanceWindow.tabIndex = 0;
@@ -3378,6 +4394,10 @@ var VisualizationWorkspace = class {
       if (requestVersion !== this.analysisRequestVersion) return;
       this.analysis = null;
       this.bottleneckSummary = null;
+      for (const id of ["visualReplayKpis"]) {
+        const container = this.root.getElementById(id);
+        if (container) container.textContent = "\u6307\u6807\u8BA1\u7B97\u5931\u8D25\uFF0C\u8BF7\u5728\u4E0B\u65B9\u5206\u6790\u533A\u91CD\u65B0\u52A0\u8F7D";
+      }
       this.elements.performance.innerHTML = `
         <div class="analysis-error-state">
           <strong>\u6570\u636E\u83B7\u53D6\u5931\u8D25</strong>
@@ -3394,16 +4414,11 @@ var VisualizationWorkspace = class {
     this.pause();
     this.setTopologyVisible(false);
     this.elements.toolbar.hidden = false;
-    this.elements.groupAnalysis.hidden = true;
     this.elements.content.hidden = true;
-    this.elements.empty.hidden = false;
     this.elements.playbackEmpty.hidden = false;
-    this.elements.empty.classList.toggle("is-loading", loading);
     this.elements.playbackEmpty.classList.toggle("is-loading", loading);
-    this.elements.empty.classList.remove("is-error");
     this.elements.playbackEmpty.classList.remove("is-error");
     const loadingMarkup = loading ? `<span class="visual-loader" aria-hidden="true"></span><strong>${escapeHtml(message)}</strong>` : `<strong>${escapeHtml(message)}</strong>`;
-    this.elements.empty.innerHTML = loadingMarkup;
     this.elements.playbackEmpty.innerHTML = loadingMarkup;
   }
   /** 在工作台空状态中显示可恢复的错误。 */
@@ -3411,21 +4426,16 @@ var VisualizationWorkspace = class {
     this.pause();
     this.setTopologyVisible(false);
     this.elements.toolbar.hidden = false;
-    this.elements.groupAnalysis.hidden = true;
     this.elements.content.hidden = true;
-    this.elements.empty.hidden = false;
     this.elements.playbackEmpty.hidden = false;
-    this.elements.empty.classList.remove("is-loading");
     this.elements.playbackEmpty.classList.remove("is-loading");
-    this.elements.empty.classList.add("is-error");
     this.elements.playbackEmpty.classList.add("is-error");
     const errorMarkup = `
       <strong>\u65E0\u6CD5\u52A0\u8F7D MoveList</strong>
       <span>${escapeHtml(message)}</span>
       <label class="btn visual-import-button">${icon("upload")}\u91CD\u65B0\u9009\u62E9\u6587\u4EF6<input type="file" accept=".json,application/json" data-visual-retry></label>`;
-    this.elements.empty.innerHTML = errorMarkup;
     this.elements.playbackEmpty.innerHTML = errorMarkup;
-    [this.elements.empty, this.elements.playbackEmpty].forEach((container) => {
+    [this.elements.playbackEmpty].forEach((container) => {
       const retryInput = container.querySelector("[data-visual-retry]");
       retryInput?.addEventListener("change", () => {
         const file = retryInput.files?.item(0);
@@ -3455,75 +4465,6 @@ function durationText(value) {
 }
 function caseLabel(item, index) {
   return item.name || `t${index + 1}`;
-}
-function improvementChart(summary) {
-  const cases = summary.cases.filter((item) => item.improvementPercent !== null);
-  const scale = Math.max(
-    1,
-    ...cases.map((item) => Math.abs(item.improvementPercent ?? 0))
-  );
-  return cases.map((item, index) => {
-    const value = item.improvementPercent ?? 0;
-    const width = Math.min(Math.abs(value) / scale * 50, 50);
-    const status = value < 0 ? "loss" : value > 0 ? "gain" : "tie";
-    return `<div class="group-chart-row">
-      <span class="group-chart-label" title="${escapeHtml2(item.name)}">${escapeHtml2(caseLabel(item, index))}</span>
-      <div class="group-diverging-track" role="img" aria-label="${escapeHtml2(caseLabel(item, index))} \u76F8\u5BF9\u57FA\u7EBF ${value >= 0 ? "\u63D0\u5347" : "\u9000\u5316"} ${Math.abs(value).toFixed(2)}%">
-        <i class="${status}" style="--bar-width:${width}%"></i>
-      </div>
-      <strong class="${status}">${value > 0 ? "+" : ""}${value.toFixed(2)}%</strong>
-    </div>`;
-  }).join("") || '<p class="group-analysis-empty">\u6CA1\u6709\u53EF\u6BD4\u8F83\u7684 Baseline\u3002</p>';
-}
-function utilizationChart(summary) {
-  const rows = summary.cases.flatMap((item, caseIndex) => item.bottleneckCandidates.map((candidate, candidateIndex) => ({
-    item,
-    caseIndex,
-    candidate,
-    candidateIndex
-  })));
-  return rows.map(({ item, caseIndex, candidate, candidateIndex }) => {
-    const utilization = Math.max(0, Math.min(candidate.utilization, 1));
-    const label = candidateIndex === 0 ? caseLabel(item, caseIndex) : `\u21B3 \u5019\u9009 ${candidateIndex + 1}`;
-    return `<div class="group-chart-row ${candidateIndex ? "is-secondary-candidate" : ""}">
-      <span class="group-chart-label" title="${escapeHtml2(item.name)}">${escapeHtml2(label)}</span>
-      <div class="group-linear-track" role="img" aria-label="${escapeHtml2(caseLabel(item, caseIndex))} \u74F6\u9888\u5019\u9009 ${escapeHtml2(candidate.resourceName)}\uFF0C\u5229\u7528\u7387 ${(utilization * 100).toFixed(1)}%">
-        <i class="utilization" style="width:${(utilization * 100).toFixed(2)}%"></i>
-      </div>
-      <strong>${(utilization * 100).toFixed(1)}%</strong>
-      <small title="${escapeHtml2(candidate.resourceName)}">${escapeHtml2(candidate.resourceName || "\u2014")}</small>
-    </div>`;
-  }).join("") || '<p class="group-analysis-empty">\u6CA1\u6709\u53EF\u5206\u6790\u7684\u74F6\u9888\u8D44\u6E90\u3002</p>';
-}
-function cpuChart(summary) {
-  const cases = summary.cases.filter((item) => item.cpuTimeMs !== null);
-  const scale = Math.max(1, ...cases.map((item) => item.cpuTimeMs ?? 0));
-  return cases.map((item, index) => {
-    const cpu = Math.max(item.cpuTimeMs ?? 0, 0);
-    return `<div class="group-chart-row">
-      <span class="group-chart-label" title="${escapeHtml2(item.name)}">${escapeHtml2(caseLabel(item, index))}</span>
-      <div class="group-linear-track" role="img" aria-label="${escapeHtml2(caseLabel(item, index))} CPU Time ${durationText(cpu)}">
-        <i class="cpu" style="width:${Math.min(cpu / scale * 100, 100).toFixed(2)}%"></i>
-      </div>
-      <strong>${escapeHtml2(durationText(cpu))}</strong>
-    </div>`;
-  }).join("") || '<p class="group-analysis-empty">\u6CA1\u6709 CPU Time \u6570\u636E\u3002</p>';
-}
-function throughputChart(summary) {
-  const rows = summary.cases.map((item, index) => ({ item, index })).filter(({ item }) => item.throughputPerHour !== null && item.throughputPerHour > 0);
-  const scale = Math.max(1, ...rows.map(({ item }) => item.throughputPerHour ?? 0));
-  return rows.map(({ item, index }) => {
-    const throughput = Math.max(item.throughputPerHour ?? 0, 0);
-    const sampleCount = Number(item.throughputSampleCount) || 0;
-    return `<div class="group-chart-row">
-      <span class="group-chart-label" title="${escapeHtml2(item.name)}">${escapeHtml2(caseLabel(item, index))}</span>
-      <div class="group-linear-track" role="img" aria-label="${escapeHtml2(caseLabel(item, index))} \u4EA7\u80FD ${throughput.toFixed(1)} \u7247/h">
-        <i class="throughput" style="width:${Math.min(throughput / scale * 100, 100).toFixed(2)}%"></i>
-      </div>
-      <strong>${throughput.toFixed(1)} \u7247/h</strong>
-      <small>${sampleCount ? `\u5C45\u4E2D ${sampleCount} \u7247` : "\u7A33\u6001\u6837\u672C"}</small>
-    </div>`;
-  }).join("") || '<p class="group-analysis-empty">\u6CA1\u6709\u53EF\u6309\u5C45\u4E2D 120 \u7247\u7A33\u6001\u6837\u672C\u8BA1\u7B97\u7684\u4EA7\u80FD\u3002</p>';
 }
 function csvEscape(value) {
   return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
@@ -3563,78 +4504,169 @@ function testGroupSummaryCsv(summary) {
   ].map(csvEscape));
   return [headers.map(csvEscape).join(","), ...rows.map((row) => row.join(","))].join("\r\n");
 }
-function resultTable(summary) {
-  return summary.cases.map((item, index) => `
-    <tr>
-      <th scope="row">${escapeHtml2(caseLabel(item, index))}</th>
-      <td>${finiteText(item.makespan, 2, " s")}</td>
-      <td>${finiteText(item.baselineMakespan, 2, " s")}</td>
-      <td class="${(item.improvementPercent ?? 0) < 0 ? "loss" : "gain"}">${item.improvementPercent === null ? "\u2014" : `${item.improvementPercent > 0 ? "+" : ""}${item.improvementPercent.toFixed(2)}%`}</td>
-      <td>${escapeHtml2(item.bottleneckResource || "\u2014")}${item.bottleneckCandidateCount > 1 ? ` <small>+${item.bottleneckCandidateCount - 1} \u4E2A\u5019\u9009</small>` : ""}</td>
-      <td>${percentText(item.bottleneckUtilization, true)}</td>
-      <td>${durationText(item.cpuTimeMs)}</td>
-      <td>${finiteText(item.throughputPerHour, 1, " \u7247/h")}</td>
-      <td>${finiteText(item.departureIntervalCv, 2)}</td>
-      <td>${finiteText(item.processChamberDwellMeanSeconds, 2, " s")}</td>
-      <td>${finiteText(item.robotWaferDwellMeanSeconds, 2, " s")}</td>
-      <td>${finiteText(item.waferSystemResidenceMeanSeconds, 2, " s")}</td>
-      <td>${finiteText(item.waferSystemResidenceCv, 2)}</td>
-      <td>${item.validationPassed ? '<span class="group-pass">\u901A\u8FC7</span>' : `<span class="group-fail">${escapeHtml2(item.validation || item.status)}</span>`}</td>
-    </tr>`).join("");
+function resultTable(summary, selected, compact = false) {
+  return summary.cases.map((item, index) => {
+    const cells = [`<th scope="row">${escapeHtml2(caseLabel(item, index))}</th>`];
+    if (selected.has("makespan")) {
+      cells.push(`<td>${finiteText(item.makespan, 2, " s")}</td>`);
+      cells.push(`<td>${item.id === summary.referenceCaseId ? '<span class="group-reference">\u53C2\u8003</span>' : item.referenceDeltas?.makespan?.percent === void 0 ? "\u2014" : item.referenceComparable ? `${item.referenceDeltas.makespan.percent > 0 ? "+" : ""}${item.referenceDeltas.makespan.percent.toFixed(2)}%` : '<span title="\u8FD0\u884C\u914D\u7F6E\u4E0D\u540C\uFF0C\u53EA\u5E76\u5217\u5C55\u793A\u6570\u503C">\u4EC5\u89C2\u5BDF</span>'}</td>`);
+    }
+    if (selected.has("baseline_improvement")) {
+      cells.push(`<td>${finiteText(item.baselineMakespan, 2, " s")}</td>`);
+      cells.push(`<td class="${(item.improvementPercent ?? 0) < 0 ? "loss" : "gain"}">${item.improvementPercent === null ? "\u2014" : `${item.improvementPercent > 0 ? "+" : ""}${item.improvementPercent.toFixed(2)}%`}</td>`);
+    }
+    if (selected.has("bottleneck_candidates")) cells.push(`<td>${escapeHtml2(item.bottleneckResource || "\u2014")}${item.bottleneckCandidateCount > 1 ? ` <small>+${item.bottleneckCandidateCount - 1} \u4E2A\u5019\u9009</small>` : ""}</td>`);
+    if (selected.has("resource_utilization")) cells.push(`<td>${percentText(item.bottleneckUtilization, true)}</td>`);
+    if (selected.has("cpu_time")) cells.push(`<td>${durationText(item.cpuTimeMs)}</td>`);
+    if (selected.has("average_recompute_time")) cells.push(`<td>${durationText(item.averageRecomputeTimeMs ?? null)}</td>`);
+    if (selected.has("throughput")) cells.push(`<td>${finiteText(item.throughputPerHour, 1, " \u7247/h")}</td>`);
+    if (selected.has("departure_interval_cv")) cells.push(`<td>${finiteText(item.departureIntervalCv, 2)}</td>`);
+    if (selected.has("process_chamber_dwell")) cells.push(`<td>${finiteText(item.processChamberDwellMeanSeconds, 2, " s")}</td>`);
+    if (selected.has("robot_wafer_dwell")) cells.push(`<td>${finiteText(item.robotWaferDwellMeanSeconds, 2, " s")}</td>`);
+    if (selected.has("system_residence")) cells.push(`<td>${finiteText(item.waferSystemResidenceMeanSeconds, 2, " s")}</td>`);
+    if (selected.has("system_residence_cv")) cells.push(`<td>${finiteText(item.waferSystemResidenceCv, 2)}</td>`);
+    if (selected.has("loadlock_wafers_per_cycle")) cells.push(`<td>${finiteText(item.loadLockWafersPerCycle, 2, " \u7247")}</td>`);
+    if (selected.has("loadlock_full_cycle_ratio")) cells.push(`<td>${percentText(item.loadLockFullCycleRatio, true)}</td>`);
+    if (selected.has("loadlock_empty_cycle_ratio")) cells.push(`<td>${percentText(item.loadLockEmptyCycleRatio, true)}</td>`);
+    if (selected.has("validation")) cells.push(`<td>${item.analysisStatus && item.analysisStatus !== "completed" ? `<span class="group-fail">${escapeHtml2(item.error || item.analysisStatus)}</span>` : item.validationPassed ? '<span class="group-pass">\u901A\u8FC7</span>' : `<span class="group-fail">${escapeHtml2(item.validation || item.status)}</span>`}</td>`);
+    const rowClasses = [
+      item.id === summary.referenceCaseId ? "is-reference" : "",
+      item.analysisStatus && item.analysisStatus !== "completed" ? "is-incomplete" : ""
+    ].filter(Boolean).join(" ");
+    const compactValues = cells.slice(1).map((cell) => cell.replace(/^<td(?:\s[^>]*)?>|<\/td>$/g, "")).join('<span aria-hidden="true"> \xB7 </span>');
+    const rowCells = compact ? [cells[0], `<td><div class="group-analysis-compact-values">${compactValues}</div></td>`] : cells;
+    return `<tr${rowClasses ? ` class="${rowClasses}"` : ""}>${rowCells.join("")}</tr>`;
+  }).join("");
 }
 function renderTestGroupAnalysis(summary, groupName) {
-  const weighted = summary.weightedImprovementPercent;
-  const medianImprovement = summary.medianImprovementPercent;
+  const selected = new Set(summary.selectedMetricIds ?? [
+    "validation",
+    "makespan",
+    "baseline_improvement",
+    "cpu_time",
+    "throughput",
+    "departure_interval_cv",
+    "process_chamber_dwell",
+    "robot_wafer_dwell",
+    "system_residence",
+    "system_residence_cv",
+    "resource_utilization",
+    "bottleneck_candidates"
+  ]);
+  const selectedLabels = {
+    validation: "\u6821\u9A8C\u7ED3\u679C",
+    makespan: "Makespan",
+    baseline_improvement: "Baseline \u6539\u5584",
+    cpu_time: "CPU Time",
+    average_recompute_time: "\u5E73\u5747\u91CD\u7B97\u65F6\u95F4",
+    throughput: "\u4EA7\u80FD",
+    departure_interval_cv: "\u51FA\u7AD9\u95F4\u9694 CV",
+    process_chamber_dwell: "\u52A0\u5DE5\u8154\u9A7B\u7559",
+    robot_wafer_dwell: "\u673A\u5668\u624B\u9A7B\u7559",
+    system_residence: "\u7CFB\u7EDF\u505C\u7559",
+    system_residence_cv: "\u7CFB\u7EDF\u505C\u7559 CV",
+    resource_utilization: "\u8D44\u6E90\u5229\u7528\u7387",
+    bottleneck_candidates: "\u74F6\u9888\u5019\u9009",
+    loadlock_wafers_per_cycle: "LoadLock \u6BCF\u5468\u671F\u6676\u5706",
+    loadlock_full_cycle_ratio: "LoadLock \u6EE1\u8F7D\u5468\u671F\u7387",
+    loadlock_empty_cycle_ratio: "LoadLock \u7A7A\u8F7D\u5468\u671F\u7387"
+  };
+  const compactTable = selected.size <= 2;
+  const tableHeaders = compactTable ? ["<th>\u6D4B\u8BD5</th>", "<th>\u6307\u6807\u7ED3\u679C</th>"] : ["<th>\u6D4B\u8BD5</th>"];
+  if (!compactTable && selected.has("makespan")) tableHeaders.push("<th>Makespan</th>", "<th>\u76F8\u5BF9\u53C2\u8003</th>");
+  if (!compactTable && selected.has("baseline_improvement")) tableHeaders.push("<th>Baseline</th>", "<th>\u6539\u5584</th>");
+  if (!compactTable && selected.has("bottleneck_candidates")) tableHeaders.push("<th>\u74F6\u9888</th>");
+  if (!compactTable && selected.has("resource_utilization")) tableHeaders.push("<th>\u5229\u7528\u7387</th>");
+  if (!compactTable && selected.has("cpu_time")) tableHeaders.push("<th>CPU Time</th>");
+  if (!compactTable && selected.has("average_recompute_time")) tableHeaders.push("<th>\u5E73\u5747\u91CD\u7B97\u65F6\u95F4</th>");
+  if (!compactTable && selected.has("throughput")) tableHeaders.push("<th>\u4EA7\u80FD</th>");
+  if (selected.has("departure_interval_cv")) tableHeaders.push("<th>\u51FA\u7AD9 CV</th>");
+  if (selected.has("process_chamber_dwell")) tableHeaders.push("<th>\u52A0\u5DE5\u8154\u9A7B\u7559\u5747\u503C</th>");
+  if (selected.has("robot_wafer_dwell")) tableHeaders.push("<th>\u673A\u5668\u624B\u9A7B\u7559\u5747\u503C</th>");
+  if (selected.has("system_residence")) tableHeaders.push("<th>\u7CFB\u7EDF\u505C\u7559\u5747\u503C</th>");
+  if (selected.has("system_residence_cv")) tableHeaders.push("<th>\u7CFB\u7EDF\u505C\u7559 CV</th>");
+  if (selected.has("loadlock_wafers_per_cycle")) tableHeaders.push("<th>LoadLock \u6BCF\u5468\u671F\u6676\u5706</th>");
+  if (selected.has("loadlock_full_cycle_ratio")) tableHeaders.push("<th>LoadLock \u6EE1\u8F7D\u5468\u671F\u7387</th>");
+  if (selected.has("loadlock_empty_cycle_ratio")) tableHeaders.push("<th>LoadLock \u7A7A\u8F7D\u5468\u671F\u7387</th>");
+  if (selected.has("validation")) tableHeaders.push("<th>\u6821\u9A8C</th>");
   return `
     <div class="group-analysis-head">
-      <h2>${escapeHtml2(groupName || "\u5F53\u524D\u6D4B\u8BD5\u7EC4")}</h2>
+      <div class="group-analysis-selection">${[...selected].map((metric) => `<span>${escapeHtml2(selectedLabels[metric] || metric)}</span>`).join("")}</div>
+      <div class="group-analysis-actions">
+        <button class="btn small group-analysis-back" type="button" data-return-run-results><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 7-5 5 5 5M5 12h14"/></svg><span>\u8FD4\u56DE\u8FD0\u884C\u7ED3\u679C</span></button>
+        <button class="btn small" type="button" data-reconfigure-analysis>\u91CD\u65B0\u9009\u62E9\u6307\u6807\u4E0E\u6D4B\u8BD5</button>
+        <button type="button" class="btn small group-analysis-export" data-group-export-csv>\u5BFC\u51FA CSV</button>
+      </div>
     </div>
-    <div class="group-kpi-grid">
-      <article><span>\u6821\u9A8C\u901A\u8FC7\u7387</span><strong>${(summary.validationPassRate * 100).toFixed(1)}%</strong><small>${summary.validationPassedCount}/${summary.metricsCount} \u4E2A\u6709\u6307\u6807\u7ED3\u679C</small></article>
-      <article><span>\u52A0\u6743\u603B\u4F53\u6539\u5584</span><strong class="${(weighted ?? 0) < 0 ? "loss" : "gain"}">${weighted === null ? "\u2014" : `${weighted > 0 ? "+" : ""}${weighted.toFixed(2)}%`}</strong><small>\u6309\u5404\u6D4B\u8BD5 Baseline makespan \u52A0\u6743</small></article>
-      <article><span>\u9010\u4F8B\u4E2D\u4F4D\u6539\u5584</span><strong class="${(medianImprovement ?? 0) < 0 ? "loss" : "gain"}">${medianImprovement === null ? "\u2014" : `${medianImprovement > 0 ? "+" : ""}${medianImprovement.toFixed(2)}%`}</strong><small>${summary.winCount} \u80DC \xB7 ${summary.tieCount} \u5E73 \xB7 ${summary.regressionCount} \u9000\u5316</small></article>
-      <article><span>CPU Time</span><strong>${durationText(summary.medianCpuTimeMs)}</strong><small>P90 ${durationText(summary.p90CpuTimeMs)} \xB7 \u603B\u8BA1 ${durationText(summary.totalCpuTimeMs)}</small></article>
-      <article><span>\u4E3B\u8981\u5019\u9009\u5229\u7528\u7387\u4E2D\u4F4D\u6570</span><strong>${percentText(summary.medianBottleneckUtilization, true)}</strong><small>\u5DE5\u5E8F\u7EC4\u3001\u673A\u5668\u4EBA\u6216 LoadLock \u5BB9\u91CF</small></article>
-      <article><span>\u4EA7\u80FD\u4E2D\u4F4D\u6570</span><strong>${finiteText(summary.medianThroughputPerHour, 1, " \u7247/h")}</strong><small>${summary.throughputEligibleCount ?? 0}/${summary.succeededCount} \u4E2A\u6D4B\u8BD5\u6709\u5C45\u4E2D 120 \u7247\u7A33\u6001\u6837\u672C \xB7 \u51FA\u7AD9 CV ${finiteText(summary.medianDepartureIntervalCv, 2)}</small></article>
-      <article><span>\u52A0\u5DE5\u8154\u9A7B\u7559\u5747\u503C\u4E2D\u4F4D\u6570</span><strong>${finiteText(summary.medianProcessChamberDwellMeanSeconds, 2, " s")}</strong><small>\u5404\u6D4B\u8BD5\u201C\u52A0\u5DE5\u7ED3\u675F \u2192 \u5B8C\u5168\u79BB\u8154\u201D\u5747\u503C\u7684\u4E2D\u4F4D\u6570</small></article>
-      <article><span>\u673A\u5668\u624B\u9A7B\u7559\u5747\u503C\u4E2D\u4F4D\u6570</span><strong>${finiteText(summary.medianRobotWaferDwellMeanSeconds, 2, " s")}</strong><small>\u5DF2\u5254\u9664\u663E\u5F0F PreTrans \u8FD0\u8F93\u533A\u95F4</small></article>
-      <article><span>\u7CFB\u7EDF\u505C\u7559\u5747\u503C\u4E2D\u4F4D\u6570</span><strong>${finiteText(summary.medianWaferSystemResidenceMeanSeconds, 2, " s")}</strong><small>\u79BB\u5F00 LP \u2192 \u8FD4\u56DE LP \xB7 CV \u4E2D\u4F4D ${finiteText(summary.medianWaferSystemResidenceCv, 2)}</small></article>
-    </div>
-    <div class="group-chart-grid">
-      <article class="group-chart-card">
-        <header><div><h3>\u76F8\u5BF9 Baseline</h3><p>\u6B63\u503C\u4E3A makespan \u6539\u5584\uFF0C\u8D1F\u503C\u4E3A\u9000\u5316</p></div></header>
-        <div class="group-chart-body">${improvementChart(summary)}</div>
-      </article>
-      <article class="group-chart-card">
-        <header><div><h3>\u4EA7\u80FD</h3><p>\u5404\u6D4B\u8BD5\u5C45\u4E2D 120 \u7247\u7A33\u6001\u6837\u672C\u4EA7\u80FD\uFF0C\u6309\u7EC4\u5185\u6700\u5927\u503C\u7F29\u653E</p></div></header>
-        <div class="group-chart-body">${throughputChart(summary)}</div>
-      </article>
-      <article class="group-chart-card">
-        <header><div><h3>\u6240\u6709\u74F6\u9888\u5019\u9009\u5229\u7528\u7387</h3><p>\u6BCF\u4E2A\u6D4B\u8BD5\u6309\u53EF\u80FD\u6027\u4F9D\u6B21\u663E\u793A\u6240\u6709\u63A5\u8FD1\u5019\u9009</p></div></header>
-        <div class="group-chart-body">${utilizationChart(summary)}</div>
-      </article>
-      <article class="group-chart-card">
-        <header><div><h3>\u8BA1\u7B97\u65F6\u95F4</h3><p>\u5404\u6D4B\u8BD5\u7B97\u6CD5 CPU Time\uFF0C\u6309\u7EC4\u5185\u6700\u5927\u503C\u7F29\u653E</p></div></header>
-        <div class="group-chart-body">${cpuChart(summary)}</div>
-      </article>
-    </div>
-    <details class="group-analysis-table-wrap">
-      <summary><span>\u67E5\u770B\u9010\u6D4B\u8BD5\u5B8C\u6574\u6307\u6807</span><button type="button" class="btn small group-analysis-export" data-group-export-csv>\u5BFC\u51FA CSV</button></summary>
+    ${summary.timedOut ? '<div class="group-analysis-warning">\u5DF2\u8FBE\u5230\u65F6\u95F4\u9884\u7B97\uFF0C\u4EE5\u4E0B\u62A5\u544A\u4FDD\u7559\u5B8C\u6210\u90E8\u5206\uFF1B\u53EF\u51CF\u5C11\u6307\u6807\u6216\u63D0\u9AD8\u65F6\u95F4\u9884\u7B97\u540E\u7EE7\u7EED\u3002</div>' : ""}
+    <section class="group-analysis-table-wrap">
       <div class="group-analysis-table-scroll">
         <table class="group-analysis-table">
-          <thead><tr><th>\u6D4B\u8BD5</th><th>Makespan</th><th>Baseline</th><th>\u6539\u5584</th><th>\u74F6\u9888</th><th>\u5229\u7528\u7387</th><th>CPU Time</th><th>\u4EA7\u80FD</th><th>\u51FA\u7AD9 CV</th><th>\u52A0\u5DE5\u8154\u9A7B\u7559\u5747\u503C</th><th>\u673A\u5668\u624B\u9A7B\u7559\u5747\u503C</th><th>\u7CFB\u7EDF\u505C\u7559\u5747\u503C</th><th>\u7CFB\u7EDF\u505C\u7559 CV</th><th>\u6821\u9A8C</th></tr></thead>
-          <tbody>${resultTable(summary)}</tbody>
+          <caption class="sr-only">${escapeHtml2(groupName || "\u5F53\u524D\u6D4B\u8BD5\u7EC4")}\u9010\u6D4B\u8BD5\u6307\u6807\u5BF9\u6BD4</caption>
+          <thead><tr>${tableHeaders.join("")}</tr></thead>
+          <tbody>${resultTable(summary, selected, compactTable)}</tbody>
         </table>
       </div>
-    </details>`;
+    </section>`;
+}
+
+// src/result_card_run_queue.ts
+function createResultCardRunQueue(options) {
+  const pendingTestIds = [];
+  const queuedOrRunning = /* @__PURE__ */ new Set();
+  let draining = false;
+  async function drain() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (pendingTestIds.length) {
+        const testId = pendingTestIds.shift();
+        options.onStateChange?.(testId, "running");
+        try {
+          await options.runTest(testId);
+        } catch {
+        } finally {
+          queuedOrRunning.delete(testId);
+          options.onStateChange?.(testId, "settled");
+        }
+      }
+    } finally {
+      draining = false;
+    }
+  }
+  return {
+    /** 将测试加入队尾，返回 false 表示该测试已在等待或运行。 */
+    enqueue(rawTestId) {
+      const testId = String(rawTestId || "").trim();
+      if (!testId || queuedOrRunning.has(testId)) return false;
+      pendingTestIds.push(testId);
+      queuedOrRunning.add(testId);
+      options.onStateChange?.(testId, "queued");
+      queueMicrotask(() => void drain());
+      return true;
+    },
+    /** 返回当前等待与运行的测试数，供页面提示使用。 */
+    get size() {
+      return queuedOrRunning.size;
+    },
+    /** 移除尚未开始的队列项；当前正在运行的测试交由后端终止。 */
+    clearPending() {
+      const removed = pendingTestIds.splice(0);
+      for (const testId of removed) {
+        queuedOrRunning.delete(testId);
+        options.onStateChange?.(testId, "settled");
+      }
+      return removed;
+    }
+  };
 }
 
 // src/editor_models.ts
 var CJOB_TYPES = ["NormalLot", "HighestLot", "HigherLot"];
 var TASK_MODES = ["Smart", "Pipeline", "Sequential", "Concurrent"];
 function stringList(value) {
-  const values = Array.isArray(value) ? value : String(value || "").replaceAll("\uFF0C", ",").split(",");
-  return [...new Set(values.map((item) => String(item).trim()).filter(Boolean))];
+  const values4 = Array.isArray(value) ? value : String(value || "").replaceAll("\uFF0C", ",").split(",");
+  return [...new Set(values4.map((item) => String(item).trim()).filter(Boolean))];
 }
 function makeVisit(stationName = "", processRecipe = "") {
   return {
@@ -3798,12 +4830,28 @@ function normalizeRound(raw, roundIndex, fallbackTime, firstTaskId = roundIndex,
 // src/config_editor.ts
 var { VISIT_SHARED_FIELDS: VISIT_SHARED_FIELDS2, automaticTemplateName: automaticTemplateName2 } = route_editor_logic_exports;
 var visualizationWorkspace = createVisualizationWorkspace();
-var batchPerformanceAnalyses = /* @__PURE__ */ new Map();
-var batchBottleneckSummaries = /* @__PURE__ */ new Map();
-var batchBottleneckRequests = /* @__PURE__ */ new Map();
-var batchBottleneckErrors = /* @__PURE__ */ new Map();
+var chooseTestDraft = createDraftChoiceDialog(document.getElementById("testDraftDialog"));
+var activeRunContext = null;
+var activeBatchContext = null;
+var batchSelectionMode = "run";
+var resultTestFilterIds = null;
+var expandedBatchTestId = "";
+var batchTestDetailsRequestVersion = 0;
+var batchCardClickTimer = 0;
+var batchResultItemHistory = /* @__PURE__ */ new Map();
+var runPreparationActive = false;
+var navigationPending = false;
+var activeManagementSection = "cases";
+var batchCardAnalyses = /* @__PURE__ */ new Map();
+var batchCardAnalysisRequests = /* @__PURE__ */ new Map();
+var activeGroupAnalysisJobId = "";
+var analysisWizardStep = 1;
+var analysisSettingsPreferencesDirty = false;
 var EXPECTED_API_SCHEMA = "cjob-pjob-v3";
 var DEFAULT_SCHEDULE_OPTIONS = Object.freeze({
+  loadLockDirection: 1,
+  loadLockCapacity: 1,
+  loadLockBindBatch: 0,
   loadLockManager: "petri-look",
   residencyGuardSeconds: 0,
   maximumRobotHoldingSeconds: 0,
@@ -3811,7 +4859,20 @@ var DEFAULT_SCHEDULE_OPTIONS = Object.freeze({
   loadLockMacroSearchSeconds: 4,
   loadLockMacroRollouts: 96,
   searchTreeModelPath: "",
+  heuristicConfig: null,
   seed: 0
+});
+var DEFAULT_HEURISTIC_WEIGHTS = Object.freeze({
+  feed_block_penalty: 4,
+  earliest_start_weight: 0.35,
+  finish_time_weight: 0.15,
+  exchange_bonus: 2,
+  process_departure_bonus: 1.6,
+  into_process_bonus: 1.5,
+  drain_bonus: 0.3,
+  sink_bonus: 0.25,
+  feed_penalty: -0.35,
+  stage_progress_bonus: 0.2
 });
 var SCHEDULE_OPTION_KEYS = new Set(Object.keys(DEFAULT_SCHEDULE_OPTIONS));
 var DEADLOCK_TYPE_CATALOG = Object.freeze({
@@ -3822,34 +4883,6 @@ var DEADLOCK_TYPE_CATALOG = Object.freeze({
   "DEADLOCK.DUAL_ARM_TARGETS_FULL": {
     deadlockCode: "DLK-ROB-002",
     title: "\u53CC\u81C2\u673A\u5668\u624B\u6301\u6709\u4E24\u7247\uFF0C\u76EE\u6807\u8154\u5BA4\u5747\u5DF2\u6EE1"
-  },
-  "DEADLOCK.DUAL_ARM_SINGLE_HELD_TARGET_FULL": {
-    deadlockCode: "DLK-ROB-003",
-    title: "\u53CC\u81C2\u673A\u5668\u624B\u6301\u6709\u4E00\u7247\uFF0C\u76EE\u6807\u8154\u5BA4\u5DF2\u6EE1\u4E14\u65E0\u4EA4\u6362\u51FA\u53E3"
-  },
-  "DEADLOCK.ROBOT_HELD_CLEANING_CONFLICT": {
-    deadlockCode: "DLK-ROB-004",
-    title: "\u673A\u5668\u624B\u6301\u7247\u4E0E\u524D\u7F6E\u6E05\u6D17\u987A\u5E8F\u51B2\u7A81"
-  },
-  "DEADLOCK.ROBOT_HELD_LOADLOCK_BLOCKED": {
-    deadlockCode: "DLK-ROB-005",
-    title: "\u673A\u5668\u624B\u6301\u7247\uFF0C\u76EE\u6807 LoadLock \u65E0\u6CD5\u63A5\u7247"
-  },
-  "DEADLOCK.ROBOT_HELD_RESOURCE_WAIT": {
-    deadlockCode: "DLK-ROB-006",
-    title: "\u673A\u5668\u624B\u6301\u7247\u4E14\u76EE\u6807\u8D44\u6E90\u65E0\u6CD5\u63A8\u8FDB"
-  },
-  "DEADLOCK.LOADLOCK_DIRECTION_CYCLE": {
-    deadlockCode: "DLK-LL-001",
-    title: "LoadLock \u538B\u529B\u65B9\u5411\u4E0E\u56DE\u7A0B\u5FAA\u73AF\u7B49\u5F85"
-  },
-  "DEADLOCK.CLEANING_SELF_BLOCKED": {
-    deadlockCode: "DLK-CLN-001",
-    title: "Dummy \u6E05\u6D17\u7247\u5728\u540C\u8154\u81EA\u963B\u585E"
-  },
-  "DEADLOCK.RESOURCE_WAIT_CYCLE": {
-    deadlockCode: "DLK-RES-001",
-    title: "\u6EE1\u8154\u8D44\u6E90\u7B49\u5F85\u73AF"
   }
 });
 function deadlockDisplay(deadlock) {
@@ -3859,9 +4892,9 @@ function deadlockDisplay(deadlock) {
   if (registered) return { internalCode: code, ...registered, message: String(deadlock.Message || "") };
   return {
     internalCode: "DEADLOCK.UNCLASSIFIED",
-    deadlockCode: "DLK-UNK-001",
-    title: "\u524D\u7AEF\u56DE\u653E\u672A\u8BC6\u522B\u51FA\u5DF2\u767B\u8BB0\u6B7B\u9501",
-    message: "MoveList \u5DF2\u56DE\u653E\u5230\u7EC8\u70B9\uFF0C\u4F46\u73B0\u573A\u4E0D\u7B26\u5408\u5DF2\u767B\u8BB0\u7684\u6301\u7247\u6EE1\u8154\u6761\u4EF6\u3002"
+    deadlockCode: "DLK-UNK",
+    title: "\u5F53\u524D\u73B0\u573A\u4E0D\u6EE1\u8DB3\u8FD9\u4E24\u79CD\u7C7B\u578B\uFF0C\u7B97\u6CD5\u62A5\u544A\u65E0\u6CD5\u7EE7\u7EED\u8C03\u5EA6\u3002",
+    message: "\u5F53\u524D\u73B0\u573A\u4E0D\u6EE1\u8DB3\u8FD9\u4E24\u79CD\u7C7B\u578B\uFF0C\u7B97\u6CD5\u62A5\u544A\u65E0\u6CD5\u7EE7\u7EED\u8C03\u5EA6\u3002"
   };
 }
 var CLEAN_TYPE_DEFINITIONS = [
@@ -3881,6 +4914,7 @@ var PROCESSING_STATION_TYPES = /* @__PURE__ */ new Set([
 var FIRST_ROBOT_SLOT_ID = 1;
 var DUAL_ARM_SLOT_COUNT = 2;
 var BATCH_STATUS_POLL_MILLISECONDS = 1e3;
+var BATCH_CARD_SINGLE_CLICK_DELAY_MILLISECONDS = 500;
 var WORKSPACE_TRANSFER_POLL_MILLISECONDS = 500;
 var TEST_ORDER_COLLATOR = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 var DEFAULT_DUMMY_WAFER_COUNT = 8;
@@ -3910,7 +4944,6 @@ var state = {
   batchCancelRequested: false,
   batchCancelSent: false,
   batchResult: null,
-  selectedBatchTestId: "",
   deviceName: "",
   baseDevice: null,
   device: null,
@@ -3968,10 +5001,6 @@ var continuousDecisionEnabled = false;
 var continuousDecisionSubmittedSearchId = "";
 var userChosenActionKey = "";
 var userChosenSearchId = "";
-var singleRunActive = false;
-var singleRunCancelling = false;
-var activeSingleRunId = "";
-var singleRunAbortController = null;
 var runStatusStartedAt = 0;
 var runStatusElapsedMs = 0;
 var runStatusTimer = 0;
@@ -4336,7 +5365,7 @@ function parseDeviceFileText(text) {
 }
 async function loadDevice(file) {
   if (!file) return;
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   updateDataTransferProgress({ progress: 5, message: "\u6B63\u5728\u8BFB\u53D6 init JSON" });
   const fileText = await file.text();
   updateDataTransferProgress({ progress: 25, message: "\u6B63\u5728\u6821\u9A8C\u8BBE\u5907\u62D3\u6251" });
@@ -4422,7 +5451,7 @@ function uploadWorkspaceTransferContent(transferId, file) {
 async function runWorkspaceTransfer(kind, file) {
   if (dataTransferMode === "export") {
     if (!state.workspaceDeviceId) throw new Error("\u8BF7\u5148\u9009\u62E9\u8BBE\u5907");
-    if (state.dirty) await saveCurrentTest(true);
+    if (!await settleTestDraft()) return;
     if (state.deviceTimingDirty) await saveDeviceTiming();
     if (kind === "test" && !state.testCaseId) throw new Error("\u8BF7\u5148\u9009\u62E9\u6D4B\u8BD5\u96C6");
   }
@@ -4504,12 +5533,12 @@ async function chooseDataTransfer(kind) {
 function robotAvailableSlots(robot) {
   const slots = /* @__PURE__ */ new Set();
   const addSlots = (rawSlots, scalarIsCapacity = false) => {
-    let values = [];
+    let values4 = [];
     if (Number.isInteger(rawSlots) && typeof rawSlots !== "boolean") {
-      values = scalarIsCapacity ? Array.from({ length: Math.max(0, rawSlots) }, (_, index) => index + FIRST_ROBOT_SLOT_ID) : [rawSlots];
-    } else if (Array.isArray(rawSlots)) values = rawSlots;
-    else if (rawSlots && typeof rawSlots === "object") values = Object.keys(rawSlots);
-    values.forEach((value) => {
+      values4 = scalarIsCapacity ? Array.from({ length: Math.max(0, rawSlots) }, (_, index) => index + FIRST_ROBOT_SLOT_ID) : [rawSlots];
+    } else if (Array.isArray(rawSlots)) values4 = rawSlots;
+    else if (rawSlots && typeof rawSlots === "object") values4 = Object.keys(rawSlots);
+    values4.forEach((value) => {
       const slotId = Number(value);
       if (Number.isInteger(slotId) && slotId >= FIRST_ROBOT_SLOT_ID) slots.add(slotId);
     });
@@ -4621,20 +5650,20 @@ function applyDeviceTopology(device, deviceName, rawRobotSlots = {}) {
   state.processModules = stations.filter(([, item]) => PROCESSING_STATION_TYPES.has(String(item.Type || "").trim().toLowerCase())).map(([name]) => name).sort(natural);
   state.robotNames = Object.keys(state.device.Robots).sort(natural);
   state.robotScopes = Object.fromEntries(Object.entries(state.device.Robots).map(([name, robot]) => [name, [...new Set(Object.values(robot.ArmInfo || {}).filter((arm) => arm.IsEnable !== false).flatMap((arm) => arm.AccessibleStations || []))]]));
-  visualizationWorkspace.setDevice(state.device);
+  if (!activeRunContext && !state.batchResult) visualizationWorkspace.setDevice(state.device);
   if (!state.loadPorts.length || !state.processModules.length) throw new Error("\u8BBE\u5907\u5FC5\u987B\u5305\u542B LoadPort \u548C ProcessChamber");
 }
 function buildDeviceTimingDraft(device) {
   const draft = { stations: {}, robots: {} };
-  Object.entries(device?.Stations || {}).forEach(([stationName, station]) => {
+  Object.entries(device?.Stations || {}).forEach(([stationName, station2]) => {
     const timing = {};
     [...STATION_ACTION_TIME_FIELDS, { key: "AlignmentTime" }].forEach(({ key }) => {
-      if (station?.[key] && typeof station[key] === "object" && !Array.isArray(station[key])) {
-        timing[key] = structuredClone(station[key]);
+      if (station2?.[key] && typeof station2[key] === "object" && !Array.isArray(station2[key])) {
+        timing[key] = structuredClone(station2[key]);
       }
     });
-    if (Array.isArray(station?.PrePrepareTime)) {
-      timing.PrePrepareTime = station.PrePrepareTime.map((row) => Number(row?.Time) || 0);
+    if (Array.isArray(station2?.PrePrepareTime)) {
+      timing.PrePrepareTime = station2.PrePrepareTime.map((row) => Number(row?.Time) || 0);
     }
     draft.stations[stationName] = timing;
   });
@@ -4653,12 +5682,12 @@ function buildDeviceTimingDraft(device) {
   const configuredExecution = device?.ExecutionTiming && typeof device.ExecutionTiming === "object" ? device.ExecutionTiming : {};
   const overlayTiming = (defaults, configured) => Object.fromEntries(Object.entries(defaults).map(([itemName, fields]) => [
     itemName,
-    Object.fromEntries(Object.entries(fields).map(([fieldName, values]) => {
+    Object.fromEntries(Object.entries(fields).map(([fieldName, values4]) => {
       const configuredValues = configured?.[itemName]?.[fieldName];
-      if (Array.isArray(values)) {
-        return [fieldName, values.map((value, index) => Number.isFinite(Number(configuredValues?.[index])) ? Number(configuredValues[index]) : value)];
+      if (Array.isArray(values4)) {
+        return [fieldName, values4.map((value, index) => Number.isFinite(Number(configuredValues?.[index])) ? Number(configuredValues[index]) : value)];
       }
-      return [fieldName, Object.fromEntries(Object.entries(values).map(([key, value]) => [
+      return [fieldName, Object.fromEntries(Object.entries(values4).map(([key, value]) => [
         key,
         Number.isFinite(Number(configuredValues?.[key])) ? Number(configuredValues[key]) : value
       ]))];
@@ -4669,6 +5698,7 @@ function buildDeviceTimingDraft(device) {
     mode: configuredExecution.mode === "fluctuation" ? "fluctuation" : "fixed",
     fluctuation: {
       kind: rawFluctuation.kind === "offset" ? "offset" : "ratio",
+      samplingMode: rawFluctuation.samplingMode === "per-init" ? "per-init" : "per-move",
       ratio: Math.max(0, Math.min(1, Number(rawFluctuation.ratio) || 0)),
       minimumOffsetSeconds: Number.isFinite(Number(rawFluctuation.minimumOffsetSeconds)) ? Number(rawFluctuation.minimumOffsetSeconds) : 0,
       maximumOffsetSeconds: Number.isFinite(Number(rawFluctuation.maximumOffsetSeconds)) ? Number(rawFluctuation.maximumOffsetSeconds) : 0
@@ -4706,11 +5736,12 @@ function renderExecutionTimingConfiguration() {
       <header><div><h3>\u5B9E\u9645\u52A8\u4F5C\u65F6\u957F</h3><p>\u7B97\u6CD5\u59CB\u7EC8\u4F7F\u7528\u7406\u8BBA\u65F6\u95F4\uFF1B\u5E73\u53F0\u72B6\u6001\u673A\u53EA\u5728\u8FD0\u884C\u8BBE\u7F6E\u542F\u7528\u540E\u5E94\u7528\u8FD9\u91CC\u7684\u6267\u884C\u65F6\u95F4\u3002</p></div></header>
       <div class="execution-mode-grid" role="radiogroup" aria-label="\u6267\u884C\u65F6\u95F4\u6A21\u5F0F">
         <label class="run-setting-option"><span class="run-setting-option-main"><input type="radio" name="executionTimingMode" value="fixed" ${fluctuating ? "" : "checked"}><span>\u56FA\u5B9A\u6267\u884C\u503C</span></span><small>\u4F7F\u7528\u8BBE\u5907\u65F6\u95F4\u548C\u673A\u5668\u624B\u65F6\u95F4\u8868\u4E2D\u5E76\u5217\u7684\u201C\u6267\u884C\u201D\u503C\u3002</small></label>
-        <label class="run-setting-option"><span class="run-setting-option-main"><input type="radio" name="executionTimingMode" value="fluctuation" ${fluctuating ? "checked" : ""}><span>\u7406\u8BBA\u503C\u968F\u673A\u6CE2\u52A8</span></span><small>\u4EE5\u6BCF\u4E2A Move \u7684\u7406\u8BBA\u65F6\u957F\u4E3A\u5747\u503C\uFF0C\u6309 seed \u751F\u6210\u53EF\u590D\u73B0\u6837\u672C\u3002</small></label>
+        <label class="run-setting-option"><span class="run-setting-option-main"><input type="radio" name="executionTimingMode" value="fluctuation" ${fluctuating ? "checked" : ""}><span>\u7406\u8BBA\u503C\u968F\u673A\u6CE2\u52A8</span></span><small>\u4EC5 init \u8BBE\u5907\u52A8\u4F5C\u65F6\u95F4\u53C2\u4E0E\u6CE2\u52A8\uFF0C\u8DEF\u5F84\u52A0\u5DE5\u65F6\u957F\u4FDD\u6301\u4E0D\u53D8\uFF1B\u6309 seed \u751F\u6210\u53EF\u590D\u73B0\u6837\u672C\u3002</small></label>
       </div>
       <div class="execution-fluctuation-fields" ${fluctuating ? "" : "hidden"}>
         <label class="field"><span>\u6CE2\u52A8\u65B9\u5F0F</span><select id="executionFluctuationKind"><option value="ratio" ${offset ? "" : "selected"}>\u6BD4\u4F8B\uFF08\xB1\uFF09</option><option value="offset" ${offset ? "selected" : ""}>\u6700\u5C0F/\u6700\u5927\u504F\u79FB</option></select></label>
         <label class="field" ${offset ? "hidden" : ""}><span>\u6CE2\u52A8\u6BD4\u4F8B</span><input id="executionFluctuationRatio" type="number" min="0" max="100" step="0.1" value="${(execution.fluctuation.ratio * 100).toFixed(1)}"><small>\u4F8B\u5982 10 \u8868\u793A\u7406\u8BBA\u65F6\u957F\u7684 \xB110%\u3002</small></label>
+        <label class="field" ${offset ? "hidden" : ""}><span>\u62BD\u6837\u53E3\u5F84</span><select id="executionSamplingMode"><option value="per-move" ${execution.fluctuation.samplingMode === "per-init" ? "" : "selected"}>\u6BCF\u4E2A Move \u91CD\u65B0\u968F\u673A</option><option value="per-init" ${execution.fluctuation.samplingMode === "per-init" ? "selected" : ""}>\u6BCF\u4E2A init \u65F6\u95F4\u9879\u521D\u6B21\u968F\u673A\u540E\u56FA\u5B9A</option></select><small>\u56FA\u5B9A\u62BD\u6837\u5728\u672C\u6B21\u8FD0\u884C\u53CA\u540E\u7EED\u91CD\u7B97\u4E2D\u590D\u7528\uFF0C\u540C seed \u53EF\u590D\u73B0\u3002</small></label>
         <label class="field" ${offset ? "" : "hidden"}><span>\u6700\u5C0F\u6CE2\u52A8\uFF08\u79D2\uFF09</span><input id="executionMinimumOffset" type="number" step="any" value="${execution.fluctuation.minimumOffsetSeconds}"></label>
         <label class="field" ${offset ? "" : "hidden"}><span>\u6700\u5927\u6CE2\u52A8\uFF08\u79D2\uFF09</span><input id="executionMaximumOffset" type="number" step="any" value="${execution.fluctuation.maximumOffsetSeconds}"></label>
       </div>
@@ -4760,9 +5791,9 @@ function stepDeviceTimingSelection(kind, offset) {
 function renderDeviceStationTiming() {
   const container = document.getElementById("deviceStationTimingEditor");
   const stationName = state.deviceStationName;
-  const station = state.baseDevice?.Stations?.[stationName];
+  const station2 = state.baseDevice?.Stations?.[stationName];
   const timing = state.deviceTimingDraft?.stations?.[stationName];
-  if (!station || !timing) {
+  if (!station2 || !timing) {
     container.innerHTML = `<div class="device-config-empty"><strong>\u6682\u65E0\u53EF\u914D\u7F6E\u7AD9\u70B9</strong><span>\u9009\u62E9\u6216\u5BFC\u5165\u8BBE\u5907\u540E\uFF0C\u53EF\u5728\u8FD9\u91CC\u6821\u51C6\u7AD9\u70B9\u52A8\u4F5C\u65F6\u95F4\u3002</span></div>`;
     return;
   }
@@ -4784,7 +5815,7 @@ function renderDeviceStationTiming() {
     </tr>
   `).join("");
   const alignmentEntries = Object.entries(timing.AlignmentTime || {});
-  const prePrepareRows = Array.isArray(station.PrePrepareTime) ? station.PrePrepareTime : [];
+  const prePrepareRows = Array.isArray(station2.PrePrepareTime) ? station2.PrePrepareTime : [];
   const specialRows = [
     ...alignmentEntries.map(([slotId, value]) => `
       <div class="device-transition-row">
@@ -4990,8 +6021,8 @@ function validateDeviceTimingDraft() {
     executionStations: state.deviceTimingDraft?.execution?.stations || {},
     executionRobots: state.deviceTimingDraft?.execution?.robots || {}
   };
-  Object.entries(timingSections).some(([sectionName, items]) => Object.entries(items).some(([itemName, fields]) => Object.entries(fields).some(([fieldName, values]) => {
-    const rows = Array.isArray(values) ? values.map((value, index) => [index, value]) : Object.entries(values || {});
+  Object.entries(timingSections).some(([sectionName, items]) => Object.entries(items).some(([itemName, fields]) => Object.entries(fields).some(([fieldName, values4]) => {
+    const rows = Array.isArray(values4) ? values4.map((value, index) => [index, value]) : Object.entries(values4 || {});
     const invalid = rows.find(([, value]) => !Number.isFinite(Number(value)) || Number(value) < 0);
     if (!invalid) return false;
     invalidLabel = `${sectionName}.${itemName}.${fieldName}.${invalid[0]}`;
@@ -5014,7 +6045,6 @@ async function saveDeviceTiming() {
     });
     state.workspaceDevice.device = structuredClone(result.device);
     applyDeviceTopology(result.device, state.deviceName, state.robotSlots);
-    resetRunResult();
     resetDeviceTimingDraft("\u65F6\u95F4\u53C2\u6570\u5DF2\u4FDD\u5B58\u5E76\u5E94\u7528\u5230\u5168\u90E8\u6D4B\u8BD5");
     setWorkspaceStatus("\u8BBE\u5907\u65F6\u95F4\u53C2\u6570\u5DF2\u4FDD\u5B58", "saved");
   } catch (error) {
@@ -5035,7 +6065,7 @@ function shortestDevicePath(source, destination) {
     const path = queue.shift(), node = path.at(-1);
     if (node === `S:${destination}`) return path.map((item) => item.slice(2));
     const [kind, name] = node.split(":");
-    const neighbours = kind === "S" ? state.robotNames.filter((robot) => (state.robotScopes[robot] || []).includes(name)).map((robot) => `R:${robot}`) : (state.robotScopes[name] || []).map((station) => `S:${station}`);
+    const neighbours = kind === "S" ? state.robotNames.filter((robot) => (state.robotScopes[robot] || []).includes(name)).map((robot) => `R:${robot}`) : (state.robotScopes[name] || []).map((station2) => `S:${station2}`);
     neighbours.forEach((next) => {
       if (!visited.has(next)) {
         visited.add(next);
@@ -5123,7 +6153,7 @@ function refreshCompactSelect(select) {
   trigger.disabled = select.disabled;
   trigger.setAttribute("aria-label", `${compactSelectLabel(select)}\uFF1A${selectedOption?.textContent?.trim() || "\u672A\u9009\u62E9"}`);
   trigger.querySelector(".compact-select-value").textContent = selectedOption?.textContent?.trim() || "\u672A\u9009\u62E9";
-  menu.innerHTML = Array.from(select.options).map((option, index) => `<button class="compact-select-option" type="button" role="option" data-option-index="${index}" aria-selected="${option.selected}" ${option.disabled ? "disabled" : ""}>${escapeHtml3(option.textContent?.trim() || "\u672A\u547D\u540D\u9009\u9879")}</button>`).join("");
+  menu.innerHTML = Array.from(select.options).map((option, index) => `<button class="compact-select-option" type="button" role="option" data-option-index="${index}" aria-selected="${option.selected}" ${option.disabled ? "disabled" : ""} ${option.hidden ? "hidden" : ""}>${escapeHtml3(option.textContent?.trim() || "\u672A\u547D\u540D\u9009\u9879")}</button>`).join("");
 }
 function initializeCompactSelects() {
   compactSelectTargets().forEach((select) => {
@@ -5225,8 +6255,9 @@ function renderWorkspaceControls() {
   document.getElementById("copyTestButton").disabled = !hasTest;
   document.getElementById("saveTestButton").disabled = !hasTest;
   document.getElementById("deleteTestButton").disabled = tests.length <= 1;
-  const batchDisabled = state.batchRunning && state.batchCancelRequested || singleRunActive || !state.serviceCompatible || !visibleTests.length;
+  const batchDisabled = runPreparationActive || state.batchRunning && state.batchCancelRequested || !state.serviceCompatible || !visibleTests.length;
   document.getElementById("batchRunButton").disabled = batchDisabled;
+  document.getElementById("batchResultFilterButton").disabled = !visibleTests.length;
   const emptyHint = document.getElementById("emptyGroupHint");
   emptyHint.classList.toggle("visible", Boolean(state.workspaceDeviceId) && !visibleTests.length);
   document.getElementById("emptyGroupNewTestButton").disabled = !state.workspaceDeviceId;
@@ -5236,64 +6267,119 @@ function renderWorkspaceControls() {
     cascade: "\u7EA7\u8054"
   }[detectDeviceTopologyLayout(state.device)];
   document.getElementById("deviceSummary").innerHTML = state.device ? `<span class="chip good">${escapeHtml3(deviceType)}</span>` : `<span class="chip">\u5C1A\u672A\u9009\u62E9\u8BBE\u5907</span>`;
+  const busy = runPreparationActive || state.batchRunning;
+  document.getElementById("runStrategyFields").disabled = busy;
+  document.getElementById("openRunSettingsButton").disabled = busy;
+  for (const [sourceId, targetId] of [["deviceSelect", "runDeviceSelect"], ["testGroupSelect", "runGroupSelect"]]) {
+    const source = document.getElementById(sourceId);
+    const target = document.getElementById(targetId);
+    target.innerHTML = source.innerHTML;
+    target.value = source.value;
+    target.disabled = source.disabled || busy;
+  }
+  document.getElementById("testContentFields").disabled = !hasTest;
+  if (!hasTest) document.getElementById("roundList").innerHTML = '<p class="hint">\u9009\u62E9\u6216\u65B0\u5EFA\u6D4B\u8BD5\u540E\u5F00\u59CB\u7F16\u8F91\u3002</p>';
+  document.getElementById("roundCount").disabled = !hasTest;
+  document.getElementById("saveAndRunPageButton").disabled = !hasTest;
+  document.getElementById("discardTestButton").disabled = !hasTest || !state.dirty;
+  document.querySelectorAll('[data-tab-target="test-management"], [data-tab-target="device-config"], [data-tab-target="route"]').forEach((button) => {
+    button.disabled = busy;
+    button.title = busy ? "\u8FD0\u884C\u7ED3\u675F\u540E\u53EF\u7F16\u8F91\u914D\u7F6E" : "";
+  });
+  renderTestCatalog(visibleTests);
   compactSelectTargets().forEach(refreshCompactSelect);
+}
+function renderTestCatalog(tests) {
+  const body = document.getElementById("testCatalogBody");
+  if (!body) return;
+  body.innerHTML = tests.map((test) => {
+    return `<div class="test-list-row" data-test-row="${escapeHtml3(test.id)}" role="listitem">
+      <strong class="test-list-name">${escapeHtml3(test.name || "\u672A\u547D\u540D\u6D4B\u8BD5")}</strong>
+      <div class="test-row-actions"><button class="btn small primary" type="button" data-test-action="edit" data-test-id="${escapeHtml3(test.id)}">\u7F16\u8F91</button><button class="btn small" type="button" data-test-action="copy" data-test-id="${escapeHtml3(test.id)}">\u590D\u5236</button><button class="btn small danger" type="button" data-test-action="delete" data-test-id="${escapeHtml3(test.id)}" ${state.workspaceDevice?.tests?.length <= 1 ? "disabled" : ""}>\u5220\u9664</button></div>
+    </div>`;
+  }).join("");
+}
+function showTestEditor() {
+  document.getElementById("testCatalogView").hidden = true;
+  document.getElementById("testEditorPanel").hidden = false;
+  renderRounds();
+  document.getElementById("testCaseName").focus();
+}
+function showTestCatalog() {
+  closeStepDrawer();
+  closePJobRoutePicker(false);
+  document.getElementById("testEditorPanel").hidden = true;
+  document.getElementById("testCatalogView").hidden = false;
+  renderWorkspaceControls();
+}
+async function switchManagementSection(section) {
+  if (!["cases", "routes", "devices"].includes(section) || section === activeManagementSection) return;
+  if (!await settleTestDraft()) return;
+  if (activeManagementSection === "routes" && state.routeDirty) {
+    document.getElementById("testDraftTitle").textContent = "\u8DEF\u5F84\u6A21\u677F\u6709\u672A\u4FDD\u5B58\u7684\u4FEE\u6539";
+    try {
+      if (!await resolveTestDraft(true, chooseTestDraft, saveRoutes, async () => discardRouteChanges())) return;
+    } finally {
+      document.getElementById("testDraftTitle").textContent = "\u6D4B\u8BD5\u6709\u672A\u4FDD\u5B58\u7684\u4FEE\u6539";
+    }
+  }
+  activeManagementSection = section;
+  document.querySelectorAll("[data-management-target]").forEach((button) => {
+    const selected = button.dataset.managementTarget === section;
+    button.classList.toggle("active", selected);
+    if (selected) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
+  document.querySelectorAll("[data-management-view]").forEach((view) => {
+    const selected = view.dataset.managementView === section;
+    view.classList.toggle("active", selected);
+    view.hidden = !selected;
+  });
+  if (section === "devices") renderDeviceTimingConfiguration();
+  if (section === "cases") showTestCatalog();
 }
 function setWorkspaceStatus(message, kind = "") {
   const status = document.getElementById("workspaceStatus");
   status.textContent = message;
-  status.className = `workspace-status ${kind}`.trim();
+  status.className = `workspace-status sr-only ${kind}`.trim();
 }
-var autoSaveTimer = null;
 var testEditRevision = 0;
 var testSaveInFlight = null;
-function scheduleAutoSave() {
-  window.clearTimeout(autoSaveTimer);
-  autoSaveTimer = window.setTimeout(() => {
-    if (state.dirty) saveCurrentTest(true).catch((error) => setWorkspaceStatus(`\u81EA\u52A8\u4FDD\u5B58\u5931\u8D25\uFF1A${error.message}`, "dirty"));
-  }, 600);
+async function discardTestDraft() {
+  if (!state.testCaseId) return;
+  const result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/tests/${state.testCaseId}`);
+  applyTestCase(result.test);
+}
+async function settleTestDraft() {
+  const allowed = await resolveTestDraft(state.dirty, chooseTestDraft, () => saveCurrentTest(false), discardTestDraft);
+  if (!allowed) renderWorkspaceControls();
+  return allowed && !state.dirty;
 }
 function markTestDirty() {
   if (!state.testCaseId) return;
   testEditRevision += 1;
   state.dirty = true;
   setWorkspaceStatus(`\u201C${state.testCaseName}\u201D\u6709\u672A\u4FDD\u5B58\u4FEE\u6539`, "dirty");
-  scheduleAutoSave();
+  document.getElementById("discardTestButton").disabled = false;
 }
 function markRoutesDirty() {
   state.routeDirty = true;
   setWorkspaceStatus("\u5F53\u524D\u8DEF\u5F84\u6A21\u677F\u6709\u672A\u4FDD\u5B58\u4FEE\u6539\uFF0C\u8BF7\u5728\u6A21\u677F\u65C1\u70B9\u51FB\u201C\u4FDD\u5B58\u201D", "dirty");
 }
 function resetRunResult() {
+  setRunResultView("results");
   visualizationWorkspace.clear();
   state.batchResult = null;
-  state.selectedBatchTestId = "";
-  batchPerformanceAnalyses.clear();
-  batchBottleneckSummaries.clear();
-  batchBottleneckRequests.clear();
-  batchBottleneckErrors.clear();
-  ["metricTime", "metricMakespan", "metricMoves", "metricValidation"].forEach((id) => {
-    document.getElementById(id).textContent = "\u2014";
-  });
-  ["metricTimeDetail", "metricMakespanDetail", "metricMovesDetail", "metricValidationDetail"].forEach((id) => {
-    document.getElementById(id).textContent = "";
-  });
-  document.getElementById("metricContext").textContent = "\u8FD0\u884C\u603B\u89C8";
-  document.getElementById("batchOverviewButton").hidden = true;
-  document.getElementById("testGroupAnalysisButton").hidden = true;
+  activeBatchContext = null;
+  batchCardAnalyses.clear();
+  batchCardAnalysisRequests.clear();
   document.getElementById("testGroupAnalysisPanel").hidden = true;
   document.getElementById("testGroupAnalysisPanel").innerHTML = "";
-  document.getElementById("metricTimeLabel").textContent = "Total Time";
-  document.getElementById("metricMakespanLabel").textContent = "Makespan";
-  setBottleneckMetric(null);
-  document.getElementById("metricValidationLabel").textContent = "Validation";
-  document.getElementById("metricValidation").closest(".metric").classList.remove("is-success", "is-error");
-  document.getElementById("batchProgress").classList.remove("visible");
   document.getElementById("batchResults").innerHTML = "";
-  for (const id of ["logButton", "ganttButton", "batchGanttButton"]) {
-    const link = document.getElementById(id);
-    link.href = "#";
-    link.setAttribute("aria-disabled", "true");
-  }
+  closeBatchTestDetails();
+  updateAnalysisReportAvailability();
+  updateBatchLogDownload({});
+  resetBatchGanttLink();
   resetSearchTelemetryView();
   writeTerminal("$ \u6D4B\u8BD5\u96C6\u5DF2\u5C31\u7EEA\uFF0C\u7B49\u5F85\u8FD0\u884C\u2026");
 }
@@ -5329,6 +6415,15 @@ function applyTestCase(testCase) {
     )
   };
   state.options.loadLockManager = state.options.loadLockManager || "petri-look";
+  const heuristicLoadLockOptionRanges = {
+    loadLockDirection: [0, 1],
+    loadLockCapacity: [0, 1, 2],
+    loadLockBindBatch: [0, 1]
+  };
+  for (const [key, allowedValues] of Object.entries(heuristicLoadLockOptionRanges)) {
+    const optionValue = Number(state.options[key]);
+    state.options[key] = allowedValues.includes(optionValue) ? optionValue : DEFAULT_SCHEDULE_OPTIONS[key];
+  }
   delete state.options.loadLockExchange;
   for (const key of ["residencyGuardSeconds", "maximumRobotHoldingSeconds", "maximumSystemResidenceCv"]) {
     const objectiveValue = Number(state.options[key]);
@@ -5372,23 +6467,25 @@ function applyTestCase(testCase) {
   state.routeEditSnapshot = null;
   state.routeEditGroupingProfile = null;
   state.routeEditIsNew = false;
-  const visualizationPlan = runtimePJobRouteInstances();
-  visualizationWorkspace.setAnalysisConfiguration(visualizationPlan.routes, visualizationPlan.rounds);
-  visualizationWorkspace.setReplayPlan(buildPayload());
+  if (!activeRunContext && !state.batchResult) {
+    const visualizationPlan = runtimePJobRouteInstances();
+    visualizationWorkspace.setAnalysisConfiguration(visualizationPlan.routes, visualizationPlan.rounds);
+    visualizationWorkspace.setReplayPlan(buildPayload());
+  }
   state.dirty = false;
   document.getElementById("roundCount").value = state.roundCount;
   document.querySelectorAll('input[name="strategy"]').forEach((input) => {
     input.checked = input.value === state.strategy;
   });
   document.querySelectorAll("[data-option]").forEach((input) => {
-    input.value = state.options[input.dataset.option] ?? input.value;
+    const optionValue = state.options[input.dataset.option];
+    if (input.type === "radio") input.checked = String(optionValue) === input.value;
+    else input.value = optionValue ?? input.value;
   });
   updateStrategyOptionVisibility();
   document.getElementById("roundCount").disabled = false;
-  if (Object.keys(state.algorithmMetadata).length) showAlgorithmDetails(state.strategy);
   renderAll();
   renderWorkspaceControls();
-  resetRunResult();
   setWorkspaceStatus(`\u5DF2\u8F7D\u5165\u201C${state.testCaseName}\u201D`, "saved");
 }
 function currentTestSnapshot(name = state.testCaseName) {
@@ -5397,10 +6494,10 @@ function currentTestSnapshot(name = state.testCaseName) {
   return structuredClone({
     name,
     group: state.testCaseGroup,
-    strategy: state.strategy,
+    strategy: state.workspaceDevice?.tests?.find((test) => test.id === state.testCaseId)?.strategy || "heuristic",
     roundCount: state.roundCount,
     times: state.times,
-    options: state.options,
+    options: state.workspaceDevice?.tests?.find((test) => test.id === state.testCaseId)?.options || {},
     cleans: state.cleans.map(runtimeClean),
     routeConfigs: state.testRouteConfigs,
     rounds: state.rounds
@@ -5442,6 +6539,24 @@ async function saveRoutes() {
   renderWorkspaceControls();
   setWorkspaceStatus("\u8DEF\u5F84\u6A21\u677F\u5DF2\u4FDD\u5B58\uFF0C\u5206\u7EC4\u5DF2\u5237\u65B0", "saved");
   return true;
+}
+function discardRouteChanges() {
+  if (!state.workspaceDevice) return;
+  state.routes = Array.isArray(state.workspaceDevice.routes) ? structuredClone(state.workspaceDevice.routes) : [];
+  state.routes.forEach((route) => normalizeRoute(route));
+  state.testRouteConfigs = normalizeTestRouteConfigs(state.testRouteConfigs, state.routes);
+  captureRouteGroupingProfiles();
+  state.routeDirty = false;
+  state.routeEditingIndex = -1;
+  state.routeEditSnapshot = null;
+  state.routeEditGroupingProfile = null;
+  state.routeEditIsNew = false;
+  state.routeNameChanges.clear();
+  state.expandedRouteProcessGroups.clear();
+  state.expandedRouteGroups.clear();
+  state.expandedRoutes.clear();
+  renderRoutes();
+  setWorkspaceStatus("\u5DF2\u653E\u5F03\u672A\u4FDD\u5B58\u7684\u8DEF\u5F84\u4FEE\u6539", "saved");
 }
 function beginRouteEdit(routeIndex, isNew = false) {
   if (!state.routes[routeIndex]) return false;
@@ -5515,10 +6630,9 @@ async function saveCurrentTest(silent = false) {
       state.dirty = false;
       state.routeNameChanges.clear();
       renderWorkspaceControls();
-      setWorkspaceStatus(`${silent ? "\u5DF2\u81EA\u52A8\u4FDD\u5B58" : "\u5DF2\u4FDD\u5B58"}\u201C${state.testCaseName}\u201D`, "saved");
+      setWorkspaceStatus(`\u5DF2\u4FDD\u5B58\u201C${state.testCaseName}\u201D`, "saved");
     } else {
       state.dirty = true;
-      scheduleAutoSave();
     }
     return true;
   })();
@@ -5531,7 +6645,7 @@ async function saveCurrentTest(silent = false) {
 }
 async function createTestCase(copyCurrent = false, targetGroup = state.activeTestGroup) {
   if (!state.workspaceDeviceId) throw new Error("\u8BF7\u5148\u9009\u62E9\u8BBE\u5907");
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   const source = copyCurrent ? currentTestSnapshot(`${state.testCaseName} \u526F\u672C`) : makeDefaultTestCase(`\u6D4B\u8BD5\u96C6 ${(state.workspaceDevice?.tests?.length || 0) + 1}`);
   source.group = targetGroup;
   const result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/tests`, {
@@ -5550,7 +6664,7 @@ async function createTestGroup() {
   if (!group) throw new Error("\u6D4B\u8BD5\u7EC4\u522B\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A");
   const exists = (state.workspaceDevice?.testGroups || []).includes(group) || (state.workspaceDevice?.tests || []).some((test) => String(test.group || "").trim() === group);
   if (exists) throw new Error(`\u6D4B\u8BD5\u7EC4\u522B\u201C${group}\u201D\u5DF2\u7ECF\u5B58\u5728`);
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   let result;
   try {
     result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/groups`, {
@@ -5569,7 +6683,6 @@ async function createTestGroup() {
   state.testCaseGroup = group;
   state.dirty = false;
   renderWorkspaceControls();
-  resetRunResult();
   setWorkspaceStatus(`\u5DF2\u65B0\u5EFA\u6D4B\u8BD5\u7EC4\u522B\u201C${group}\u201D\uFF0C\u8BF7\u5728\u8BE5\u7EC4\u4E2D\u65B0\u5EFA\u6D4B\u8BD5`, "saved");
 }
 async function renameCurrentTestGroup() {
@@ -5578,7 +6691,7 @@ async function renameCurrentTestGroup() {
   const group = await showWorkspaceDialog({ title: "\u91CD\u547D\u540D\u6D4B\u8BD5\u7EC4\u522B", message: "\u7EC4\u5185\u6D4B\u8BD5\u4F1A\u4FDD\u7559\uFF0C\u5E76\u540C\u6B65\u4F7F\u7528\u65B0\u7EC4\u522B\u540D\u79F0\u3002", value: oldName, needsInput: true });
   if (group === null || group === oldName) return;
   if (!group) throw new Error("\u6D4B\u8BD5\u7EC4\u522B\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A");
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   const result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/groups`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -5601,7 +6714,7 @@ async function deleteCurrentTestGroup() {
   const displayName = group || "\u672A\u5206\u7EC4";
   const confirmed = await showWorkspaceDialog({ title: "\u5220\u9664\u6D4B\u8BD5\u7EC4\u522B", message: `\u786E\u5B9A\u5220\u9664\u201C${displayName}\u201D\u5417\uFF1F${impact}`, dangerous: true });
   if (!confirmed) return;
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   const result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/groups`, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
@@ -5623,7 +6736,6 @@ async function deleteCurrentTestGroup() {
     applyTestCase(nextResult.test);
   } else {
     renderWorkspaceControls();
-    resetRunResult();
     setWorkspaceStatus(`\u5DF2\u5220\u9664\u6D4B\u8BD5\u7EC4\u522B\u201C${displayName}\u201D`, "saved");
   }
 }
@@ -5649,11 +6761,10 @@ async function deleteCurrentTest() {
   state.testCaseGroup = currentGroup;
   state.dirty = false;
   renderWorkspaceControls();
-  resetRunResult();
   setWorkspaceStatus(`\u5DF2\u5220\u9664\u6D4B\u8BD5\u201C${deletedTestName}\u201D`, "saved");
 }
 async function selectWorkspaceTest(testId) {
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   const index = state.workspaceDevice?.tests?.findIndex((test) => test.id === testId) ?? -1;
   if (index < 0) throw new Error(`\u6D4B\u8BD5\u96C6\u4E0D\u5B58\u5728\uFF1A${testId}`);
   const result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/tests/${testId}`);
@@ -5662,7 +6773,7 @@ async function selectWorkspaceTest(testId) {
   applyTestCase(testCase);
 }
 async function selectWorkspaceGroup(group) {
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   state.activeTestGroup = group;
   const testCase = state.workspaceDevice?.tests?.find((test) => String(test.group || "").trim() === group);
   if (!testCase) {
@@ -5671,11 +6782,12 @@ async function selectWorkspaceGroup(group) {
     state.testCaseGroup = group;
     state.dirty = false;
     renderWorkspaceControls();
-    resetRunResult();
+    showCurrentGroupTestCards(true);
     setWorkspaceStatus(`\u6D4B\u8BD5\u7EC4\u522B\u201C${group || "\u672A\u5206\u7EC4"}\u201D\u6682\u65E0\u6D4B\u8BD5`, "saved");
     return;
   }
   await selectWorkspaceTest(testCase.id);
+  showCurrentGroupTestCards(true);
 }
 async function selectWorkspaceDevice(deviceId, preferredTestId = "") {
   const result = await requestJson(`/api/workspaces/${deviceId}`);
@@ -5688,17 +6800,21 @@ async function selectWorkspaceDevice(deviceId, preferredTestId = "") {
   state.routes = Array.isArray(result.device.routes) ? structuredClone(result.device.routes) : [];
   state.cleans = Array.isArray(result.device.cleans) ? structuredClone(result.device.cleans).map(normalizeClean) : [];
   if (!result.device.tests.length) {
-    const created = await requestJson(`/api/workspaces/${deviceId}/tests`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(makeDefaultTestCase())
-    });
-    state.workspaceDevice.tests.push(created.test);
+    state.testCaseId = "";
+    state.testCaseName = "";
+    state.rounds = [];
+    state.dirty = false;
+    renderAll();
+    renderWorkspaceControls();
+    showCurrentGroupTestCards(true);
+    setWorkspaceStatus("\u8BE5\u8BBE\u5907\u6682\u65E0\u6D4B\u8BD5\uFF0C\u8BF7\u5728\u6D4B\u8BD5\u7BA1\u7406\u4E2D\u65B0\u5EFA\u6216\u5BFC\u5165", "saved");
+    return;
   }
   const summary = state.workspaceDevices.find((device) => device.id === deviceId);
   if (summary) summary.testCount = state.workspaceDevice.tests.length;
   const selected = state.workspaceDevice.tests.find((test) => test.id === preferredTestId) || state.workspaceDevice.tests[0];
   await selectWorkspaceTest(selected.id);
+  showCurrentGroupTestCards(true);
 }
 async function loadWorkspaceCatalog(preferredDeviceId = "", preferredTestId = "") {
   const result = await requestJson("/api/workspaces");
@@ -5733,7 +6849,7 @@ function resetWorkspaceSelection() {
   state.deviceTimingStatusMessage = "\u9009\u62E9\u8BBE\u5907\u540E\u5F00\u59CB\u914D\u7F6E";
   renderWorkspaceControls();
   renderDeviceTimingConfiguration();
-  resetRunResult();
+  showCurrentGroupTestCards(true);
 }
 async function deleteWorkspaceDevice() {
   if (!state.workspaceDeviceId) return;
@@ -5755,13 +6871,68 @@ async function deleteWorkspaceDevice() {
     setWorkspaceStatus(`\u8BBE\u5907\u5DF2\u5220\u9664\uFF0C\u4F46\u76EE\u5F55\u5237\u65B0\u5931\u8D25\uFF1A${error.message}`, "dirty");
   }
 }
-function switchTab(name) {
-  document.querySelectorAll("[data-tab-target]").forEach((button) => button.classList.toggle("active", button.dataset.tabTarget === name));
-  document.querySelectorAll("[data-tab-view]").forEach((view) => view.classList.toggle("active", view.dataset.tabView === name));
-  document.getElementById("scheduleSide").classList.toggle("is-hidden", name !== "schedule");
-  document.getElementById("pageLayout").classList.toggle("editor-mode", name !== "schedule");
-  if (name === "device-config") renderDeviceTimingConfiguration();
-  if (name !== "route") closeStepDrawer();
+function canOpenAnalysisReport() {
+  return Boolean(state.batchResult?.items?.some((item) => hasBatchResultMetrics(item) && item.resultUrl));
+}
+function updateAnalysisReportAvailability() {
+  const button = document.getElementById("analysisReportViewButton");
+  const enabled = canOpenAnalysisReport();
+  button.disabled = !enabled;
+  button.title = enabled ? "\u914D\u7F6E\u6216\u67E5\u770B\u6D4B\u8BD5\u7EC4\u5206\u6790\u62A5\u544A" : "\u81F3\u5C11\u5B8C\u6210\u4E00\u9879\u53EF\u5206\u6790\u6D4B\u8BD5\u540E\u624D\u80FD\u67E5\u770B\u5206\u6790\u62A5\u544A";
+  if (!enabled && !document.getElementById("runAnalysisView").hidden) setRunResultView("results");
+}
+function setRunResultView(view) {
+  const analysis = view === "analysis";
+  if (analysis && !canOpenAnalysisReport()) return;
+  document.getElementById("runResultsView").hidden = analysis;
+  document.getElementById("runAnalysisView").hidden = !analysis;
+  document.querySelectorAll("[data-result-view]").forEach((button) => {
+    const selected = button.dataset.resultView === view;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+}
+async function switchTab(name) {
+  if (navigationPending) return;
+  const requestedManagementSection = name === "route" ? "routes" : name === "device-config" ? "devices" : null;
+  if (requestedManagementSection) name = "test-management";
+  if (document.querySelector("[data-tab-view].active")?.dataset.tabView === name) {
+    if (requestedManagementSection) await switchManagementSection(requestedManagementSection);
+    return;
+  }
+  if ((runPreparationActive || state.batchRunning) && !["schedule", "playback"].includes(name)) return;
+  navigationPending = true;
+  try {
+    if (!await settleTestDraft()) return;
+    if (activeManagementSection === "routes" && name !== "test-management" && state.routeDirty) {
+      document.getElementById("testDraftTitle").textContent = "\u8DEF\u5F84\u6A21\u677F\u6709\u672A\u4FDD\u5B58\u7684\u4FEE\u6539";
+      try {
+        if (!await resolveTestDraft(true, chooseTestDraft, saveRoutes, async () => discardRouteChanges())) return;
+      } finally {
+        document.getElementById("testDraftTitle").textContent = "\u6D4B\u8BD5\u6709\u672A\u4FDD\u5B58\u7684\u4FEE\u6539";
+      }
+    }
+    document.querySelectorAll(".primary-sidebar [data-tab-target]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.tabTarget === name);
+      if (button.dataset.tabTarget === name) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
+    document.querySelectorAll("[data-tab-view]").forEach((view) => view.classList.toggle("active", view.dataset.tabView === name));
+    const managementSubtabs = document.querySelector(".sidebar-subtabs");
+    if (managementSubtabs) managementSubtabs.hidden = name !== "test-management";
+    document.getElementById("scheduleSide").classList.toggle("is-hidden", name !== "schedule");
+    document.getElementById("pageLayout").classList.toggle("editor-mode", name !== "schedule");
+    if (name === "test-management" && requestedManagementSection) await switchManagementSection(requestedManagementSection);
+    if (name === "test-management" && activeManagementSection === "devices") renderDeviceTimingConfiguration();
+    closeStepDrawer();
+    closePJobRoutePicker(false);
+    if (name === "schedule") renderAll();
+    renderWorkspaceControls();
+  } catch (error) {
+    setWorkspaceStatus(`\u65E0\u6CD5\u79BB\u5F00\u6D4B\u8BD5\uFF1A${error.message}`, "dirty");
+  } finally {
+    navigationPending = false;
+  }
 }
 function resizeRounds(count) {
   normalizeRounds();
@@ -6251,7 +7422,7 @@ function renderRouteInstanceSteps(route, pjob, loadPort = "") {
   }
   return `<table class="route-table"><thead><tr><th>StepID</th><th>\u7C7B\u578B</th><th>\u53EF\u9009\u8154\u5BA4 / \u673A\u5668\u624B</th><th>PostStepID</th><th>NeedProcess</th></tr></thead><tbody>${(runtimeRoute.stages || []).map((stage, stageIndex) => {
     const fixed = isFixedRouteStep(runtimeRoute, stageIndex);
-    return `<tr ${fixed ? "" : "data-step-card"} data-route-index="${routeIndex}" data-stage-index="${stageIndex}">
+    return `<tr ${fixed ? "" : 'data-step-card tabindex="0" role="button"'} data-route-index="${routeIndex}" data-stage-index="${stageIndex}">
       <td><span class="step-id-badge">${Number(stage.stepId)}</span></td>
       <td>${fixed ? `<span class="route-step-source-note">\u7531 CJob LoadPort \u51B3\u5B9A</span>` : `<span class="step-type ${stage.needProcess ? "process" : ""}">${stepKind(route, stageIndex)}</span>`}</td>
       <td>${fixed ? `<span class="route-step-readonly">\u2014</span>` : renderReadonlyCandidates(stage)}</td>
@@ -6326,7 +7497,7 @@ function openPJobRoutePicker(button) {
     groups,
     processKey: selectedProcess?.key || "",
     structureKey: selectedStructure?.key || "",
-    mode: "select"
+    mode: selectedRoute ? "edit" : "select"
   };
   document.getElementById("pjobRouteDialogTitle").textContent = `\u9009\u62E9 ${pjob.jobName} \u7684\u8DEF\u5F84`;
   const processSelect = document.getElementById("pjobRouteProcess");
@@ -6358,8 +7529,7 @@ function selectPJobRoute(routeIndex) {
   );
   normalizeRounds();
   markTestDirty();
-  context.mode = "edit";
-  renderPJobRouteDialogGroup(context.processKey, context.structureKey);
+  closePJobRoutePicker(false);
 }
 function renderPJobRoutePicker(pjob, roundIndex, cjobIndex, pjobIndex) {
   const selectedRoute = state.routes.find((route) => route.name === pjob.routeRef);
@@ -6374,6 +7544,10 @@ function renderPJobRoutePicker(pjob, roundIndex, cjobIndex, pjobIndex) {
 function renderRounds() {
   normalizeRounds();
   const host = document.getElementById("roundList");
+  if (!state.testCaseId) {
+    host.innerHTML = '<p class="hint">\u9009\u62E9\u6216\u65B0\u5EFA\u6D4B\u8BD5\u540E\u5F00\u59CB\u7F16\u8F91\u3002</p>';
+    return;
+  }
   host.innerHTML = state.rounds.map((round, roundIndex) => {
     const roundTitle = roundIndex ? `\u7B2C ${roundIndex + 1} \u8F6E\u91CD\u7B97` : "\u9996\u6B21\u6392\u7A0B";
     const serialMode = round.cjobs.some((cjob) => ["Pipeline", "Sequential"].includes(cjob.taskMode));
@@ -6478,10 +7652,10 @@ function renderStepDrawer() {
   </details>` : `<div class="empty">\u672A\u9009\u62E9\u5019\u9009\u8BBE\u5907\uFF0C\u8BF7\u5148\u5728\u8DEF\u5F84\u5217\u8868\u4E2D\u9009\u62E9\u3002</div>`;
   document.getElementById("drawerBody").innerHTML = editor;
 }
-function openPJobStepDrawer(routeIndex, stageIndex) {
+function openPJobStepDrawer(routeIndex, stageIndex, inlineContext = null) {
   const route = state.routes[routeIndex];
   if (!route || isFixedRouteStep(route, stageIndex)) return;
-  const context = pjobRoutePickerContext;
+  const context = inlineContext || pjobRoutePickerContext;
   if (!context) return;
   state.drawer = {
     scope: "test",
@@ -6579,7 +7753,6 @@ async function setRobotArmCount(robotName, armCount) {
     });
     state.workspaceDevice.robotSlots = structuredClone(result.robotSlots);
     applyDeviceTopology(state.baseDevice, state.deviceName, result.robotSlots);
-    resetRunResult();
     setWorkspaceStatus(`\u5DF2\u4FDD\u5B58 ${robotName} \u7684${boundedCount >= DUAL_ARM_SLOT_COUNT ? "\u53CC\u81C2" : "\u5355\u81C2"}\u914D\u7F6E`, "saved");
   } catch (error) {
     applyDeviceTopology(state.baseDevice, state.deviceName, previousSelections);
@@ -6615,6 +7788,46 @@ function openSearchTreeOptionsDialog() {
   document.getElementById("searchTreeCheckpointHint").textContent = configuredPath ? "\u5F53\u524D checkpoint \u5DF2\u4FDD\u5B58\u5728\u672C\u5730\u670D\u52A1\u4E2D\uFF1B\u91CD\u65B0\u9009\u62E9\u6587\u4EF6\u53EF\u66FF\u6362\u5B83\u3002" : "\u9009\u62E9\u672C\u673A checkpoint \u540E\u5C06\u4E0A\u4F20\u5230\u672C\u5730\u670D\u52A1\uFF0C\u5E76\u7528\u4E8E\u540E\u7EED\u8FD0\u884C\u3002";
   document.getElementById("searchTreeOptionsDialog").showModal();
 }
+function openHeuristicSettingsDialog() {
+  document.getElementById("heuristicSettingsError").textContent = "";
+  const configured = state.options.heuristicConfig && typeof state.options.heuristicConfig === "object" ? state.options.heuristicConfig : null;
+  document.getElementById("heuristicCustomWeightsEnabled").checked = Boolean(configured);
+  document.querySelectorAll("[data-heuristic-weight]").forEach((input) => {
+    const key = input.dataset.heuristicWeight;
+    input.value = configured?.[key] ?? DEFAULT_HEURISTIC_WEIGHTS[key];
+  });
+  for (const key of ["loadLockDirection", "loadLockCapacity", "loadLockBindBatch"]) {
+    document.querySelectorAll(`[data-heuristic-dialog-option="${key}"]`).forEach((input) => {
+      input.checked = String(state.options[key]) === input.value;
+    });
+  }
+  updateHeuristicWeightEditorState();
+  document.getElementById("heuristicSettingsDialog").showModal();
+}
+function updateHeuristicWeightEditorState() {
+  const enabled = document.getElementById("heuristicCustomWeightsEnabled")?.checked === true;
+  document.querySelectorAll("[data-heuristic-weight]").forEach((input) => {
+    input.disabled = !enabled;
+  });
+  document.getElementById("heuristicWeightFields")?.classList.toggle("is-disabled", !enabled);
+}
+function saveHeuristicSettings() {
+  for (const key of ["loadLockDirection", "loadLockCapacity", "loadLockBindBatch"]) {
+    const input = document.querySelector(`[data-heuristic-dialog-option="${key}"]:checked`);
+    state.options[key] = Number(input?.value);
+  }
+  if (document.getElementById("heuristicCustomWeightsEnabled").checked) {
+    const weights = {};
+    document.querySelectorAll("[data-heuristic-weight]").forEach((input) => {
+      const value = Number(input.value);
+      if (!Number.isFinite(value)) throw new Error(`${input.dataset.heuristicWeight} \u5FC5\u987B\u662F\u6709\u9650\u6570\u5B57`);
+      weights[input.dataset.heuristicWeight] = value;
+    });
+    state.options.heuristicConfig = weights;
+  } else state.options.heuristicConfig = null;
+  retainSessionSchedulingConfiguration();
+  document.getElementById("heuristicSettingsDialog").close();
+}
 async function uploadSearchTreeCheckpoint(file) {
   const response = await fetch("/api/model-checkpoints", {
     method: "POST",
@@ -6635,7 +7848,6 @@ async function saveSearchTreeOptions() {
     state.options.searchTreeModelPath = modelPath;
     pendingSearchTreeCheckpointFile = null;
     retainSessionSchedulingConfiguration();
-    markTestDirty();
     renderAll();
     document.getElementById("searchTreeOptionsDialog").close();
   } finally {
@@ -6648,7 +7860,7 @@ function updateStateFromControl(control) {
   const scope = control.dataset.scope;
   const routeControl = ["stage-candidates", "stage-candidate-toggle"].includes(scope);
   if (routeControl) markRoutesDirty();
-  else markTestDirty();
+  else if (!control.dataset.option) markTestDirty();
   if (control.dataset.timeIndex !== void 0) {
     state.times[Number(control.dataset.timeIndex)] = value;
     return;
@@ -6660,6 +7872,9 @@ function updateStateFromControl(control) {
     return;
   }
   if (control.dataset.option) {
+    if (["loadLockDirection", "loadLockCapacity", "loadLockBindBatch"].includes(control.dataset.option)) {
+      value = Number(control.value);
+    }
     if (["residencyGuardSeconds", "maximumRobotHoldingSeconds", "maximumSystemResidenceCv"].includes(control.dataset.option)) {
       value = Number.isFinite(value) ? Math.max(0, value) : 0;
       control.value = value;
@@ -6945,10 +8160,10 @@ function collectRecipes(routes = state.routes) {
   return recipes;
 }
 function stationSlotList(stationName) {
-  const station = state.device?.Stations?.[stationName];
-  if (station) {
-    if (Array.isArray(station.Slots) && station.Slots.length) return station.Slots.map(Number);
-    const capacity = Number(station.Capacity) || 0;
+  const station2 = state.device?.Stations?.[stationName];
+  if (station2) {
+    if (Array.isArray(station2.Slots) && station2.Slots.length) return station2.Slots.map(Number);
+    const capacity = Number(station2.Capacity) || 0;
     return capacity >= 1 ? Array.from({ length: capacity }, (_, index) => index + 1) : [1];
   }
   const robot = state.device?.Robots?.[stationName];
@@ -6995,11 +8210,19 @@ function buildPayload() {
   const instances = runtimePJobRouteInstances();
   const routes = instances.routes.map((route) => ({ ...normalizeRoute(route), stages: route.stages.map((stage) => ({ ...stage, visits: stage.visits.map((visit) => structuredClone(visit)) })) }));
   const cleans = state.cleans.map(runtimeClean);
-  const options = { ...state.options };
+  const options = schedulingRequestOptions();
   if (state.strategy === "search-tree") {
     options.searchTreeExecutionMode = "continuous";
   }
-  return { schemaVersion: EXPECTED_API_SCHEMA, workspaceDeviceId: state.workspaceDeviceId, workspaceTestId: state.testCaseId, deviceName: state.deviceName, device: state.device, strategy: state.strategy, roundCount: state.roundCount, options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), executionTimingEnabled: executionTimingEnabled(), skipBaseline: skipBaselineEnabled(), cleanValidationTypes: cleanValidationTypes(), recipes: collectRecipes(routes), cleans, routes, rounds: instances.rounds };
+  return { schemaVersion: EXPECTED_API_SCHEMA, workspaceDeviceId: state.workspaceDeviceId, workspaceTestId: state.testCaseId, deviceName: state.deviceName, device: state.device, strategy: state.strategy, roundCount: state.roundCount, options, hongYeCheck: hongYeCheckEnabled(), executionTimingEnabled: executionTimingEnabled(), skipBaseline: skipBaselineEnabled(), cleanValidationTypes: cleanValidationTypes(), recipes: collectRecipes(routes), cleans, routes, rounds: instances.rounds };
+}
+function schedulingRequestOptions() {
+  if (state.strategy !== "heuristic") return { ...state.options };
+  const options = Object.fromEntries(
+    ["loadLockDirection", "loadLockCapacity", "loadLockBindBatch"].map((key) => [key, state.options[key]])
+  );
+  if (state.options.heuristicConfig) options.heuristicConfig = structuredClone(state.options.heuristicConfig);
+  return options;
 }
 function clampParallelismInput(elementId, min, max, fallback) {
   const input = document.getElementById(elementId);
@@ -7023,7 +8246,6 @@ function cleanValidationTypes() {
 var runSettingsPreferencesDirty = false;
 function currentRunSettingsPreferences() {
   return {
-    compatibilityMode: compatibilityModeEnabled(),
     hongYeCheck: hongYeCheckEnabled(),
     skipBaseline: skipBaselineEnabled(),
     executionTimingEnabled: executionTimingEnabled(),
@@ -7035,7 +8257,6 @@ function currentRunSettingsPreferences() {
 function applyRunSettingsPreferences(settings) {
   if (!settings || typeof settings !== "object") return;
   const checkboxFields = {
-    compatibilityMode: "compatibilityModeInput",
     hongYeCheck: "hongYeCheckInput",
     skipBaseline: "skipBaselineInput",
     executionTimingEnabled: "executionTimingEnabledInput"
@@ -7070,17 +8291,51 @@ async function saveRunSettingsPreferences() {
   });
   applyRunSettingsPreferences(result.runSettings);
 }
+function currentAnalysisSettingsPreferences() {
+  return {
+    metricIds: [...document.querySelectorAll("[data-analysis-metric]:checked")].map((input) => String(input.value)),
+    windowMode: String(document.getElementById("analysisWindowMode")?.value || "steady"),
+    timeBudgetSeconds: Number(document.getElementById("analysisTimeBudget")?.value || 120)
+  };
+}
+function applyAnalysisSettingsPreferences(settings) {
+  if (!settings || typeof settings !== "object") return;
+  const selectedIds = new Set(Array.isArray(settings.metricIds) ? settings.metricIds : []);
+  document.querySelectorAll("[data-analysis-metric]").forEach((input) => {
+    input.checked = selectedIds.has(String(input.value));
+  });
+  const windowInput = document.getElementById("analysisWindowMode");
+  const budgetInput = document.getElementById("analysisTimeBudget");
+  if (windowInput && ["steady", "full"].includes(String(settings.windowMode))) {
+    windowInput.value = String(settings.windowMode);
+  }
+  if (budgetInput && [30, 120, 300].includes(Number(settings.timeBudgetSeconds))) {
+    budgetInput.value = String(settings.timeBudgetSeconds);
+  }
+  analysisSettingsPreferencesDirty = false;
+}
+async function loadAnalysisSettingsPreferences() {
+  const result = await requestJson("/api/preferences/analysis-settings", { cache: "no-store" });
+  if (!analysisSettingsPreferencesDirty) applyAnalysisSettingsPreferences(result.analysisSettings);
+}
+async function saveAnalysisSettingsPreferences() {
+  const result = await requestJson("/api/preferences/analysis-settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ analysisSettings: currentAnalysisSettingsPreferences() })
+  });
+  applyAnalysisSettingsPreferences(result.analysisSettings);
+}
 function hongYeCheckEnabled() {
   return document.getElementById("hongYeCheckInput")?.checked === true;
 }
 function executionTimingEnabled() {
-  return compatibilityModeEnabled() && document.getElementById("executionTimingEnabledInput")?.checked === true;
+  return document.getElementById("executionTimingEnabledInput")?.checked === true;
 }
 var runSettingsTrigger = null;
 function updateRunSettingsButtonLabel() {
   const button = document.getElementById("openRunSettingsButton");
   if (!button) return;
-  const compatibility = document.getElementById("compatibilityModeInput")?.checked === true;
   const hongYe = document.getElementById("hongYeCheckInput")?.checked === true;
   const skipBaseline = document.getElementById("skipBaselineInput")?.checked === true;
   const executionTiming = document.getElementById("executionTimingEnabledInput")?.checked === true;
@@ -7089,16 +8344,14 @@ function updateRunSettingsButtonLabel() {
   const enabledCleanTypes = cleanValidationTypes();
   const validationInput = document.getElementById("validationParallelismInput");
   if (validationInput) validationInput.disabled = !hongYe;
-  const executionInput = document.getElementById("executionTimingEnabledInput");
-  if (executionInput) executionInput.disabled = !compatibility;
-  const labels = [compatibility && "\u517C\u5BB9\u6A21\u5F0F", executionTiming && compatibility && "\u6267\u884C\u65F6\u95F4\u6A21\u62DF", hongYe && "HongYe Check", skipBaseline && "\u8DF3\u8FC7 Baseline", enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length && `Clean \u6821\u9A8C ${enabledCleanTypes.length}/${CLEAN_VALIDATION_TYPES.length}`].filter(Boolean);
+  const labels = [executionTiming && "\u65F6\u95F4\u6CE2\u52A8\u6A21\u5F0F", hongYe && "HongYe Check", skipBaseline && "\u8DF3\u8FC7 Baseline", enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length && `Clean \u6821\u9A8C ${enabledCleanTypes.length}/${CLEAN_VALIDATION_TYPES.length}`].filter(Boolean);
   const parallelism = `\u7B97\u6CD5\xD7${algorithmWorkers}${hongYe ? ` \u6821\u9A8C\xD7${validationWorkers}` : ""}`;
   const summary = labels.length ? `\u8FD0\u884C\u8BBE\u7F6E\uFF1A${labels.join("\u3001")}\uFF08${parallelism}\uFF09` : `\u8FD0\u884C\u8BBE\u7F6E\uFF1A${parallelism}`;
   button.setAttribute("aria-label", summary);
   button.setAttribute("title", summary);
   button.classList.toggle(
     "is-customized",
-    !compatibility || executionTiming || !hongYe || !skipBaseline || algorithmWorkers !== 4 || validationWorkers !== 2 || enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length
+    executionTiming || !hongYe || !skipBaseline || algorithmWorkers !== 4 || validationWorkers !== 2 || enabledCleanTypes.length !== CLEAN_VALIDATION_TYPES.length
   );
 }
 function openRunSettingsDialog() {
@@ -7106,7 +8359,7 @@ function openRunSettingsDialog() {
   runSettingsTrigger = document.getElementById("openRunSettingsButton");
   runSettingsTrigger?.setAttribute("aria-expanded", "true");
   dialog.showModal();
-  window.setTimeout(() => document.getElementById("compatibilityModeInput")?.focus(), 0);
+  window.setTimeout(() => document.getElementById("executionTimingEnabledInput")?.focus(), 0);
 }
 function closeRunSettingsDialog() {
   const dialog = document.getElementById("runSettingsDialog");
@@ -7124,9 +8377,6 @@ function finishRunSettingsDialog() {
   runSettingsTrigger?.setAttribute("aria-expanded", "false");
   if (runSettingsTrigger?.isConnected) runSettingsTrigger.focus();
   runSettingsTrigger = null;
-}
-function compatibilityModeEnabled() {
-  return document.getElementById("compatibilityModeInput")?.checked === true;
 }
 function skipBaselineEnabled() {
   return document.getElementById("skipBaselineInput")?.checked === true;
@@ -7146,71 +8396,22 @@ function renderOtherAlgorithmOptions(algorithms) {
     </label>
   `).join("");
   updateStrategyOptionVisibility();
-  renderAlgorithmMetadata();
 }
 function updateStrategyOptionVisibility() {
   const algorithm = state.availableAlgorithms.find((item) => item.strategy === state.strategy);
   const optionGroups = new Set(algorithm?.optionGroups || []);
   document.getElementById("loadlockOptions").classList.toggle("is-hidden", !optionGroups.has("loadlock"));
-  document.getElementById("heuristicObjectiveOptions").classList.toggle("is-hidden", !optionGroups.has("heuristic-objectives"));
+  document.getElementById("heuristicSettings").classList.toggle("is-hidden", state.strategy !== "heuristic");
   document.getElementById("searchTreeOptions").classList.toggle("is-hidden", !optionGroups.has("search-tree"));
-}
-function showAlgorithmDetails(strategy) {
-  const metadata = state.algorithmMetadata[strategy] || {};
-  const cardName = document.querySelector(`[data-strategy-card="${CSS.escape(strategy)}"] b`)?.textContent;
-  document.getElementById("algorithmHoverInfo").innerHTML = `
-    <span class="algorithm-hover-info-name">${escapeHtml3(metadata.name || cardName || strategy)}<small>\u7B97\u6CD5\u7B80\u4ECB</small></span>
-    <span class="algorithm-hover-info-description">${escapeHtml3(metadata.introduction || "\u6682\u65E0\u7B97\u6CD5\u7B80\u4ECB")}</span>
-  `;
 }
 function displayStrategyName(strategy) {
   const normalized = String(strategy || "heuristic");
   const cardName = document.querySelector(`[data-strategy-card="${CSS.escape(normalized)}"] b`)?.textContent;
   return state.algorithmMetadata[normalized]?.name || cardName || normalized;
 }
-function renderAlgorithmMetadata() {
-  document.querySelectorAll("[data-strategy-card]").forEach((card) => {
-    const strategy = card.dataset.strategyCard;
-    card.onmouseenter = () => showAlgorithmDetails(strategy);
-    card.onfocusin = () => showAlgorithmDetails(strategy);
-  });
-  const strategyOptions = document.querySelector(".strategy-options");
-  strategyOptions.onmouseleave = () => showAlgorithmDetails(state.strategy);
-  strategyOptions.onfocusout = (event) => {
-    if (!strategyOptions.contains(event.relatedTarget)) showAlgorithmDetails(state.strategy);
-  };
-  showAlgorithmDetails(state.strategy);
-}
 function readableLogFileName(testName) {
   const readableTestName = String(testName || "\u5F53\u524D\u6D4B\u8BD5").replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_").replace(/^[ ._]+|[ ._]+$/g, "") || "\u5F53\u524D\u6D4B\u8BD5";
   return `\u590D\u73B0\u65E5\u5FD7-${readableTestName}.json`;
-}
-function prepareLogDownload(result) {
-  if (!result?.logUrl) return false;
-  const link = document.getElementById("logButton");
-  link.href = result.logUrl;
-  link.download = readableLogFileName(state.testCaseName);
-  link.removeAttribute("aria-disabled");
-  return true;
-}
-function prepareGanttView(result) {
-  if (!result?.ganttUrl) return false;
-  const link = document.getElementById("ganttButton");
-  link.href = result.ganttUrl;
-  link.removeAttribute("aria-disabled");
-  return true;
-}
-async function prepareWorkspaceView(result) {
-  if (!result?.resultId) return null;
-  visualizationWorkspace.setAnalysisConfiguration(state.routes, state.rounds);
-  visualizationWorkspace.setReplayPlan(buildPayload());
-  await visualizationWorkspace.loadResult(result.resultId, state.testCaseName || "\u5F53\u524D\u8FD0\u884C\u7ED3\u679C");
-  const replayDeadlock = visualizationWorkspace.getTerminalDeadlock();
-  if (result.deadlock) {
-    const serverCode = String(result.deadlock.Code || "").toUpperCase();
-    result.deadlock = replayDeadlock || (DEADLOCK_TYPE_CATALOG[serverCode] ? result.deadlock : { Code: "DEADLOCK.UNCLASSIFIED" });
-  }
-  return visualizationWorkspace.getBottleneckUtilization();
 }
 function formatRunElapsed(milliseconds) {
   const totalTenths = Math.max(0, Math.floor(Number(milliseconds || 0) / 100));
@@ -7244,16 +8445,6 @@ function renderRunStatusEvents(events) {
     return item;
   }));
 }
-function renderSingleRunStatus(snapshot) {
-  if (!snapshot) return;
-  runStatusElapsedMs = Math.max(runStatusElapsedMs, Number(snapshot.elapsedMs || 0));
-  document.getElementById("runStatusElapsed").textContent = formatRunElapsed(runStatusElapsedMs);
-  const terminal = ["completed", "failed", "cancelled"].includes(snapshot.status);
-  const title = snapshot.status === "completed" ? "\u5F53\u524D\u6D4B\u8BD5\u8FD0\u884C\u5B8C\u6210" : snapshot.status === "failed" ? "\u5F53\u524D\u6D4B\u8BD5\u8FD0\u884C\u5931\u8D25" : snapshot.status === "cancelled" ? "\u5F53\u524D\u6D4B\u8BD5\u5DF2\u505C\u6B62" : `\u6B63\u5728\u8FD0\u884C \xB7 ${snapshot.testName || state.testCaseName || "\u5F53\u524D\u6D4B\u8BD5"}`;
-  document.getElementById("runStatusTitle").textContent = title;
-  renderRunStatusEvents(snapshot.events || []);
-  if (terminal) finishRunStatus(snapshot.status, title);
-}
 function renderBatchRunStatus(result) {
   if (!result) return;
   const total = Number(result.testCount || 0);
@@ -7278,163 +8469,36 @@ function finishRunStatus(status, title) {
   if (status === "cancelled") card.classList.add("cancelled");
   if (title) document.getElementById("runStatusTitle").textContent = title;
 }
-async function pollSingleRunStatus(runId) {
-  while (singleRunActive && activeSingleRunId === runId) {
-    try {
-      const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`, { cache: "no-store" });
-      if (response.ok) {
-        const snapshot = await response.json();
-        renderSingleRunStatus(snapshot);
-        if (["completed", "failed", "cancelled"].includes(snapshot.status)) return;
-      }
-    } catch {
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 180));
-  }
-}
-async function requestSingleRunCancellation() {
-  if (!singleRunActive || singleRunCancelling || !activeSingleRunId) return;
-  singleRunCancelling = true;
-  const button = document.getElementById("runButton");
-  button.disabled = true;
-  button.classList.add("running", "cancel");
-  button.textContent = "\u6B63\u5728\u505C\u6B62\u2026";
-  document.getElementById("runStatusTitle").textContent = "\u6B63\u5728\u505C\u6B62\u5F53\u524D\u6D4B\u8BD5";
-  try {
-    const response = await fetch(`/api/runs/${encodeURIComponent(activeSingleRunId)}`, { method: "DELETE" });
-    const snapshot = await response.json();
-    if (!response.ok) throw new Error(snapshot.error || `\u670D\u52A1\u8FD4\u56DE ${response.status}`);
-    renderSingleRunStatus(snapshot);
-    if (state.strategy === "search-tree") {
-      try {
-        await requestSearchControl("cancel");
-      } catch {
-      }
-    }
-    singleRunAbortController?.abort();
-  } catch (error) {
-    singleRunCancelling = false;
-    button.disabled = false;
-    button.classList.remove("running");
-    button.classList.add("cancel");
-    button.textContent = "\u25A0 \u505C\u6B62\u5F53\u524D\u6D4B\u8BD5";
-    throw error;
-  }
-}
-async function runPlan() {
-  const button = document.getElementById("runButton");
-  const batchButton = document.getElementById("batchRunButton");
-  if (singleRunActive) {
-    try {
-      await requestSingleRunCancellation();
-    } catch (error) {
-      writeTerminal(`$ \u505C\u6B62\u5931\u8D25\uFF1A${error.message || "\u672A\u77E5\u9519\u8BEF"}
-  \u53EF\u518D\u6B21\u70B9\u51FB\u201C\u25A0 \u505C\u6B62\u5F53\u524D\u6D4B\u8BD5\u201D\u91CD\u8BD5\u3002`, true);
-    }
-    return;
-  }
-  let logReady = false, ganttReady = false, runResult = null, bottleneckSummary = null;
-  button.disabled = true;
-  batchButton.disabled = true;
-  button.classList.add("running");
-  button.classList.remove("cancel");
-  button.textContent = "\u6B63\u5728\u51C6\u5907\u2026";
-  startRunStatus(`\u51C6\u5907\u8FD0\u884C \xB7 ${state.testCaseName || "\u5F53\u524D\u6D4B\u8BD5"}`, "\u68C0\u67E5\u670D\u52A1\u4E0E\u6D4B\u8BD5\u914D\u7F6E");
-  try {
-    const healthResponse = await fetch("/api/health", { cache: "no-store" }), health = await healthResponse.json();
-    if (!healthResponse.ok || health.schemaVersion !== EXPECTED_API_SCHEMA) throw new Error("\u672C\u5730\u670D\u52A1\u7248\u672C\u8FC7\u65E7\uFF0C\u8BF7\u91CD\u542F realtime_scheduler.backend.main");
-    if (state.strategy.startsWith("other_alg:")) {
-      const algorithm = (health.otherAlgorithms || []).find((item) => item.strategy === state.strategy);
-      if (!algorithm?.available) throw new Error(`${state.strategy} \u7B97\u6CD5\u5305\u4E0D\u5B58\u5728\u6216\u5165\u53E3\u4E0D\u5B8C\u6574`);
-    } else if (health.strategies?.[state.strategy] === false) {
-      throw new Error(health.strategyErrors?.[state.strategy] || `${state.strategy} \u7B56\u7565\u5F53\u524D\u4E0D\u53EF\u7528`);
-    }
-    if (state.dirty) await saveCurrentTest(true);
-    const payload = buildPayload();
-    const runId = (crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`).replace(/[^A-Za-z0-9_-]/g, "");
-    payload.clientRunId = runId;
-    payload.testCaseName = state.testCaseName || "\u5F53\u524D\u6D4B\u8BD5";
-    singleRunActive = true;
-    singleRunCancelling = false;
-    activeSingleRunId = runId;
-    singleRunAbortController = new AbortController();
-    button.disabled = false;
-    batchButton.disabled = true;
-    button.classList.remove("running");
-    button.classList.add("cancel");
-    button.textContent = "\u25A0 \u505C\u6B62\u5F53\u524D\u6D4B\u8BD5";
-    startRunStatus(`\u6B63\u5728\u8FD0\u884C \xB7 ${payload.testCaseName}`, "\u63D0\u4EA4\u8FD0\u884C\u8BF7\u6C42");
-    void pollSingleRunStatus(runId);
-    resetRunResult();
-    visualizationWorkspace.setAnalysisConfiguration(state.routes, state.rounds);
-    writeTerminal(`$ \u5F00\u59CB\u8FD0\u884C ${state.strategy}
-  \u603B\u8F6E\u6570: ${state.roundCount}
-  \u91CD\u7B97\u65F6\u95F4: ${state.rounds.map((round) => round.currentTime).join(", ")} s`);
-    const response = await fetch("/api/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: singleRunAbortController.signal
-    });
-    const responseText = await response.text();
-    try {
-      runResult = JSON.parse(responseText);
-    } catch {
-      throw new Error(responseText.trim().slice(0, 240) || `\u670D\u52A1\u8FD4\u56DE ${response.status}`);
-    }
-    logReady = prepareLogDownload(runResult);
-    ganttReady = prepareGanttView(runResult);
-    if (runResult?.resultId) {
-      try {
-        bottleneckSummary = await prepareWorkspaceView(runResult);
-        runResult.bottleneckUtilization = bottleneckSummary;
-      } catch (workspaceError) {
-        writeTerminal(`$ \u5DE5\u4F5C\u53F0\u52A0\u8F7D\u5931\u8D25
-  ${workspaceError.message || "\u672A\u77E5\u9519\u8BEF"}`, true);
-      }
-    }
-    if (!response.ok || !runResult.ok) {
-      if (runResult?.metricsAvailable) showFailedResultMetrics(runResult);
-      throw new Error(runResult.error || `\u670D\u52A1\u8FD4\u56DE ${response.status}`);
-    }
-    showResult(runResult);
-    finishRunStatus("completed", "\u5F53\u524D\u6D4B\u8BD5\u8FD0\u884C\u5B8C\u6210");
-  } catch (error) {
-    const cancelled = singleRunCancelling || runResult?.cancelled === true || error?.name === "AbortError";
-    const baselineError = runResult?.baseline?.status === "failed" ? `
-  Baseline \u5931\u8D25\uFF1A${runResult.baseline.error || "\u672A\u77E5\u539F\u56E0"}` : "";
-    const validationIssues = Array.isArray(runResult?.validationIssues) ? runResult.validationIssues.map((issue) => `  ${issue}`) : [];
-    const deadlock = deadlockDisplay(runResult?.deadlock);
-    if (!runResult?.metricsAvailable && ganttReady) {
-      setBottleneckMetric(bottleneckSummary, "\u6CA1\u6709\u8DB3\u591F\u7684\u8D44\u6E90\u6D3B\u52A8");
-      document.getElementById("metricMakespan").textContent = Number.isFinite(Number(runResult.makespan)) ? `${Number(runResult.makespan).toFixed(2)} s` : "\u2014";
-    }
-    renderRunFailureCard({
-      cancelled,
-      errorMessage: error.message || "\u672A\u77E5\u9519\u8BEF",
-      deadlock,
-      validationIssues,
-      baselineError: baselineError.trim()
-    });
-    document.getElementById("metricValidation").textContent = runResult?.metricsAvailable ? runResult.validation === "failed" ? "\u672A\u901A\u8FC7" : validationDisplay(runResult.validation) || "\u5931\u8D25" : "\u5931\u8D25";
-    finishRunStatus(cancelled ? "cancelled" : "failed", cancelled ? "\u5F53\u524D\u6D4B\u8BD5\u5DF2\u505C\u6B62" : "\u5F53\u524D\u6D4B\u8BD5\u8FD0\u884C\u5931\u8D25");
-  } finally {
-    singleRunActive = false;
-    singleRunCancelling = false;
-    activeSingleRunId = "";
-    singleRunAbortController = null;
-    button.disabled = false;
-    button.classList.remove("running", "cancel");
-    button.textContent = "\u25B6 \u8FD0\u884C\u5F53\u524D\u6D4B\u8BD5";
-    renderWorkspaceControls();
-  }
-}
 function currentBatchGroupTests() {
   return (state.workspaceDevice?.tests || []).map((test, workspaceIndex) => ({ test, workspaceIndex })).filter(({ test }) => String(test.group || "").trim() === state.activeTestGroup).sort((left, right) => {
     const leftLabel = String(left.test.name || left.test.id || "");
     const rightLabel = String(right.test.name || right.test.id || "");
     return TEST_ORDER_COLLATOR.compare(leftLabel, rightLabel) || left.workspaceIndex - right.workspaceIndex;
   }).map(({ test }) => test);
+}
+function updateBatchResultFilterButton() {
+  const button = document.getElementById("batchResultFilterButton");
+  const tests = currentBatchGroupTests();
+  const selectedCount = resultTestFilterIds instanceof Set ? tests.filter((test) => resultTestFilterIds.has(String(test.id || ""))).length : tests.length;
+  button.disabled = tests.length === 0;
+  button.textContent = "\u9009\u62E9\u6D4B\u8BD5";
+  button.title = tests.length ? `\u5F53\u524D\u663E\u793A ${selectedCount}/${tests.length} \u4E2A\u6D4B\u8BD5` : "\u5F53\u524D\u6D4B\u8BD5\u7EC4\u6CA1\u6709\u6D4B\u8BD5";
+  button.setAttribute("aria-label", button.title);
+}
+function showCurrentGroupTestCards(resetSelection = true) {
+  const tests = currentBatchGroupTests();
+  if (resetSelection) resultTestFilterIds = new Set(tests.map((test) => String(test.id || "")));
+  batchResultItemHistory.clear();
+  resetRunResult();
+  activeRunContext = null;
+  updateBatchLogDownload({ items: [] });
+  renderBatchItems(tests.map((test, index) => ({
+    index,
+    testId: String(test.id || ""),
+    testName: String(test.name || `\u6D4B\u8BD5 ${index + 1}`),
+    status: "not-run"
+  })));
+  updateBatchResultFilterButton();
 }
 function updateBatchSelectionCount() {
   const checkboxes = [...document.querySelectorAll("[data-batch-test-selection]")];
@@ -7448,7 +8512,7 @@ function setBatchTestSelection(predicate) {
   });
   updateBatchSelectionCount();
 }
-function openBatchTestSelectionDialog() {
+function openBatchTestSelectionDialog(mode = "run") {
   if (!state.workspaceDeviceId) {
     writeTerminal("$ \u8BF7\u5148\u9009\u62E9\u8BBE\u5907\u548C\u6D4B\u8BD5\u7EC4", true);
     return;
@@ -7458,10 +8522,12 @@ function openBatchTestSelectionDialog() {
     writeTerminal("$ \u5F53\u524D\u6D4B\u8BD5\u7EC4\u6CA1\u6709\u53EF\u8FD0\u884C\u6D4B\u8BD5", true);
     return;
   }
-  document.getElementById("batchTestSelectionDialogContext").textContent = `${state.activeTestGroup || "\u672A\u5206\u7EC4"} \xB7 \u5171 ${tests.length} \u9879 \xB7 \u5C06\u6309\u4E0B\u5217\u987A\u5E8F\u6267\u884C\u5E76\u5C55\u793A`;
+  batchSelectionMode = mode;
+  document.getElementById("batchTestSelectionDialogTitle").textContent = mode === "filter" ? "\u9009\u62E9\u663E\u793A\u7684\u6D4B\u8BD5" : "\u9009\u62E9\u8981\u8FD0\u884C\u7684\u6D4B\u8BD5";
+  document.getElementById("batchTestSelectionDialogContext").textContent = mode === "filter" ? `${state.activeTestGroup || "\u672A\u5206\u7EC4"} \xB7 \u5171 ${tests.length} \u9879 \xB7 \u4EC5\u66F4\u65B0\u7ED3\u679C\u533A\u663E\u793A\uFF0C\u4E0D\u4F1A\u5F00\u59CB\u8FD0\u884C` : `${state.activeTestGroup || "\u672A\u5206\u7EC4"} \xB7 \u5171 ${tests.length} \u9879 \xB7 \u5C06\u6309\u4E0B\u5217\u987A\u5E8F\u6267\u884C\u5E76\u5C55\u793A`;
   document.getElementById("batchSelectionList").innerHTML = tests.map((test, index) => `
     <label class="batch-selection-item" title="${escapeHtml3(`${test.id || ""} \xB7 ${test.name || ""}`)}">
-      <input type="checkbox" value="${escapeHtml3(test.id || "")}" data-batch-test-selection checked>
+      <input type="checkbox" value="${escapeHtml3(test.id || "")}" data-batch-test-selection ${mode === "run" || resultTestFilterIds?.has(String(test.id || "")) ? "checked" : ""}>
       <span class="batch-selection-index">t${index + 1}</span>
       <span class="batch-selection-name">${escapeHtml3(test.name || `\u6D4B\u8BD5 ${index + 1}`)}</span>
     </label>
@@ -7472,6 +8538,8 @@ function openBatchTestSelectionDialog() {
   rangeStart.value = "1";
   rangeEnd.max = String(tests.length);
   rangeEnd.value = String(tests.length);
+  document.getElementById("batchSelectionRunAll").textContent = mode === "filter" ? "\u663E\u793A\u5168\u90E8" : "\u5168\u91CF\u8FD0\u884C";
+  document.getElementById("batchSelectionRunSelected").textContent = mode === "filter" ? "\u5B8C\u6210" : "\u8FD0\u884C\u5DF2\u9009";
   updateBatchSelectionCount();
   const dialog = document.getElementById("batchTestSelectionDialog");
   dialog.showModal();
@@ -7482,12 +8550,21 @@ function runBatchSelection(runAll = false) {
   const selectedIds = runAll ? tests.map((test) => String(test.id || "")) : [...document.querySelectorAll("[data-batch-test-selection]:checked")].map((checkbox) => String(checkbox.value));
   if (!selectedIds.length) return;
   document.getElementById("batchTestSelectionDialog").close();
+  if (batchSelectionMode === "filter") {
+    resultTestFilterIds = new Set(selectedIds);
+    if (state.batchResult) renderBatchItems(state.batchResult.items || []);
+    else showCurrentGroupTestCards(false);
+    updateBatchResultFilterButton();
+    return;
+  }
   void runCurrentTestGroup(selectedIds);
 }
-async function runCurrentTestGroup(selectedTestIds = null) {
+async function runCurrentTestGroup(selectedTestIds = null, runOptions = {}) {
+  const fromResultCardQueue = runOptions.fromResultCardQueue === true;
+  if (runPreparationActive) return;
   const button = document.getElementById("batchRunButton");
-  const runButton = document.getElementById("runButton");
   if (state.batchRunning) {
+    if (fromResultCardQueue) return;
     try {
       await requestBatchCancellation();
     } catch (error) {
@@ -7503,38 +8580,63 @@ async function runCurrentTestGroup(selectedTestIds = null) {
     return;
   }
   if (!Array.isArray(selectedTestIds)) {
-    openBatchTestSelectionDialog();
-    return;
+    const selectedIds = resultTestFilterIds instanceof Set ? [...resultTestFilterIds] : currentBatchGroupTests().map((test) => String(test.id || ""));
+    return runCurrentTestGroup(selectedIds, runOptions);
   }
   try {
     if (!state.workspaceDeviceId) throw new Error("\u8BF7\u5148\u9009\u62E9\u8BBE\u5907\u548C\u6D4B\u8BD5\u7EC4");
-    if (state.dirty) await saveCurrentTest(true);
+    if (!await settleTestDraft()) return;
     const selectedIdSet = new Set(selectedTestIds.map(String));
     const tests = currentBatchGroupTests().filter((test) => selectedIdSet.has(String(test.id || "")));
     if (!tests.length) throw new Error("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u53EF\u8FD0\u884C\u6D4B\u8BD5");
+    if (fromResultCardQueue) {
+      resultTestFilterIds = new Set(currentBatchGroupTests().map((test) => String(test.id || "")));
+    } else {
+      batchResultItemHistory.clear();
+      resultTestFilterIds = new Set(tests.map((test) => String(test.id || "")));
+    }
+    updateBatchResultFilterButton();
+    runPreparationActive = true;
+    renderWorkspaceControls();
+    const savedTests = [];
+    const readConcurrency = 4;
+    for (let offset = 0; offset < tests.length; offset += readConcurrency) {
+      const selected = tests.slice(offset, offset + readConcurrency);
+      const responses = await Promise.all(selected.map((test) => requestJson(`/api/workspaces/${state.workspaceDeviceId}/tests/${test.id}`)));
+      savedTests.push(...responses.map((response2) => response2.test));
+    }
+    if (!fromResultCardQueue) resetRunResult();
+    activeRunContext = null;
+    const knownTests = fromResultCardQueue ? activeBatchContext?.tests || [] : [];
+    const testsById = new Map([...knownTests, ...savedTests].map((test) => [String(test.id || ""), test]));
+    activeBatchContext = { device: structuredClone(state.device), routes: structuredClone(state.routes), tests: structuredClone([...testsById.values()]) };
+    runPreparationActive = false;
     state.batchRunning = true;
     state.activeBatchId = "";
     state.batchCancelRequested = false;
     state.batchCancelSent = false;
     state.batchResult = null;
-    state.selectedBatchTestId = "";
+    renderWorkspaceControls();
     startRunStatus(`\u6279\u91CF\u6D4B\u8BD5 \xB7 ${state.activeTestGroup || "\u672A\u5206\u7EC4"}`, `\u7B49\u5F85 ${tests.length} \u4E2A\u6D4B\u8BD5`);
-    batchPerformanceAnalyses.clear();
-    batchBottleneckSummaries.clear();
-    batchBottleneckRequests.clear();
-    batchBottleneckErrors.clear();
+    batchCardAnalyses.clear();
+    batchCardAnalysisRequests.clear();
     lastBatchItemsRenderSignature = "";
-    document.getElementById("testGroupAnalysisButton").hidden = true;
     document.getElementById("testGroupAnalysisPanel").hidden = true;
     document.getElementById("testGroupAnalysisPanel").innerHTML = "";
-    document.getElementById("batchOverviewButton").hidden = true;
+    updateAnalysisReportAvailability();
     button.disabled = false;
-    runButton.disabled = true;
     button.classList.add("cancel");
     button.textContent = "\u25A0 \u7EC8\u6B62\u8C03\u5EA6";
-    document.getElementById("batchResults").innerHTML = "";
+    const queuedItems = tests.map((test, index) => ({
+      index,
+      testId: String(test.id || ""),
+      testName: String(test.name || `\u6D4B\u8BD5 ${index + 1}`),
+      status: "queued"
+    }));
+    renderBatchItems(queuedItems);
+    lastBatchItemsRenderSignature = batchItemsRenderSignature(queuedItems);
     const validationSummary = hongYeCheckEnabled() ? ` \xB7 HongYe \u6821\u9A8C\u5E76\u884C ${validationParallelism()} \u8DEF` : "";
-    writeTerminal(`$ \u6279\u91CF\u8FD0\u884C\u5F53\u524D\u6D4B\u8BD5\u7EC4
+    writeTerminal(`$ \u8FD0\u884C\u6240\u9009\u6D4B\u8BD5
   \u7EC4\u522B: ${state.activeTestGroup || "\u672A\u5206\u7EC4"}
   \u7B56\u7565: ${displayStrategyName(state.strategy)}
   \u6D4B\u8BD5\u6570: ${tests.length}
@@ -7542,7 +8644,7 @@ async function runCurrentTestGroup(selectedTestIds = null) {
     const response = await fetch("/api/run-batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId: state.workspaceDeviceId, group: state.activeTestGroup, testIds: tests.map((test) => test.id), strategy: state.strategy, options: state.options, hongYeCheck: hongYeCheckEnabled(), compatibilityMode: compatibilityModeEnabled(), executionTimingEnabled: executionTimingEnabled(), skipBaseline: skipBaselineEnabled(), maximumWorkers: batchParallelism(), validationWorkers: validationParallelism(), cleanValidationTypes: cleanValidationTypes() })
+      body: JSON.stringify({ deviceId: state.workspaceDeviceId, group: state.activeTestGroup, testIds: tests.map((test) => test.id), strategy: state.strategy, options: schedulingRequestOptions(), hongYeCheck: hongYeCheckEnabled(), executionTimingEnabled: executionTimingEnabled(), skipBaseline: skipBaselineEnabled(), maximumWorkers: fromResultCardQueue ? 1 : batchParallelism(), validationWorkers: validationParallelism(), cleanValidationTypes: cleanValidationTypes() })
     });
     let result = await response.json();
     if (!response.ok || !result.batchId || !Array.isArray(result.items)) throw new Error(result.error || `\u670D\u52A1\u8FD4\u56DE ${response.status}`);
@@ -7566,26 +8668,89 @@ async function runCurrentTestGroup(selectedTestIds = null) {
       return;
     }
     if (result.status === "failed" && !Array.isArray(result.items)) throw new Error(result.error || "\u6279\u91CF\u4EFB\u52A1\u5931\u8D25");
+    if (fromResultCardQueue) {
+      for (const item of result.items || []) batchResultItemHistory.set(String(item.testId || ""), item);
+      result = {
+        ...result,
+        items: currentBatchGroupTests().map((test) => batchResultItemHistory.get(String(test.id || ""))).filter((item) => item && item.status !== "not-run")
+      };
+      result.testCount = result.items.length;
+      result.completed = result.items.filter((item) => ["succeeded", "failed", "cancelled"].includes(item.status)).length;
+      result.succeeded = result.items.filter((item) => item.status === "succeeded").length;
+      result.failed = result.items.filter((item) => item.status === "failed").length;
+      result.cancelled = result.items.filter((item) => item.status === "cancelled").length;
+    }
     showBatchResult(result);
-    finishRunStatus(Number(result.failed || 0) ? "failed" : "completed", Number(result.failed || 0) ? "\u6279\u91CF\u6D4B\u8BD5\u5B8C\u6210\uFF08\u6709\u5931\u8D25\uFF09" : "\u6279\u91CF\u6D4B\u8BD5\u8FD0\u884C\u5B8C\u6210");
+    if (!fromResultCardQueue || resultCardRunQueue.size <= 1) {
+      finishRunStatus(Number(result.failed || 0) ? "failed" : "completed", Number(result.failed || 0) ? "\u6279\u91CF\u6D4B\u8BD5\u5B8C\u6210\uFF08\u6709\u5931\u8D25\uFF09" : "\u6279\u91CF\u6D4B\u8BD5\u8FD0\u884C\u5B8C\u6210");
+    }
   } catch (error) {
+    if (fromResultCardQueue && Array.isArray(selectedTestIds)) {
+      for (const testId of selectedTestIds.map(String)) {
+        const previous = batchResultItemHistory.get(testId);
+        if (previous) batchResultItemHistory.set(testId, { ...previous, ok: false, status: "failed", error: error.message || "\u672A\u77E5\u9519\u8BEF" });
+      }
+      renderBatchItems([]);
+    }
     writeTerminal(`$ \u6279\u91CF\u8FD0\u884C\u5931\u8D25\uFF1A${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true);
-    document.getElementById("metricValidation").textContent = "\u5931\u8D25";
     finishRunStatus("failed", "\u6279\u91CF\u6D4B\u8BD5\u8FD0\u884C\u5931\u8D25");
   } finally {
+    runPreparationActive = false;
     state.batchRunning = false;
     state.activeBatchId = "";
     state.batchCancelRequested = false;
     state.batchCancelSent = false;
     button.disabled = !state.serviceCompatible;
-    runButton.disabled = !state.serviceCompatible;
     button.classList.remove("running", "cancel");
-    button.textContent = "\u25A6 \u8FD0\u884C\u5F53\u524D\u6D4B\u8BD5\u7EC4";
+    button.textContent = "\u25B6 \u8FD0\u884C\u6240\u9009\u6D4B\u8BD5";
     renderWorkspaceControls();
+  }
+}
+function markResultCardTestQueued(testId) {
+  const tests = currentBatchGroupTests();
+  const index = tests.findIndex((test2) => String(test2.id || "") === testId);
+  if (index < 0) return;
+  const test = tests[index];
+  batchResultItemHistory.set(testId, {
+    index,
+    testId,
+    testName: String(test.name || `\u6D4B\u8BD5 ${index + 1}`),
+    status: "queued"
+  });
+  resultTestFilterIds = new Set(tests.map((item) => String(item.id || "")));
+  renderBatchItems([]);
+  updateBatchResultFilterButton();
+}
+var resultCardRunQueue = createResultCardRunQueue({
+  runTest: (testId) => runCurrentTestGroup([testId], { fromResultCardQueue: true }),
+  onStateChange(testId, event) {
+    if (event === "queued") {
+      markResultCardTestQueued(testId);
+      return;
+    }
+    if (event === "settled" && batchResultItemHistory.get(testId)?.status === "queued") {
+      batchResultItemHistory.set(testId, { ...batchResultItemHistory.get(testId), status: "not-run" });
+      renderBatchItems([]);
+    }
+  }
+});
+function enqueueResultCardTest(testId) {
+  if (!state.serviceCompatible) {
+    writeTerminal("$ \u8C03\u5EA6\u670D\u52A1\u5C1A\u672A\u5C31\u7EEA\uFF0C\u6682\u65F6\u65E0\u6CD5\u8FD0\u884C\u6D4B\u8BD5", true);
+    return;
+  }
+  if ((runPreparationActive || state.batchRunning) && resultCardRunQueue.size === 0) {
+    writeTerminal("$ \u5F53\u524D\u6279\u91CF\u4EFB\u52A1\u6B63\u5728\u8FD0\u884C\uFF0C\u8BF7\u5728\u7ED3\u675F\u540E\u4F7F\u7528\u5361\u7247\u53CC\u51FB\u961F\u5217", true);
+    return;
+  }
+  if (!currentBatchGroupTests().some((test) => String(test.id || "") === String(testId || ""))) return;
+  if (!resultCardRunQueue.enqueue(String(testId))) {
+    writeTerminal("$ \u8BE5\u6D4B\u8BD5\u5DF2\u5728\u8FD0\u884C\u961F\u5217\u4E2D");
   }
 }
 async function requestBatchCancellation() {
   if (!state.batchRunning || state.batchCancelRequested) return;
+  resultCardRunQueue.clearPending();
   state.batchCancelRequested = true;
   const button = document.getElementById("batchRunButton");
   button.disabled = true;
@@ -7602,172 +8767,137 @@ async function sendBatchCancellation() {
   if (!response.ok) throw new Error(result.error || `\u7EC8\u6B62\u5931\u8D25\uFF0C\u670D\u52A1\u8FD4\u56DE ${response.status}`);
   showBatchProgress(result);
 }
-function setResultMetric(key, label, value, detail = "") {
-  document.getElementById(`metric${key}Label`).textContent = label;
-  document.getElementById(`metric${key}`).textContent = value;
-  document.getElementById(`metric${key}Detail`).textContent = detail;
-}
 function hasBatchResultMetrics(item) {
   return item?.status === "succeeded" || item?.metricsAvailable === true;
 }
-function setBottleneckMetric(summary, emptyDetail = "") {
-  const utilization = Number(summary?.utilization);
-  const available = summary && Number.isFinite(utilization);
-  const resourceName = String(summary?.resourceName || "\u672A\u77E5\u8D44\u6E90").replace(/^工序容量组\s*[·:：-]?\s*/, "").trim() || "\u672A\u77E5\u8D44\u6E90";
-  setResultMetric(
-    "Moves",
-    "Bottleneck Utilization",
-    available ? `${resourceName} ${(utilization * 100).toFixed(1)}%` : "\u2014",
-    available ? "" : emptyDetail
-  );
+function groupAnalysisComparisonKey(testCase) {
+  return JSON.stringify({ rounds: testCase?.rounds || [] });
 }
-function showBatchOverviewMetrics(result) {
-  const measured = (result.items || []).filter(hasBatchResultMetrics);
-  const averageMakespan = measured.length ? measured.reduce((sum, item) => sum + Number(item.makespan), 0) / measured.length : 0;
-  const comparable = measured.filter((item) => item.baseline?.status === "succeeded");
-  const totalMakespan = comparable.reduce((sum, item) => sum + Number(item.makespan), 0);
-  const totalBaseline = comparable.reduce((sum, item) => sum + Number(item.baseline.makespan), 0);
-  const aggregateImprovement = totalBaseline > 0 ? (totalBaseline - totalMakespan) / totalBaseline * 100 : NaN;
-  const moveCount = measured.reduce((sum, item) => sum + Number(item.moveCount || 0), 0);
-  const timeText = result.status === "completed" ? `${(Number(result.totalElapsedMs) / 1e3).toFixed(2)} s` : result.status === "cancelled" ? "\u5DF2\u7EC8\u6B62" : "\u8FD0\u884C\u4E2D";
-  const makespanText = comparable.length ? `${totalMakespan.toFixed(2)} / ${totalBaseline.toFixed(2)} s` : measured.length ? `${averageMakespan.toFixed(2)} s` : "\u2014";
-  const improvementText = comparable.length && Number.isFinite(aggregateImprovement) ? `${aggregateImprovement >= 0 ? "\u63D0\u5347" : "\u9000\u5316"} ${Math.abs(aggregateImprovement).toFixed(2)}%` : "";
-  document.getElementById("metricContext").textContent = `\u6279\u91CF\u603B\u89C8 \xB7 ${result.group || "\u672A\u5206\u7EC4"}`;
-  document.getElementById("batchOverviewButton").hidden = true;
-  setResultMetric("Time", "Total Time", timeText);
-  setResultMetric("Makespan", comparable.length ? "\u603B Makespan / Baseline" : "\u5E73\u5747 Makespan", makespanText, improvementText);
-  setResultMetric("Moves", "\u603B Move \u6570", moveCount || "\u2014");
-  setResultMetric("Validation", result.cancelled ? "\u6210\u529F / \u5931\u8D25 / \u7EC8\u6B62" : "\u6210\u529F / \u5931\u8D25", result.cancelled ? `${result.succeeded || 0} / ${result.failed || 0} / ${result.cancelled}` : `${result.succeeded || 0} / ${result.failed || 0}`);
+function showAnalysisWizardStep(step) {
+  analysisWizardStep = Math.max(1, Math.min(3, Number(step) || 1));
+  document.querySelectorAll("[data-analysis-page]").forEach((page) => {
+    const active = Number(page.dataset.analysisPage) === analysisWizardStep;
+    page.hidden = !active;
+    page.classList.toggle("active", active);
+  });
+  document.querySelectorAll("[data-analysis-flow-step]").forEach((item) => {
+    const itemStep = Number(item.dataset.analysisFlowStep);
+    item.classList.toggle("active", itemStep === analysisWizardStep);
+    item.classList.toggle("complete", itemStep < analysisWizardStep);
+  });
+  const descriptions = {
+    1: "\u9010\u9879\u9009\u62E9\u672C\u6B21\u9700\u8981\u5B9E\u9645\u8BA1\u7B97\u7684\u6307\u6807\uFF0C\u9009\u62E9\u4F1A\u4FDD\u5B58\u4E3A\u4E2A\u4EBA\u8BBE\u7F6E\u3002",
+    2: "\u9009\u62E9\u53C2\u4E0E\u5BF9\u6BD4\u7684\u6D4B\u8BD5\uFF0C\u5E76\u786E\u8BA4\u53C2\u8003\u6D4B\u8BD5\u3001\u7EDF\u8BA1\u7A97\u53E3\u548C\u65F6\u95F4\u9884\u7B97\u3002",
+    3: "\u6B63\u5728\u6309\u6240\u9009\u6307\u6807\u8BA1\u7B97\uFF0C\u8FBE\u5230\u65F6\u95F4\u9884\u7B97\u65F6\u4F1A\u4FDD\u7559\u5DF2\u5B8C\u6210\u7ED3\u679C\u3002"
+  };
+  document.getElementById("analysisOptionsDescription").textContent = descriptions[analysisWizardStep];
+  document.getElementById("analysisPreviousButton").hidden = analysisWizardStep !== 2;
+  document.getElementById("analysisNextButton").hidden = analysisWizardStep !== 1;
+  document.getElementById("startGroupAnalysisButton").hidden = analysisWizardStep !== 2;
+  const cancelButton = document.getElementById("analysisOptionsCancel");
+  cancelButton.textContent = analysisWizardStep === 3 ? "\u53D6\u6D88\u5206\u6790" : "\u53D6\u6D88";
 }
-function showBatchItemOverview(item, index) {
-  const hasMetrics = hasBatchResultMetrics(item);
-  const baseline = item.baseline || {};
-  const baselineReady = baseline.status === "succeeded";
-  const cpuTime = Number(item.cpuTimeMs ?? item.totalElapsedMs);
-  const elapsedTime = Number(item.totalElapsedMs);
-  const makespan = Number(item.makespan);
-  const improvement = Number(item.improvementPercent);
-  const validationText = item.validation === "passed" ? "\u901A\u8FC7" : item.validation === "skipped" ? "\u8DF3\u8FC7" : item.validation ? String(item.validation) : item.status === "failed" ? "\u8FD0\u884C\u5931\u8D25" : item.status === "cancelled" ? "\u5DF2\u7EC8\u6B62" : "\u7B49\u5F85\u5B8C\u6210";
-  const comparisonDetail = baselineReady && Number.isFinite(improvement) ? `${improvement >= 0 ? "\u63D0\u5347" : "\u9000\u5316"} ${Math.abs(improvement).toFixed(2)}%` : baseline.status && baseline.status !== "succeeded" && baseline.status !== "skipped" ? `Baseline ${baseline.status === "failed" ? "\u5931\u8D25" : "\u5931\u6548"}` : "";
-  const resultUrl = String(item.resultUrl || "");
-  const bottleneckReady = resultUrl && batchBottleneckSummaries.has(resultUrl);
-  const bottleneckSummary = bottleneckReady ? batchBottleneckSummaries.get(resultUrl) : null;
-  const bottleneckError = resultUrl ? batchBottleneckErrors.get(resultUrl) : "";
-  document.getElementById("metricContext").textContent = `t${index + 1} \xB7 ${item.testName || `\u6D4B\u8BD5 ${index + 1}`} \xB7 ${displayStrategyName(state.batchResult?.strategy)}`;
-  document.getElementById("batchOverviewButton").hidden = false;
-  setResultMetric("Time", "CPU Time / \u8017\u65F6", Number.isFinite(cpuTime) ? `${cpuTime.toFixed(1)} ms` : "\u2014", Number.isFinite(elapsedTime) ? `\u7AEF\u5230\u7AEF\u8017\u65F6 ${elapsedTime.toFixed(1)} ms` : "");
-  setResultMetric("Makespan", "Makespan / Baseline", Number.isFinite(makespan) ? `${makespan.toFixed(2)} / ${baselineReady ? Number(baseline.makespan).toFixed(2) : "\u2014"} s` : "\u2014", comparisonDetail);
-  setBottleneckMetric(
-    bottleneckSummary,
-    hasMetrics && resultUrl ? bottleneckError ? `\u74F6\u9888\u8BA1\u7B97\u5931\u8D25\uFF1A${bottleneckError}` : bottleneckReady ? "\u6CA1\u6709\u8DB3\u591F\u7684\u8D44\u6E90\u6D3B\u52A8" : "\u6B63\u5728\u8BA1\u7B97\u7A33\u6001\u74F6\u9888\u2026" : "\u6CA1\u6709\u53EF\u5206\u6790\u7684 MoveList"
-  );
-  setResultMetric("Validation", "Validation", validationText, item.error || "");
+function openGroupAnalysisOptions() {
+  const result = state.batchResult;
+  if (!result?.items?.length) return;
+  const testsById = new Map((activeBatchContext?.tests || []).map((test) => [String(test.id), test]));
+  const analyzable = result.items.filter((item) => hasBatchResultMetrics(item) && item.resultUrl);
+  const options = document.getElementById("analysisTestOptions");
+  options.innerHTML = analyzable.map((item, index) => `
+    <label><input type="checkbox" checked value="${escapeHtml3(String(item.testId || `index-${index}`))}" data-analysis-test>
+      <span><strong>${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}</strong><small>${escapeHtml3(validationDisplay(item.validation))}</small></span>
+    </label>`).join("");
+  const reference = document.getElementById("analysisReferenceTest");
+  reference.innerHTML = analyzable.map((item, index) => `
+    <option value="${escapeHtml3(String(item.testId || `index-${index}`))}">${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}</option>`).join("");
+  reference.dataset.testsById = String(testsById.size);
+  document.getElementById("analysisToggleAllTests").textContent = "\u53D6\u6D88\u5168\u9009";
+  document.getElementById("analysisDialogProgress").innerHTML = "";
+  document.getElementById("analysisOptionsCancel").disabled = false;
+  document.getElementById("analysisOptionsClose").disabled = false;
+  document.getElementById("startGroupAnalysisButton").disabled = false;
+  showAnalysisWizardStep(1);
+  document.getElementById("analysisOptionsDialog").showModal();
+  window.setTimeout(() => document.querySelector("[data-analysis-metric]")?.focus(), 0);
 }
-async function loadBatchItemPerformance(item, index) {
-  const resultUrl = String(item?.resultUrl || "");
-  if (!resultUrl || !hasBatchResultMetrics(item)) return null;
-  if (batchPerformanceAnalyses.has(resultUrl)) {
-    return batchPerformanceAnalyses.get(resultUrl);
-  }
-  if (batchBottleneckErrors.has(resultUrl)) return null;
-  let request = batchBottleneckRequests.get(resultUrl);
-  if (!request) {
-    request = (async () => {
-      const testCase = (state.workspaceDevice?.tests || []).find(
-        (test) => String(test.id) === String(item.testId)
-      );
-      const resultId = resultUrl.startsWith("/api/results/") ? decodeURIComponent(resultUrl.slice("/api/results/".length)) : "";
-      if (!resultId) throw new Error("\u7ED3\u679C\u5730\u5740\u4E0D\u7B26\u5408\u670D\u52A1\u7AEF\u5206\u6790\u5951\u7EA6");
-      const response = await requestScheduleAnalysis({
-        resultId,
-        device: state.device,
-        windowMode: "steady",
-        routes: state.workspaceDevice?.routes || state.routes,
-        rounds: testCase?.rounds || state.rounds
-      });
-      batchPerformanceAnalyses.set(resultUrl, response.analysis);
-      batchBottleneckSummaries.set(resultUrl, response.bottleneck);
-      return response.analysis;
-    })();
-    batchBottleneckRequests.set(resultUrl, request);
-  }
-  try {
-    return await request;
-  } catch (error) {
-    batchBottleneckErrors.set(resultUrl, error.message || "\u672A\u77E5\u9519\u8BEF");
-    if (state.selectedBatchTestId === String(item.testId || `index-${index}`)) {
-      setBottleneckMetric(null, `\u74F6\u9888\u8BA1\u7B97\u5931\u8D25\uFF1A${error.message || "\u672A\u77E5\u9519\u8BEF"}`);
-    }
-    return null;
-  } finally {
-    batchBottleneckRequests.delete(resultUrl);
-  }
-}
-async function loadBatchItemBottleneck(item, index) {
-  await loadBatchItemPerformance(item, index);
-  const currentIndex = (state.batchResult?.items || []).findIndex(
-    (candidate, candidateIndex) => String(candidate.testId || `index-${candidateIndex}`) === state.selectedBatchTestId
-  );
-  if (currentIndex >= 0) showBatchItemOverview(state.batchResult.items[currentIndex], currentIndex);
-}
-function selectBatchItem(index) {
-  const item = state.batchResult?.items?.[index];
-  if (!item) return;
-  state.selectedBatchTestId = String(item.testId || `index-${index}`);
-  renderBatchItems(state.batchResult.items || []);
-  showBatchItemOverview(item, index);
-  void loadBatchItemBottleneck(item, index);
-}
-function showCurrentBatchOverview() {
-  if (!state.batchResult) return;
-  state.selectedBatchTestId = "";
-  renderBatchItems(state.batchResult.items || []);
-  showBatchOverviewMetrics(state.batchResult);
+function renderGroupAnalysisProgress(job) {
+  const percent = Math.max(0, Math.min(100, Number(job.progress) || 0));
+  const elapsed = Number(job.elapsedSeconds) || 0;
+  document.getElementById("analysisDialogProgress").innerHTML = `
+    <section class="group-analysis-progress" aria-live="polite">
+      <header><div><small>\u6D4B\u8BD5\u7EC4\u7ED3\u679C\u5206\u6790</small><strong>${escapeHtml3(job.message || "\u6B63\u5728\u5206\u6790")}</strong></div><b>${percent}%</b></header>
+      <div class="group-analysis-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><i style="width:${percent}%"></i></div>
+      <p>${escapeHtml3(job.currentCaseName || "\u6B63\u5728\u51C6\u5907")} \xB7 \u5DF2\u5B8C\u6210 ${Number(job.completedCases) || 0}/${Number(job.totalCases) || 0} \u4E2A\u6D4B\u8BD5 \xB7 \u5DF2\u7528 ${elapsed.toFixed(1)} \u79D2 / ${Number(job.timeBudgetSeconds) || 0} \u79D2</p>
+    </section>`;
+  showAnalysisWizardStep(3);
 }
 async function showTestGroupAnalysis() {
   const result = state.batchResult;
   if (!result?.items?.length) return;
-  const button = document.getElementById("testGroupAnalysisButton");
-  const originalText = button.textContent;
-  button.disabled = true;
-  button.textContent = "\u6B63\u5728\u5206\u6790\u2026";
-  try {
-    const analyzable = result.items.map((item, index) => ({ item, index })).filter((entry) => hasBatchResultMetrics(entry.item) && entry.item.resultUrl);
-    let cursor = 0;
-    const workerCount = Math.min(4, analyzable.length);
-    await Promise.all(Array.from({ length: workerCount }, async () => {
-      while (cursor < analyzable.length) {
-        const current = analyzable[cursor];
-        cursor += 1;
-        await loadBatchItemPerformance(current.item, current.index);
-      }
-    }));
-    const summary = await requestTestGroupAnalysis(result.items.map((item, index) => ({
-      id: String(item.testId || `index-${index}`),
+  const selectedIds = new Set(
+    [...document.querySelectorAll("[data-analysis-test]:checked")].map((input) => String(input.value))
+  );
+  if (!selectedIds.size) throw new Error("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u6D4B\u8BD5");
+  const metricIds = [...document.querySelectorAll("[data-analysis-metric]:checked")].map((input) => String(input.value));
+  if (!metricIds.length) throw new Error("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u8BA1\u7B97\u6307\u6807");
+  const testsById = new Map((activeBatchContext?.tests || []).map((test) => [String(test.id), test]));
+  const cases = result.items.map((item, index) => ({ item, index })).filter(({ item, index }) => selectedIds.has(String(item.testId || `index-${index}`))).map(({ item, index }) => {
+    const testId = String(item.testId || `index-${index}`);
+    const testCase = testsById.get(testId);
+    const resultId = String(item.resultUrl || "").startsWith("/api/results/") ? decodeURIComponent(String(item.resultUrl).slice("/api/results/".length)) : "";
+    return {
+      id: testId,
       name: item.testName || `t${index + 1}`,
       status: String(item.status || "unknown"),
       validation: String(item.validation || "unknown"),
-      metricsAvailable: hasBatchResultMetrics(item),
       makespan: item.makespan,
       baselineMakespan: item.baseline?.status === "succeeded" ? item.baseline.makespan : null,
       cpuTimeMs: item.cpuTimeMs ?? item.totalElapsedMs,
       elapsedTimeMs: item.totalElapsedMs,
       error: item.error || item.baseline?.error || "",
-      performance: item.resultUrl ? batchPerformanceAnalyses.get(String(item.resultUrl)) ?? null : null
-    })));
-    const panelMarkup = renderTestGroupAnalysis(
-      summary,
-      result.group || state.activeTestGroup || "\u5F53\u524D\u6D4B\u8BD5\u7EC4"
-    );
-    visualizationWorkspace.showGroupAnalysis(panelMarkup);
-    switchTab("workspace");
-    const panel = document.getElementById("testGroupAnalysisPanel");
-    bindTestGroupExport(panel, summary, result.group || state.activeTestGroup || "\u5F53\u524D\u6D4B\u8BD5\u7EC4");
-    panel.scrollIntoView({ behavior: "smooth", block: "start" });
-  } finally {
-    button.disabled = false;
-    button.textContent = originalText;
+      resultId,
+      rounds: testCase?.rounds || [],
+      comparisonKey: groupAnalysisComparisonKey(testCase)
+    };
+  });
+  const referenceSelect = document.getElementById("analysisReferenceTest");
+  const referenceCaseId = selectedIds.has(String(referenceSelect.value)) ? String(referenceSelect.value) : cases[0].id;
+  await saveAnalysisSettingsPreferences();
+  const job = await createTestGroupAnalysisJob({
+    cases,
+    device: activeBatchContext?.device,
+    routes: activeBatchContext?.routes || [],
+    metricIds,
+    referenceCaseId,
+    windowMode: document.getElementById("analysisWindowMode").value,
+    timeBudgetSeconds: Number(document.getElementById("analysisTimeBudget").value)
+  });
+  activeGroupAnalysisJobId = String(job.id || "");
+  let snapshot = job;
+  renderGroupAnalysisProgress(snapshot);
+  while (["queued", "running"].includes(String(snapshot.status))) {
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    snapshot = await readTestGroupAnalysisJob(activeGroupAnalysisJobId);
+    renderGroupAnalysisProgress(snapshot);
   }
+  activeGroupAnalysisJobId = "";
+  if (!snapshot.result) throw new Error(snapshot.message || "\u7ED3\u679C\u5206\u6790\u5931\u8D25");
+  const summary = snapshot.result;
+  const panelMarkup = renderTestGroupAnalysis(
+    summary,
+    result.group || state.activeTestGroup || "\u5F53\u524D\u6D4B\u8BD5\u7EC4"
+  );
+  visualizationWorkspace.showGroupAnalysis(panelMarkup);
+  document.getElementById("analysisOptionsCancel").disabled = false;
+  document.getElementById("analysisOptionsClose").disabled = false;
+  document.getElementById("analysisOptionsDialog").close();
+  await switchTab("schedule");
+  setRunResultView("analysis");
+  const panel = document.getElementById("testGroupAnalysisPanel");
+  bindTestGroupExport(panel, summary, result.group || state.activeTestGroup || "\u5F53\u524D\u6D4B\u8BD5\u7EC4");
+  panel.querySelector("[data-return-run-results]")?.addEventListener("click", () => setRunResultView("results"));
+  panel.querySelector("[data-reconfigure-analysis]")?.addEventListener("click", openGroupAnalysisOptions);
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 function bindTestGroupExport(panel, summary, groupName) {
   const button = panel?.querySelector("[data-group-export-csv]");
@@ -7805,30 +8935,26 @@ function orderedBatchItems(items) {
 }
 function showBatchProgress(result) {
   result.items = orderedBatchItems(result.items || []);
+  for (const item of result.items) {
+    const testId = String(item.testId || "");
+    if (testId) batchResultItemHistory.set(testId, item);
+  }
   const completed = Number(result.completed || 0), total = Number(result.testCount || result.items?.length || 0);
   const percent = total ? Math.round(completed / total * 100) : 0;
-  const progress = document.getElementById("batchProgress");
-  document.getElementById("testGroupAnalysisButton").hidden = !["completed", "cancelled"].includes(result.status);
-  progress.classList.add("visible");
-  progress.setAttribute("aria-valuenow", String(percent));
-  document.getElementById("batchProgressCount").textContent = `${percent}%`;
-  document.getElementById("batchProgressBar").style.width = `${percent}%`;
   state.batchResult = result;
+  updateAnalysisReportAvailability();
   updateBatchLogDownload(result);
-  if (!state.selectedBatchTestId) showBatchOverviewMetrics(result);
   const items = result.items || [];
   const renderSignature = batchItemsRenderSignature(items);
   if (renderSignature !== lastBatchItemsRenderSignature) {
     renderBatchItems(items);
     lastBatchItemsRenderSignature = renderSignature;
   }
-  const selectedIndex = (result.items || []).findIndex((item, index) => String(item.testId || `index-${index}`) === state.selectedBatchTestId);
-  if (selectedIndex >= 0) {
-    showBatchItemOverview(result.items[selectedIndex], selectedIndex);
-    void loadBatchItemBottleneck(result.items[selectedIndex], selectedIndex);
+  if (["completed", "cancelled"].includes(String(result.status))) {
+    void hydrateBatchCardAnalyses(items);
   }
   writeTerminal([
-    "$ \u6279\u91CF\u8FD0\u884C\u5F53\u524D\u6D4B\u8BD5\u7EC4",
+    "$ \u8FD0\u884C\u6240\u9009\u6D4B\u8BD5",
     `  \u7EC4\u522B: ${result.group || "\u672A\u5206\u7EC4"} \xB7 \u7B56\u7565: ${displayStrategyName(result.strategy)}`,
     `  \u8FDB\u5EA6: ${completed}/${total} (${percent}%) \xB7 \u7B97\u6CD5\u5E76\u884C: ${result.workerCount}${result.validationWorkers > 0 ? ` \xB7 HongYe \u6821\u9A8C\u5E76\u884C: ${result.validationWorkers}` : ""}`,
     `  \u7B49\u5F85: ${(result.items || []).filter((item) => item.status === "queued").length} \xB7 \u8FD0\u884C\u4E2D: ${(result.items || []).filter((item) => item.status === "running").length} \xB7 \u6210\u529F: ${result.succeeded || 0} \xB7 \u5931\u8D25: ${result.failed || 0} \xB7 \u7EC8\u6B62: ${result.cancelled || 0}`
@@ -7845,49 +8971,189 @@ function batchItemErrorText(item) {
   if (baseline.status && baseline.status !== "succeeded" && baseline.status !== "skipped") return `Baseline \u5931\u6548\uFF1A${baseline.error || "\u7B49\u5F85\u91CD\u65B0\u8BA1\u7B97"}`;
   return "";
 }
+async function loadBatchCardAnalysis(item) {
+  const resultUrl = String(item?.resultUrl || "");
+  if (!resultUrl || !hasBatchResultMetrics(item)) return null;
+  if (batchCardAnalyses.has(resultUrl)) return batchCardAnalyses.get(resultUrl);
+  if (batchCardAnalysisRequests.has(resultUrl)) return batchCardAnalysisRequests.get(resultUrl);
+  const request = (async () => {
+    const testCase = (activeBatchContext?.tests || []).find(
+      (test) => String(test.id) === String(item.testId)
+    );
+    const resultId = resultUrl.startsWith("/api/results/") ? decodeURIComponent(resultUrl.slice("/api/results/".length)) : "";
+    if (!resultId) return null;
+    try {
+      const response = await requestScheduleAnalysis({
+        resultId,
+        device: activeBatchContext?.device,
+        windowMode: "steady",
+        routes: activeBatchContext?.routes || [],
+        rounds: testCase?.rounds || [],
+        metricGroups: ["basic", "throughput"]
+      });
+      batchCardAnalyses.set(resultUrl, response.analysis);
+      return response.analysis;
+    } catch {
+      batchCardAnalyses.set(resultUrl, null);
+      return null;
+    } finally {
+      batchCardAnalysisRequests.delete(resultUrl);
+    }
+  })();
+  batchCardAnalysisRequests.set(resultUrl, request);
+  return request;
+}
+async function hydrateBatchCardAnalyses(items) {
+  const pending = orderedBatchItems(items).filter((item) => {
+    const resultUrl = String(item?.resultUrl || "");
+    return resultUrl && !batchCardAnalyses.has(resultUrl) && !batchCardAnalysisRequests.has(resultUrl);
+  });
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < pending.length) {
+      const item = pending[nextIndex++];
+      await loadBatchCardAnalysis(item);
+      if (state.batchResult) renderBatchItems(state.batchResult.items || []);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, pending.length) }, worker));
+}
 function renderBatchItems(items) {
-  items = orderedBatchItems(items);
-  const statusLabels = { queued: "\u7B49\u5F85\u4E2D", running: "\u8FD0\u884C\u4E2D", succeeded: "\u6210\u529F", failed: "\u5931\u8D25", cancelled: "\u5DF2\u7EC8\u6B62" };
-  document.getElementById("batchResults").innerHTML = items.map((item, index) => {
+  for (const item of orderedBatchItems(items)) {
+    const testId = String(item.testId || "");
+    if (testId) batchResultItemHistory.set(testId, item);
+  }
+  const entries = currentBatchGroupTests().map((test, index) => ({
+    item: batchResultItemHistory.get(String(test.id || "")) || {
+      index,
+      testId: String(test.id || ""),
+      testName: String(test.name || `\u6D4B\u8BD5 ${index + 1}`),
+      status: "not-run"
+    },
+    index
+  })).filter(({ item }) => !(resultTestFilterIds instanceof Set) || resultTestFilterIds.has(String(item.testId || "")));
+  const statusLabels = { "not-run": "\u672A\u8FD0\u884C", queued: "\u7B49\u5F85\u4E2D", running: "\u8FD0\u884C\u4E2D", succeeded: "\u6210\u529F", failed: "\u5931\u8D25", cancelled: "\u5DF2\u7EC8\u6B62" };
+  document.getElementById("batchResults").innerHTML = entries.map(({ item, index }) => {
     const hasMetrics = hasBatchResultMetrics(item);
-    const baseline = item.baseline || {}, baselineReady = baseline.status === "succeeded";
-    const cpuTime = Number(item.cpuTimeMs);
-    const improvement = Number(item.improvementPercent);
-    const improvementText = hasMetrics && baselineReady && Number.isFinite(improvement) ? `${improvement >= 0 ? "\u63D0\u5347" : "\u9000\u5316"} ${Math.abs(improvement).toFixed(2)}%` : baseline.status === "skipped" ? "\u5DF2\u8DF3\u8FC7\u57FA\u7EBF" : baseline.status && baseline.status !== "succeeded" ? "\u65E0\u6709\u6548\u57FA\u7EBF" : "\u63D0\u5347 \u2014";
+    const resultUrl = String(item.resultUrl || "");
+    const cardAnalysis = batchCardAnalyses.get(resultUrl);
+    const throughput = Number(cardAnalysis?.throughputPerHour);
+    const rawAverageRecomputeTime = cardAnalysis?.averageRecomputeTimeMs ?? item.averageRecomputeTimeMs;
+    const averageRecomputeTime = Number(rawAverageRecomputeTime);
+    const hasThroughput = Number.isFinite(throughput) && throughput > 0;
+    const hasAverageRecomputeTime = rawAverageRecomputeTime !== null && rawAverageRecomputeTime !== void 0 && Number.isFinite(averageRecomputeTime);
     const summaryError = batchItemErrorText(item);
     const failed = Boolean(summaryError);
-    const summaryNote = item.status === "cancelled" ? "\u8C03\u5EA6\u5DF2\u7EC8\u6B62" : failed ? "" : summaryError;
+    const summaryNote = failed ? "" : summaryError;
     const displayId = `t${index + 1}`;
-    const itemSelectionId = String(item.testId || `index-${index}`);
-    const selected = itemSelectionId === state.selectedBatchTestId;
+    const testId = String(item.testId || "");
     return `
-      <div class="batch-result ${escapeHtml3(item.status || "queued")}${selected ? " selected" : ""}" data-batch-item-index="${index}">
+      <div class="batch-result ${escapeHtml3(item.status || "queued")} ${testId === expandedBatchTestId ? "details-open" : ""}" data-batch-test-card="${escapeHtml3(testId)}" role="button" tabindex="0" aria-expanded="${testId === expandedBatchTestId}" aria-label="${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}\uFF1A\u5355\u51FB\u67E5\u770B\u8BE6\u60C5\uFF0C\u53CC\u51FB\u52A0\u5165\u8FD0\u884C\u961F\u5217" title="\u5355\u51FB\u67E5\u770B\u53EA\u8BFB\u914D\u7F6E\uFF1B\u53CC\u51FB\u52A0\u5165\u8FD0\u884C\u961F\u5217">
         <div class="batch-result-head">
-          <button class="batch-result-title" type="button" aria-pressed="${selected}" aria-label="\u67E5\u770B ${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)} \u7684\u8BE6\u7EC6\u6307\u6807"><strong title="${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}">${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}</strong></button>
+          <span class="batch-result-title"><strong title="${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}">${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}</strong></span>
           <div class="batch-result-meta">
             <span class="batch-status">${statusLabels[item.status] || "\u7B49\u5F85\u4E2D"}</span>
             ${item.logUrl ? `<a class="btn" href="${escapeHtml3(item.logUrl)}" download="${escapeHtml3(readableLogFileName(item.testName || `\u6D4B\u8BD5-${index + 1}`))}">\u65E5\u5FD7</a>` : `<span class="btn" aria-disabled="true">\u65E5\u5FD7</span>`}
             ${item.resultUrl ? `<button class="btn primary" type="button" data-playback-result="${escapeHtml3(item.resultUrl)}" data-playback-name="${escapeHtml3(item.testName || `\u6D4B\u8BD5 ${index + 1}`)}">\u56DE\u653E</button>` : `<span class="btn" aria-disabled="true">\u56DE\u653E</span>`}
             ${item.ganttUrl ? `<a class="btn" href="${escapeHtml3(item.ganttUrl)}" target="_blank">\u7518\u7279\u56FE</a>` : `<span class="btn" aria-disabled="true">\u7518\u7279\u56FE</span>`}
-            ${failed ? `<button class="btn danger" type="button" data-batch-error="${index}" aria-label="\u67E5\u770B ${escapeHtml3(displayId)} \u7684\u62A5\u9519\u4FE1\u606F">\u62A5\u9519</button>` : ""}
+            ${failed ? `<button class="btn danger" type="button" data-batch-error="${escapeHtml3(testId)}" aria-label="\u67E5\u770B ${escapeHtml3(displayId)} \u7684\u62A5\u9519\u4FE1\u606F">\u62A5\u9519</button>` : ""}
           </div>
         </div>
         <div class="batch-result-summary">
           <div class="batch-metric-tags" aria-label="\u4E3B\u8981\u6307\u6807">
-            <span class="batch-metric-tag makespan" title="Makespan${baselineReady ? `\uFF1BBaseline ${Number(baseline.makespan).toFixed(2)} s` : ""}">${hasMetrics ? `${Number(item.makespan).toFixed(2)} s` : "\u2014 s"}</span>
-            <span class="batch-metric-tag ${improvement < 0 ? "loss" : "gain"}">${escapeHtml3(improvementText)}</span>
-            <span class="batch-metric-tag cpu">CPU Time ${hasMetrics && Number.isFinite(cpuTime) ? `${cpuTime.toFixed(1)} ms` : "\u2014"}</span>
+            <span class="batch-metric-tag production">${hasThroughput ? `\u4EA7\u80FD ${throughput.toFixed(1)} \u7247/h` : `Makespan ${hasMetrics && Number.isFinite(Number(item.makespan)) ? `${Number(item.makespan).toFixed(2)} s` : "\u2014"}`}</span>
+            <span class="batch-metric-tag recompute">\u5E73\u5747\u91CD\u7B97 ${hasMetrics && hasAverageRecomputeTime ? `${averageRecomputeTime.toFixed(1)} ms` : "\u2014"}</span>
           </div>
           ${summaryNote ? `<span class="summary-error" title="${escapeHtml3(summaryNote)}">${escapeHtml3(summaryNote)}</span>` : ""}
         </div>
       </div>`;
   }).join("");
 }
-function openBatchErrorDialog(index) {
-  const item = state.batchResult?.items?.[index];
+function closeBatchTestDetails() {
+  expandedBatchTestId = "";
+  batchTestDetailsRequestVersion += 1;
+  const panel = document.getElementById("batchTestDetails");
+  panel.hidden = true;
+  panel.innerHTML = "";
+}
+function updateBatchTestCardDetailState() {
+  document.querySelectorAll("[data-batch-test-card]").forEach((card) => {
+    const expanded = card.dataset.batchTestCard === expandedBatchTestId;
+    card.classList.toggle("details-open", expanded);
+    card.setAttribute("aria-expanded", String(expanded));
+  });
+}
+function renderBatchTestDetailField(label, value) {
+  const text = readonlyText(value);
+  return `<div class="batch-test-detail-field"><span>${escapeHtml3(label)}</span><strong title="${escapeHtml3(text)}">${escapeHtml3(text)}</strong></div>`;
+}
+function batchTestDetailRouteSummary(testCase, pjob) {
+  const routeName = String(pjob?.routeRef || "");
+  const template = (state.workspaceDevice?.routes || state.routes || []).find((route) => String(route?.name || "") === routeName);
+  if (!template) return routeName || "\u672A\u914D\u7F6E\u8DEF\u5F84";
+  const routeConfig = pjob?.routeConfig || testCase?.routeConfigs?.[routeName] || defaultRouteConfigForRoute(template);
+  return routePickerCompactPath(runtimeRouteForTemplate(template, routeConfig), true, pjob?.loadPort || "");
+}
+function renderBatchTestDetails(testCase) {
+  const rounds = Array.isArray(testCase?.rounds) ? testCase.rounds : [];
+  const details = rounds.map((round, roundIndex) => {
+    const cjobs = Array.isArray(round?.cjobs) ? round.cjobs : [];
+    const cjobMarkup = cjobs.map((cjob, cjobIndex) => {
+      const pjobs = Array.isArray(cjob?.pjobs) ? cjob.pjobs : [];
+      const pjobMarkup = pjobs.map((pjob, pjobIndex) => `<div class="batch-test-detail-pjob">
+        <div class="batch-test-detail-pjob-name"><span>PJob</span><strong>${escapeHtml3(pjob?.jobName || `P${pjobIndex + 1}`)}</strong></div>
+        <div class="batch-test-detail-pjob-fields">
+          ${renderBatchTestDetailField("Material", pjob?.waferCount)}
+          ${renderBatchTestDetailField("Priority", pjob?.priority)}
+          ${renderBatchTestDetailField("OriginRoute", batchTestDetailRouteSummary(testCase, pjob))}
+        </div>
+      </div>`).join("") || '<span class="hint">\u6B64 CJob \u6CA1\u6709 PJob\u3002</span>';
+      return `<section class="batch-test-detail-cjob">
+        <div class="batch-test-detail-fields">
+          <header class="batch-test-detail-cjob-head"><strong>CJob ${cjobIndex + 1}</strong><span>TaskID ${escapeHtml3(cjob?.taskId)}</span></header>
+          ${renderBatchTestDetailField("JobType", cjob?.jobType)}
+          ${renderBatchTestDetailField("LoadPort", cjob?.loadPort)}
+          ${renderBatchTestDetailField("Priority", cjob?.priority)}
+          ${renderBatchTestDetailField("TaskMode", cjob?.taskMode)}
+          ${renderBatchTestDetailField("CJobCycle", cjob?.cjobCycle)}
+        </div>
+        <div class="batch-test-detail-pjobs">${pjobMarkup}</div>
+      </section>`;
+    }).join("") || '<span class="hint">\u6B64\u8F6E\u6CA1\u6709 CJob\u3002</span>';
+    return `<section class="batch-test-detail-round">
+      <header class="batch-test-detail-round-head"><span class="batch-test-detail-round-number">${roundIndex + 1}</span><strong>${roundIndex ? `\u7B2C ${roundIndex + 1} \u8F6E\u91CD\u7B97` : "\u9996\u6B21\u6392\u7A0B"}</strong><span>${roundIndex ? "\u91CD\u7B97\u65F6\u95F4" : "\u6392\u7A0B\u65F6\u95F4"} ${escapeHtml3(formatCleanSeconds(round?.currentTime ?? 0))}</span></header>
+      <div class="batch-test-detail-cjobs">${cjobMarkup}</div>
+    </section>`;
+  }).join("") || '<p class="hint">\u8BE5\u6D4B\u8BD5\u6CA1\u6709\u53EF\u663E\u793A\u7684\u4EFB\u52A1\u914D\u7F6E\u3002</p>';
+  return `<div class="batch-test-details-body">${details}</div>`;
+}
+async function toggleBatchTestDetails(testId) {
+  if (!testId || !state.workspaceDeviceId) return;
+  if (expandedBatchTestId === testId) {
+    closeBatchTestDetails();
+    updateBatchTestCardDetailState();
+    return;
+  }
+  expandedBatchTestId = testId;
+  const requestVersion = ++batchTestDetailsRequestVersion;
+  const panel = document.getElementById("batchTestDetails");
+  panel.hidden = false;
+  panel.innerHTML = '<div class="batch-test-details-body"><p class="hint">\u6B63\u5728\u8BFB\u53D6\u6D4B\u8BD5\u8BE6\u60C5\u2026</p></div>';
+  updateBatchTestCardDetailState();
+  try {
+    const result = await requestJson(`/api/workspaces/${state.workspaceDeviceId}/tests/${encodeURIComponent(testId)}`);
+    if (requestVersion !== batchTestDetailsRequestVersion || expandedBatchTestId !== testId) return;
+    panel.innerHTML = renderBatchTestDetails(result.test);
+  } catch (error) {
+    if (requestVersion !== batchTestDetailsRequestVersion || expandedBatchTestId !== testId) return;
+    panel.innerHTML = `<div class="batch-test-details-body"><p class="hint">\u8BFB\u53D6\u6D4B\u8BD5\u8BE6\u60C5\u5931\u8D25\uFF1A${escapeHtml3(error?.message || "\u672A\u77E5\u9519\u8BEF")}</p></div>`;
+  }
+}
+function openBatchErrorDialog(testId) {
+  const item = batchResultItemHistory.get(String(testId || ""));
   if (!item) return;
   const errorText = batchItemErrorText(item) || "\u672A\u77E5\u9519\u8BEF";
-  document.getElementById("batchErrorDialogContext").textContent = `${item.testName || `\u6D4B\u8BD5 ${index + 1}`} \xB7 ${item.status === "failed" ? "\u8FD0\u884C\u5931\u8D25" : "\u57FA\u7EBF\u5F02\u5E38"}`;
+  document.getElementById("batchErrorDialogContext").textContent = `${item.testName || "\u5F53\u524D\u6D4B\u8BD5"} \xB7 ${item.status === "failed" ? "\u8FD0\u884C\u5931\u8D25" : "\u57FA\u7EBF\u5F02\u5E38"}`;
   document.getElementById("batchErrorDialogContent").textContent = errorText;
   document.getElementById("batchErrorDialog").showModal();
 }
@@ -7899,26 +9165,34 @@ function batchGanttUrl(items) {
   });
   return params.size ? `/movelist_gantt_viewer.html?${params.toString()}` : "";
 }
+function resetBatchGanttLink() {
+  const link = document.getElementById("batchGanttButton");
+  link.href = "#";
+  link.setAttribute("aria-disabled", "true");
+}
 function updateBatchLogDownload(result) {
-  const button = document.getElementById("batchLogButton");
+  const buttons = document.querySelectorAll(".batch-log-download");
   const hasLogs = (result.items || []).some((item) => item.logUrl);
   if (!result.batchId || !hasLogs) {
-    button.href = "#";
-    button.setAttribute("aria-disabled", "true");
+    buttons.forEach((button) => {
+      button.href = "#";
+      button.setAttribute("aria-disabled", "true");
+    });
     return;
   }
-  button.href = `/api/run-batches/${encodeURIComponent(result.batchId)}/logs`;
   const deviceName = String(result.deviceName || "\u5F53\u524D\u8BBE\u5907").replace(/\.json$/i, "");
   const readableDeviceName = deviceName.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_") || "\u5F53\u524D\u8BBE\u5907";
   const readableGroupName = String(result.group || "\u5F53\u524D\u6D4B\u8BD5\u7EC4").replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_") || "\u5F53\u524D\u6D4B\u8BD5\u7EC4";
-  button.download = `\u6279\u91CF\u590D\u73B0\u65E5\u5FD7-${readableDeviceName}-${readableGroupName}.zip`;
-  button.removeAttribute("aria-disabled");
+  buttons.forEach((button) => {
+    button.href = `/api/run-batches/${encodeURIComponent(result.batchId)}/logs`;
+    button.download = `\u6279\u91CF\u590D\u73B0\u65E5\u5FD7-${readableDeviceName}-${readableGroupName}.zip`;
+    button.removeAttribute("aria-disabled");
+  });
 }
 function showBatchResult(result) {
   state.batchResult = result;
   updateBatchLogDownload(result);
-  document.getElementById("testGroupAnalysisButton").hidden = false;
-  if (!state.selectedBatchTestId) showBatchOverviewMetrics(result);
+  updateAnalysisReportAvailability();
   const resultErrors = result.items.flatMap((item, index) => {
     if (item.status === "failed") {
       return [`t${index + 1} ${item.testName || ""}\uFF1A${item.error || "\u8FD0\u884C\u5931\u8D25"}`];
@@ -7930,112 +9204,12 @@ function showBatchResult(result) {
   });
   writeTerminal(resultErrors.join("\n"), resultErrors.length > 0);
   renderBatchItems(result.items);
-  const selectedIndex = result.items.findIndex((item, index) => String(item.testId || `index-${index}`) === state.selectedBatchTestId);
-  if (selectedIndex >= 0) {
-    showBatchItemOverview(result.items[selectedIndex], selectedIndex);
-    void loadBatchItemBottleneck(result.items[selectedIndex], selectedIndex);
-  }
-  const first = result.items.find((item) => item.ganttUrl || item.logUrl);
-  if (first) {
-    if (first.ganttUrl) {
-      const gantt = document.getElementById("ganttButton");
-      gantt.href = first.ganttUrl;
-      gantt.removeAttribute("aria-disabled");
-    }
-    if (first.logUrl) {
-      const log = document.getElementById("logButton");
-      log.href = first.logUrl;
-      log.download = readableLogFileName(first.testName);
-      log.removeAttribute("aria-disabled");
-    }
-  }
   const allGanttUrl = batchGanttUrl(result.items);
   const allGantt = document.getElementById("batchGanttButton");
   if (allGanttUrl) {
     allGantt.href = allGanttUrl;
     allGantt.removeAttribute("aria-disabled");
   }
-}
-function showResult(result) {
-  state.batchResult = null;
-  state.selectedBatchTestId = "";
-  document.getElementById("testGroupAnalysisButton").hidden = true;
-  document.getElementById("testGroupAnalysisPanel").hidden = true;
-  document.getElementById("batchProgress").classList.remove("visible");
-  document.getElementById("batchResults").innerHTML = "";
-  const allGantt = document.getElementById("batchGanttButton");
-  allGantt.href = "#";
-  allGantt.setAttribute("aria-disabled", "true");
-  updateBatchLogDownload({});
-  const baseline = result.baseline || {}, baselineReady = baseline.status === "succeeded";
-  const cpuTime = Number(result.cpuTimeMs ?? result.totalElapsedMs);
-  document.getElementById("metricContext").textContent = "\u5F53\u524D\u6D4B\u8BD5";
-  document.getElementById("batchOverviewButton").hidden = true;
-  ["metricTimeDetail", "metricMakespanDetail", "metricMovesDetail", "metricValidationDetail"].forEach((id) => {
-    document.getElementById(id).textContent = "";
-  });
-  document.getElementById("metricTimeLabel").textContent = "CPU Time";
-  document.getElementById("metricMakespanLabel").textContent = "Makespan / Baseline";
-  setBottleneckMetric(result.bottleneckUtilization, "\u6CA1\u6709\u8DB3\u591F\u7684\u8D44\u6E90\u6D3B\u52A8");
-  document.getElementById("metricValidationLabel").textContent = "Validation";
-  document.getElementById("metricTime").textContent = `${cpuTime.toFixed(1)} ms`;
-  document.getElementById("metricMakespan").textContent = `${result.makespan.toFixed(2)} / ${baselineReady ? Number(baseline.makespan).toFixed(2) : "\u2014"} s`;
-  const validationValue = validationDisplay(result.validation);
-  document.getElementById("metricValidation").textContent = validationValue;
-  document.getElementById("metricValidation").closest(".metric").classList.toggle("is-success", result.validation === "passed");
-  document.getElementById("metricValidation").closest(".metric").classList.toggle("is-error", result.validation !== "passed" && result.validation !== "skipped");
-  const objectiveDiagnostics = [...result.rounds || []].reverse().map((round) => round.strategyDiagnostics).find((diagnostics) => diagnostics?.metrics);
-  if (objectiveDiagnostics) {
-    const metrics = objectiveDiagnostics.metrics;
-    document.getElementById("metricValidationLabel").textContent = "Validation / Multi-metric";
-    document.getElementById("metricValidationDetail").textContent = `\u9A7B\u7559\u8D85\u9650 ${Number(metrics.residencyViolationCount) || 0} \u6B21 \xB7 \u6700\u5927\u6301\u7247 ${Number(metrics.maximumRobotHoldingSeconds || 0).toFixed(2)} s \xB7 \u7CFB\u7EDF\u505C\u7559 CV ${Number(metrics.systemResidenceCv || 0).toFixed(3)}`;
-  }
-  const dualActorDiagnostics = (result.rounds || []).map((round) => round.strategyDiagnostics).filter((diagnostics) => diagnostics?.selectedSource === "dual-actor-e2e");
-  if (dualActorDiagnostics.length) {
-    const totals = dualActorDiagnostics.reduce((summary, diagnostics) => ({
-      atmosphere: summary.atmosphere + (Number(diagnostics.actorDecisionCounts?.atmosphere) || 0),
-      vacuum: summary.vacuum + (Number(diagnostics.actorDecisionCounts?.vacuum) || 0),
-      pick: summary.pick + (Number(diagnostics.primitiveActionCounts?.pick) || 0),
-      place: summary.place + (Number(diagnostics.primitiveActionCounts?.place) || 0),
-      swap: summary.swap + (Number(diagnostics.primitiveActionCounts?.swap) || 0)
-    }), { atmosphere: 0, vacuum: 0, pick: 0, place: 0, swap: 0 });
-    document.getElementById("metricValidationLabel").textContent = "Validation / Dual Actor";
-    document.getElementById("metricValidationDetail").textContent = `\u51B3\u7B56\uFF1A\u5927\u6C14 ${totals.atmosphere} \xB7 \u771F\u7A7A ${totals.vacuum}\uFF1B\u539F\u5B50\u52A8\u4F5C\uFF1APick ${totals.pick} \xB7 Place ${totals.place} \xB7 Swap ${totals.swap}`;
-  }
-  writeTerminal(["$ \u8C03\u5EA6\u5B8C\u6210", ...(result.rounds || []).map((round) => {
-    if (round.kind === "initial") return `  #${round.index} \u9996\u6B21 | ${round.elapsedMs.toFixed(1)} ms`;
-    const request = Number(round.requestedTime);
-    const recoveryEnd = Number(round.recoveryEndTime ?? round.effectiveTime);
-    const triggerLabel = round.trigger === "cjob-cycle" ? "CJobCycle \u8865\u7247\u91CD\u7B97" : "\u5B9A\u65F6\u91CD\u7B97";
-    const timing = Math.abs(recoveryEnd - request) > 1e-6 ? `@${request}s ${triggerLabel} \xB7 \u56FA\u5B9A\u65E7\u52A8\u4F5C\u6536\u5C3E\u81F3 @${recoveryEnd}s` : `@${request}s ${triggerLabel}`;
-    return `  #${round.index} ${timing} | ${round.elapsedMs.toFixed(1)} ms`;
-  }), "", ...result.logs || []].join("\n"));
-  const gantt = document.getElementById("ganttButton");
-  gantt.href = result.ganttUrl;
-  gantt.removeAttribute("aria-disabled");
-}
-function showFailedResultMetrics(result) {
-  state.batchResult = null;
-  state.selectedBatchTestId = "";
-  document.getElementById("testGroupAnalysisButton").hidden = true;
-  document.getElementById("testGroupAnalysisPanel").hidden = true;
-  document.getElementById("batchProgress").classList.remove("visible");
-  document.getElementById("batchResults").innerHTML = "";
-  const baseline = result?.baseline || {};
-  const baselineMakespan = baseline.status === "succeeded" ? Number(baseline.makespan) : NaN;
-  const makespan = Number(result?.makespan);
-  const elapsedTime = Number(result?.totalElapsedMs ?? result?.cpuTimeMs);
-  const improvement = Number(result?.improvementPercent);
-  const makespanText = `${Number.isFinite(makespan) ? makespan.toFixed(2) : "\u2014"} / ${Number.isFinite(baselineMakespan) ? baselineMakespan.toFixed(2) : "\u2014"} s`;
-  const comparisonDetail = Number.isFinite(improvement) ? `${improvement >= 0 ? "\u63D0\u5347" : "\u9000\u5316"} ${Math.abs(improvement).toFixed(2)}% \xB7 \u7ED3\u679C\u6821\u9A8C\u672A\u901A\u8FC7` : baseline.status === "skipped" ? "" : baseline.status && baseline.status !== "succeeded" ? `Baseline ${baseline.status === "failed" ? "\u5931\u8D25" : "\u5931\u6548"}` : "\u5916\u90E8\u7B97\u6CD5\u672A\u8FD4\u56DE\u53EF\u6BD4\u8F83\u7684\u5B8C\u6574 Makespan";
-  document.getElementById("metricContext").textContent = "\u5F53\u524D\u6D4B\u8BD5 \xB7 \u5916\u90E8\u7B97\u6CD5\u5931\u8D25\u7ED3\u679C";
-  document.getElementById("batchOverviewButton").hidden = true;
-  setResultMetric("Time", "\u5931\u8D25\u524D\u8017\u65F6", Number.isFinite(elapsedTime) ? `${elapsedTime.toFixed(1)} ms` : "\u2014", "\u4ECE\u63D0\u4EA4\u5230\u8FD4\u56DE\u5931\u8D25\u7ED3\u679C");
-  setResultMetric("Makespan", "Makespan / Baseline", makespanText, comparisonDetail);
-  setBottleneckMetric(result?.bottleneckUtilization, result?.resultId ? "\u5931\u8D25\u7ED3\u679C\u6CA1\u6709\u8DB3\u591F\u7684\u8D44\u6E90\u6D3B\u52A8" : "\u672A\u751F\u6210\u53EF\u5206\u6790\u7684 MoveList");
-  setResultMetric("Validation", "Validation", result?.validation === "failed" ? "\u672A\u901A\u8FC7" : String(result?.validation || "\u5931\u8D25"), result?.error || "");
-  document.getElementById("metricValidation").closest(".metric").classList.remove("is-success");
-  document.getElementById("metricValidation").closest(".metric").classList.add("is-error");
 }
 function writeTerminal(message, error = false) {
   const panel = document.getElementById("resultErrorPanel");
@@ -8055,53 +9229,8 @@ function writeTerminal(message, error = false) {
   terminal.textContent = String(message || "\u672A\u77E5\u9519\u8BEF").replace(/^\$\s*/, "");
   panel.hidden = false;
 }
-function renderRunFailureCard({
-  cancelled,
-  errorMessage,
-  deadlock,
-  validationIssues,
-  baselineError
-}) {
-  const panel = document.getElementById("resultErrorPanel");
-  const details = document.getElementById("resultErrorDetails");
-  const terminal = document.getElementById("terminal");
-  const issueRows = validationIssues.map((rawIssue) => {
-    const issue = String(rawIssue || "").trim();
-    const matched = issue.match(/^\[([A-Z0-9-]+)\]\s*/);
-    const code = matched?.[1] || "MVL-UNKNOWN";
-    const message = matched ? issue.slice(matched[0].length) : issue;
-    return `<li><code>${escapeHtml3(code)}</code><span>${escapeHtml3(message || issue)}</span></li>`;
-  }).join("");
-  const validationFailure = validationIssues.length > 0;
-  const informationType = cancelled ? "\u8FD0\u884C\u5DF2\u7EC8\u6B62" : deadlock ? "\u7B97\u6CD5\u6B7B\u9501" : validationFailure ? "MoveList \u6821\u9A8C\u5931\u8D25" : baselineError ? "Baseline \u5931\u8D25" : "\u8FD0\u884C\u5F02\u5E38";
-  const primaryCode = deadlock?.deadlockCode || (validationIssues[0]?.match(/^\s*\[([A-Z0-9-]+)\]/)?.[1] ?? "RUN-ERR-001");
-  const summaryText = deadlock?.message || (cancelled ? "\u7528\u6237\u7EC8\u6B62\u4E86\u672C\u6B21\u8FD0\u884C" : errorMessage);
-  const summaryMarkup = validationFailure ? `<strong>${escapeHtml3(summaryText || "\u672A\u63D0\u4F9B\u9519\u8BEF\u8BF4\u660E")}</strong>` : `<span class="error-summary-meta">[${escapeHtml3(informationType)} <i aria-hidden="true">|</i> <code>${escapeHtml3(primaryCode)}</code>]</span><strong>${escapeHtml3(summaryText || "\u672A\u63D0\u4F9B\u9519\u8BEF\u8BF4\u660E")}</strong>`;
-  const validationSection = validationFailure ? "" : issueRows ? `
-    <section class="error-detail-section" aria-labelledby="errorValidationTitle">
-      <div class="error-detail-heading"><span id="errorValidationTitle">MoveList \u6821\u9A8C\u95EE\u9898</span><b>${validationIssues.length} \u9879</b></div>
-      <ul class="error-issue-list">${issueRows}</ul>
-    </section>` : "";
-  const baselineSection = baselineError ? `
-    <section class="error-detail-section">
-      <div class="error-detail-heading"><span>Baseline</span><b>\u5931\u8D25</b></div>
-      <p>${escapeHtml3(baselineError.replace(/^Baseline\s*失败：?\s*/, ""))}</p>
-    </section>` : "";
-  details.innerHTML = `
-    <div class="error-summary-line">
-      ${summaryMarkup}
-    </div>
-    ${validationSection}
-    ${baselineSection}
-  `;
-  terminal.textContent = "";
-  terminal.hidden = true;
-  details.hidden = false;
-  panel.hidden = false;
-}
 async function checkService() {
   const pill = document.getElementById("serviceState");
-  const runButton = document.getElementById("runButton");
   const batchRunButton = document.getElementById("batchRunButton");
   try {
     const response = await fetch("/api/health", { cache: "no-store" });
@@ -8110,8 +9239,7 @@ async function checkService() {
     state.serviceCompatible = compatible;
     state.algorithmMetadata = status.algorithmMetadata || {};
     renderOtherAlgorithmOptions(status.algorithms || status.otherAlgorithms || []);
-    runButton.disabled = !compatible || singleRunCancelling || state.batchRunning;
-    batchRunButton.disabled = !compatible || singleRunActive || state.batchRunning && state.batchCancelRequested;
+    batchRunButton.disabled = !compatible || state.batchRunning && state.batchCancelRequested;
     renderWorkspaceControls();
     pill.textContent = compatible ? "\u672C\u5730\u670D\u52A1\u5DF2\u8FDE\u63A5" : "\u670D\u52A1\u7248\u672C\u8FC7\u65E7";
     if (!compatible) {
@@ -8121,7 +9249,6 @@ async function checkService() {
     }
   } catch {
     state.serviceCompatible = false;
-    runButton.disabled = true;
     batchRunButton.disabled = true;
     renderWorkspaceControls();
     pill.textContent = "\u672C\u5730\u670D\u52A1\u672A\u8FDE\u63A5";
@@ -8290,8 +9417,68 @@ document.getElementById("testExchangeFile").addEventListener("change", (event) =
   ${error.message}`, true);
   });
 });
+document.getElementById("resultPreviewViewButton").addEventListener("click", () => setRunResultView("results"));
+document.getElementById("analysisReportViewButton").addEventListener("click", () => {
+  if (!canOpenAnalysisReport()) return;
+  if (document.getElementById("testGroupAnalysisPanel").hidden) openGroupAnalysisOptions();
+  else setRunResultView("analysis");
+});
+document.getElementById("batchResultFilterButton").addEventListener("click", () => openBatchTestSelectionDialog("filter"));
+for (const [sourceId, targetId] of [["runDeviceSelect", "deviceSelect"], ["runGroupSelect", "testGroupSelect"]]) {
+  document.getElementById(sourceId).addEventListener("change", (event) => {
+    const target = document.getElementById(targetId);
+    target.value = event.target.value;
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+document.getElementById("discardTestButton").addEventListener("click", () => discardTestDraft().catch((error) => setWorkspaceStatus(`\u64A4\u9500\u5931\u8D25\uFF1A${error.message}`, "dirty")));
+document.getElementById("saveAndRunPageButton").addEventListener("click", async () => {
+  try {
+    await saveCurrentTest(false);
+    showTestCatalog();
+  } catch (error) {
+    setWorkspaceStatus(`\u4FDD\u5B58\u5931\u8D25\uFF1A${error.message}`, "dirty");
+  }
+});
+document.getElementById("cancelTestEditButton").addEventListener("click", async () => {
+  try {
+    if (await settleTestDraft()) showTestCatalog();
+  } catch (error) {
+    setWorkspaceStatus(`\u65E0\u6CD5\u8FD4\u56DE\u5217\u8868\uFF1A${error.message}`, "dirty");
+  }
+});
+document.querySelectorAll("[data-management-target]").forEach((button) => button.addEventListener("click", () => {
+  (async () => {
+    await switchTab("test-management");
+    await switchManagementSection(button.dataset.managementTarget);
+  })().catch((error) => setWorkspaceStatus(`\u5207\u6362\u5931\u8D25\uFF1A${error.message}`, "dirty"));
+}));
+document.getElementById("testCatalogBody").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-test-action]");
+  if (!button || button.disabled) return;
+  (async () => {
+    if (button.dataset.testId !== state.testCaseId) await selectWorkspaceTest(button.dataset.testId);
+    if (button.dataset.testAction === "edit") showTestEditor();
+    if (button.dataset.testAction === "copy") {
+      await createTestCase(true);
+      showTestCatalog();
+    }
+    if (button.dataset.testAction === "delete") {
+      await deleteCurrentTest();
+      showTestCatalog();
+    }
+  })().catch((error) => setWorkspaceStatus(`\u6D4B\u8BD5\u64CD\u4F5C\u5931\u8D25\uFF1A${error.message}`, "dirty"));
+});
+document.getElementById("deviceImportButton").addEventListener("click", () => document.getElementById("workspaceImportButton").click());
+document.getElementById("deviceExportButton").addEventListener("click", () => document.getElementById("workspaceExportButton").click());
+window.addEventListener("beforeunload", (event) => {
+  if (state.dirty) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
 document.getElementById("deviceSelect").addEventListener("change", (event) => (async () => {
-  if (state.dirty) await saveCurrentTest(true);
+  if (!await settleTestDraft()) return;
   if (state.deviceTimingDirty) await saveDeviceTiming();
   await selectWorkspaceDevice(event.target.value);
 })().catch((error) => writeTerminal(`$ \u8BBE\u5907\u5207\u6362\u5931\u8D25
@@ -8336,9 +9523,9 @@ document.getElementById("deleteGroupButton").addEventListener("click", () => del
   writeTerminal(`$ \u5220\u9664\u6D4B\u8BD5\u7EC4\u522B\u5931\u8D25
   ${error.message}`, true);
 }));
-document.getElementById("newTestButton").addEventListener("click", () => createTestCase(false).catch((error) => writeTerminal(`$ \u65B0\u5EFA\u6D4B\u8BD5\u96C6\u5931\u8D25
+document.getElementById("newTestButton").addEventListener("click", () => createTestCase(false).then(showTestEditor).catch((error) => writeTerminal(`$ \u65B0\u5EFA\u6D4B\u8BD5\u96C6\u5931\u8D25
   ${error.message}`, true)));
-document.getElementById("emptyGroupNewTestButton").addEventListener("click", () => createTestCase(false).catch((error) => writeTerminal(`$ \u65B0\u5EFA\u6D4B\u8BD5\u96C6\u5931\u8D25
+document.getElementById("emptyGroupNewTestButton").addEventListener("click", () => createTestCase(false).then(showTestEditor).catch((error) => writeTerminal(`$ \u65B0\u5EFA\u6D4B\u8BD5\u96C6\u5931\u8D25
   ${error.message}`, true)));
 document.getElementById("copyTestButton").addEventListener("click", () => createTestCase(true).catch((error) => writeTerminal(`$ \u590D\u5236\u6D4B\u8BD5\u96C6\u5931\u8D25
   ${error.message}`, true)));
@@ -8350,12 +9537,11 @@ document.getElementById("roundCount").addEventListener("input", (event) => {
   resizeRounds(event.target.value);
   markTestDirty();
 });
-document.getElementById("runButton").addEventListener("click", runPlan);
 document.getElementById("batchRunButton").addEventListener("click", runCurrentTestGroup);
 document.getElementById("openRunSettingsButton").addEventListener("click", openRunSettingsDialog);
 document.getElementById("runSettingsDialogClose").addEventListener("click", closeRunSettingsDialog);
 document.getElementById("runSettingsDialog").addEventListener("close", finishRunSettingsDialog);
-["hongYeCheckInput", "compatibilityModeInput", "executionTimingEnabledInput", "skipBaselineInput", "batchParallelismInput", "validationParallelismInput", ...CLEAN_VALIDATION_TYPES.map((type) => `cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`)].forEach((id) => {
+["hongYeCheckInput", "executionTimingEnabledInput", "skipBaselineInput", "batchParallelismInput", "validationParallelismInput", ...CLEAN_VALIDATION_TYPES.map((type) => `cleanValidation${type[0].toUpperCase()}${type.slice(1)}Input`)].forEach((id) => {
   document.getElementById(id).addEventListener("change", () => {
     runSettingsPreferencesDirty = true;
     updateRunSettingsButtonLabel();
@@ -8384,6 +9570,17 @@ document.getElementById("batchTestSelectionForm").addEventListener("submit", (ev
   runBatchSelection(false);
 });
 document.getElementById("openSearchTreeOptionsDialogButton").addEventListener("click", openSearchTreeOptionsDialog);
+document.getElementById("openHeuristicSettingsDialogButton").addEventListener("click", openHeuristicSettingsDialog);
+document.getElementById("heuristicSettingsDialogCancel").addEventListener("click", () => document.getElementById("heuristicSettingsDialog").close());
+document.getElementById("heuristicCustomWeightsEnabled").addEventListener("change", updateHeuristicWeightEditorState);
+document.getElementById("heuristicSettingsForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  try {
+    saveHeuristicSettings();
+  } catch (error) {
+    document.getElementById("heuristicSettingsError").textContent = error.message;
+  }
+});
 document.getElementById("searchTreeOptionsDialogCancel").addEventListener("click", () => document.getElementById("searchTreeOptionsDialog").close());
 document.getElementById("searchTreeCheckpointFile").addEventListener("change", (event) => {
   pendingSearchTreeCheckpointFile = event.currentTarget.files?.[0] || null;
@@ -8403,19 +9600,79 @@ document.getElementById("searchTreeOptionsForm").addEventListener("submit", (eve
     document.getElementById("searchTreeCheckpointHint").textContent = error.message || "\u53C2\u6570\u4FDD\u5B58\u5931\u8D25";
   });
 });
-document.getElementById("batchOverviewButton").addEventListener("click", showCurrentBatchOverview);
-document.getElementById("testGroupAnalysisButton").addEventListener("click", () => {
-  showTestGroupAnalysis().catch((error) => writeTerminal(`$ \u6D4B\u8BD5\u7EC4\u7ED3\u679C\u5206\u6790\u5931\u8D25
+var cancelOrCloseAnalysisWizard = async () => {
+  if (activeGroupAnalysisJobId) {
+    document.getElementById("analysisOptionsCancel").disabled = true;
+    document.getElementById("analysisOptionsClose").disabled = true;
+    await cancelTestGroupAnalysisJob(activeGroupAnalysisJobId);
+    return;
+  }
+  document.getElementById("analysisOptionsDialog").close();
+};
+document.getElementById("analysisOptionsClose").addEventListener("click", () => void cancelOrCloseAnalysisWizard());
+document.getElementById("analysisOptionsCancel").addEventListener("click", () => void cancelOrCloseAnalysisWizard());
+document.getElementById("analysisOptionsDialog").addEventListener("cancel", (event) => {
+  if (!activeGroupAnalysisJobId) return;
+  event.preventDefault();
+  void cancelOrCloseAnalysisWizard();
+});
+document.getElementById("analysisOptionsDialog").addEventListener("close", () => {
+  if (analysisSettingsPreferencesDirty) {
+    saveAnalysisSettingsPreferences().catch((error) => writeTerminal(`$ \u5206\u6790\u8BBE\u7F6E\u4FDD\u5B58\u5931\u8D25
   ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
+  }
 });
-document.getElementById("logButton").addEventListener("click", (event) => {
-  if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
+document.getElementById("analysisNextButton").addEventListener("click", () => {
+  if (!document.querySelector("[data-analysis-metric]:checked")) {
+    writeTerminal("$ \u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u8BA1\u7B97\u6307\u6807", true);
+    return;
+  }
+  showAnalysisWizardStep(2);
 });
-document.getElementById("ganttButton").addEventListener("click", (event) => {
-  if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
+document.getElementById("analysisPreviousButton").addEventListener("click", () => showAnalysisWizardStep(1));
+document.querySelectorAll("[data-analysis-metric], #analysisWindowMode, #analysisTimeBudget").forEach((input) => {
+  input.addEventListener("change", () => {
+    analysisSettingsPreferencesDirty = true;
+  });
 });
-document.getElementById("batchLogButton").addEventListener("click", (event) => {
-  if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
+document.getElementById("analysisToggleAllTests").addEventListener("click", (event) => {
+  const checkboxes = [...document.querySelectorAll("[data-analysis-test]")];
+  const selectAll = checkboxes.some((checkbox) => !checkbox.checked);
+  checkboxes.forEach((checkbox) => {
+    checkbox.checked = selectAll;
+  });
+  event.currentTarget.textContent = selectAll ? "\u53D6\u6D88\u5168\u9009" : "\u5168\u9009";
+});
+document.getElementById("analysisOptionsForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (analysisWizardStep === 1) {
+    if (document.querySelector("[data-analysis-metric]:checked")) showAnalysisWizardStep(2);
+    else writeTerminal("$ \u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u8BA1\u7B97\u6307\u6807", true);
+    return;
+  }
+  if (analysisWizardStep !== 2) return;
+  document.getElementById("startGroupAnalysisButton").disabled = true;
+  showTestGroupAnalysis().catch((error) => {
+    activeGroupAnalysisJobId = "";
+    document.getElementById("startGroupAnalysisButton").disabled = false;
+    document.getElementById("analysisOptionsCancel").disabled = false;
+    document.getElementById("analysisOptionsClose").disabled = false;
+    document.getElementById("analysisOptionsCancel").textContent = "\u5173\u95ED";
+    document.getElementById("analysisDialogProgress").innerHTML = `<section class="group-analysis-warning"><strong>\u7ED3\u679C\u5206\u6790\u5931\u8D25</strong><br>${escapeHtml3(error.message || "\u672A\u77E5\u9519\u8BEF")}</section>`;
+    if (analysisWizardStep !== 3) {
+      document.getElementById("analysisOptionsCancel").textContent = "\u53D6\u6D88";
+    } else {
+      visualizationWorkspace.showGroupAnalysis(`<section class="group-analysis-warning"><strong>\u7ED3\u679C\u5206\u6790\u5931\u8D25</strong><br>${escapeHtml3(error.message || "\u672A\u77E5\u9519\u8BEF")}</section>`);
+      setRunResultView("analysis");
+    }
+    writeTerminal(`$ \u6D4B\u8BD5\u7EC4\u7ED3\u679C\u5206\u6790\u5931\u8D25
+  ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true);
+  });
+});
+document.querySelectorAll(".batch-log-download").forEach((button) => {
+  button.addEventListener("click", (event) => {
+    if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
+  });
 });
 document.getElementById("batchGanttButton").addEventListener("click", (event) => {
   if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
@@ -8429,7 +9686,33 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("keydown", (event) => {
   const card = event.target.closest?.("[data-step-card]");
-  if (card && event.key === "Enter") openPJobStepDrawer(Number(card.dataset.routeIndex), Number(card.dataset.stageIndex));
+  if (!card || event.key !== "Enter") return;
+  const inlineContext = card.dataset.roundIndex === void 0 ? null : {
+    roundIndex: Number(card.dataset.roundIndex),
+    cjobIndex: Number(card.dataset.cjobIndex),
+    pjobIndex: Number(card.dataset.pjobIndex)
+  };
+  openPJobStepDrawer(Number(card.dataset.routeIndex), Number(card.dataset.stageIndex), inlineContext);
+});
+document.addEventListener("keydown", (event) => {
+  const card = event.target.closest?.("[data-batch-test-card]");
+  if (!card || !["Enter", " "].includes(event.key)) return;
+  if (event.target.closest("a, button, input, select, textarea, label")) return;
+  event.preventDefault();
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    enqueueResultCardTest(card.dataset.batchTestCard);
+    return;
+  }
+  toggleBatchTestDetails(card.dataset.batchTestCard).catch((error) => writeTerminal(`$ \u6D4B\u8BD5\u8BE6\u60C5\u8BFB\u53D6\u5931\u8D25
+  ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
+});
+document.addEventListener("dblclick", (event) => {
+  const card = event.target.closest?.("[data-batch-test-card]");
+  if (!card || event.target.closest("a, button, input, select, textarea, label")) return;
+  event.preventDefault();
+  window.clearTimeout(batchCardClickTimer);
+  batchCardClickTimer = 0;
+  enqueueResultCardTest(card.dataset.batchTestCard);
 });
 document.addEventListener("input", (event) => {
   if (event.target.matches("[data-device-timing-target], [data-device-execution-target]")) updateDeviceTimingFromControl(event.target);
@@ -8460,6 +9743,11 @@ document.addEventListener("change", (event) => {
     execution.fluctuation.kind = event.target.value === "offset" ? "offset" : "ratio";
     markDeviceTimingDirty();
     renderDeviceTimingConfiguration();
+    return;
+  }
+  if (execution && event.target.id === "executionSamplingMode") {
+    execution.fluctuation.samplingMode = event.target.value === "per-init" ? "per-init" : "per-move";
+    markDeviceTimingDirty();
     return;
   }
   const transferAxis = event.target.closest?.("[data-robot-transfer-axis]");
@@ -8497,8 +9785,6 @@ document.addEventListener("change", (event) => {
     retainSessionSchedulingConfiguration();
     document.getElementById("roundCount").disabled = false;
     updateStrategyOptionVisibility();
-    showAlgorithmDetails(state.strategy);
-    markTestDirty();
     renderAll();
   }
 });
@@ -8529,14 +9815,12 @@ document.addEventListener("click", (event) => {
   }
   const batchErrorButton = event.target.closest("[data-batch-error]");
   if (batchErrorButton) {
-    openBatchErrorDialog(Number(batchErrorButton.dataset.batchError));
+    openBatchErrorDialog(batchErrorButton.dataset.batchError);
     return;
   }
-  const batchResultCard = event.target.closest("[data-batch-item-index]");
-  if (batchResultCard && !event.target.closest(".batch-result-meta")) selectBatchItem(Number(batchResultCard.dataset.batchItemIndex));
   const playbackResult = event.target.closest("[data-playback-result]");
   if (playbackResult) {
-    visualizationWorkspace.loadResult(playbackResult.dataset.playbackResult, playbackResult.dataset.playbackName).then(() => visualizationWorkspace.showPlayback()).catch((error) => writeTerminal(`$ \u62D3\u6251\u56DE\u653E\u52A0\u8F7D\u5931\u8D25
+    visualizationWorkspace.loadResult(playbackResult.dataset.playbackResult, playbackResult.dataset.playbackName).then(() => visualizationWorkspace.showPlayback()).catch((error) => writeTerminal(`$ \u56DE\u653E\u8BCA\u65AD\u52A0\u8F7D\u5931\u8D25
   ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
     return;
   }
@@ -8546,13 +9830,31 @@ document.addEventListener("click", (event) => {
   ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
     return;
   }
+  const batchTestCard = event.target.closest("[data-batch-test-card]");
+  if (batchTestCard) {
+    if (event.target.closest("a, button, input, select, textarea, label")) return;
+    window.clearTimeout(batchCardClickTimer);
+    batchCardClickTimer = window.setTimeout(() => {
+      batchCardClickTimer = 0;
+      toggleBatchTestDetails(batchTestCard.dataset.batchTestCard).catch((error) => writeTerminal(`$ \u6D4B\u8BD5\u8BE6\u60C5\u8BFB\u53D6\u5931\u8D25
+  ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
+    }, BATCH_CARD_SINGLE_CLICK_DELAY_MILLISECONDS);
+    return;
+  }
   const button = event.target.closest("[data-action]");
   if (button && !button.disabled) {
     handleAction(button);
     return;
   }
   const card = event.target.closest("[data-step-card]");
-  if (card) openPJobStepDrawer(Number(card.dataset.routeIndex), Number(card.dataset.stageIndex));
+  if (card) {
+    const inlineContext = card.dataset.roundIndex === void 0 ? null : {
+      roundIndex: Number(card.dataset.roundIndex),
+      cjobIndex: Number(card.dataset.cjobIndex),
+      pjobIndex: Number(card.dataset.pjobIndex)
+    };
+    openPJobStepDrawer(Number(card.dataset.routeIndex), Number(card.dataset.stageIndex), inlineContext);
+  }
 });
 window.addEventListener("pagehide", () => {
   if (runSettingsPreferencesDirty) {
@@ -8560,6 +9862,15 @@ window.addEventListener("pagehide", () => {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ runSettings: currentRunSettingsPreferences() }),
+      keepalive: true
+    }).catch(() => {
+    });
+  }
+  if (analysisSettingsPreferencesDirty) {
+    fetch("/api/preferences/analysis-settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analysisSettings: currentAnalysisSettingsPreferences() }),
       keepalive: true
     }).catch(() => {
     });
@@ -8573,21 +9884,16 @@ window.addEventListener("pagehide", () => {
     }).catch(() => {
     });
   }
-  if (state.dirty && state.workspaceDeviceId && state.testCaseId) {
-    fetch(`/api/workspaces/${state.workspaceDeviceId}/tests/${state.testCaseId}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(currentTestSnapshot()),
-      keepalive: true
-    }).catch(() => {
-    });
-  }
 });
+var managementSections = document.getElementById("testManagementSections");
+for (const id of ["routeManagementSection", "deviceManagementSection"]) managementSections.append(document.getElementById(id));
 initializeCompactSelects();
 renderAll();
 renderWorkspaceControls();
 renderDeviceTimingConfiguration();
 checkService();
 loadRunSettingsPreferences().catch((error) => writeTerminal(`$ \u8FD0\u884C\u8BBE\u7F6E\u8BFB\u53D6\u5931\u8D25
+  ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
+loadAnalysisSettingsPreferences().catch((error) => writeTerminal(`$ \u5206\u6790\u8BBE\u7F6E\u8BFB\u53D6\u5931\u8D25
   ${error.message || "\u672A\u77E5\u9519\u8BEF"}`, true));
 loadWorkspaceCatalog().catch((error) => setWorkspaceStatus(`\u6D4B\u8BD5\u96C6\u8BFB\u53D6\u5931\u8D25\uFF1A${error.message}`, "dirty"));

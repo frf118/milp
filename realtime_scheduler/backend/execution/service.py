@@ -28,7 +28,6 @@ def _execute_standard_algorithm(
     if (algorithm_id is None) == (builtin_strategy is None):
         raise ValueError("标准算法执行必须且只能选择一种算法来源")
     use_hongye_validation = bool(plan.get("hongYeCheck", True))
-    compatibility_mode = bool(plan.get("compatibilityMode", True))
     enabled_clean_validation_types = plan.get("cleanValidationTypes")
     supported_clean_validation_types = {"preclean", "postclean", "wacclean", "dummy", "dummywac"}
     skipped_clean_validation_types = (
@@ -146,12 +145,11 @@ def _execute_standard_algorithm(
             runtime = PlatformMoveListRuntime(
                 prepared_first_update,
                 output,
-                compatibility_mode=compatibility_mode,
                 skipped_clean_validation_types=skipped_clean_validation_types,
                 device=plan["device"],
                 execution_timing=(
                     plan.get("executionTiming")
-                    if plan.get("executionTimingEnabled") and compatibility_mode
+                    if plan.get("executionTimingEnabled")
                     else None
                 ),
                 execution_timing_seed=int(_finite_number(
@@ -359,8 +357,18 @@ def _execute_standard_algorithm(
                 f"收到 output #{recompute_index}",
                 "succeeded",
             )
+            cumulative_failure_output = (
+                runtime.combined_failure_output(
+                    output,
+                    requested_time,
+                    reason,
+                    committed_moves,
+                )
+                if _deadlock_feedback(output) is not None
+                else output
+            )
             _raise_deadlock_feedback(
-                output,
+                cumulative_failure_output,
                 reproduction,
                 sim_time=requested_time,
                 context=reason,
@@ -581,7 +589,6 @@ def _execute_standard_algorithm(
         "makespan": makespan,
         "moveCount": len(combined_output["MoveList"]),
         "validation": "passed",
-        "compatibilityMode": compatibility_mode,
         "validationEngine": (
             "platform+hongye" if use_hongye_validation else "platform"
         ),
@@ -690,7 +697,8 @@ def _execute_plan(raw_plan: Mapping[str, Any], reproduction: ReproductionLog) ->
         else "petri-look"
     )
     loadlock_manager_mode = str(
-        options.get("loadLockManager") or default_loadlock_manager_mode
+        (options.get("loadLockManager") if strategy != "heuristic" else None)
+        or default_loadlock_manager_mode
     ).strip().lower()
     supported_loadlock_managers = {
         "joint",

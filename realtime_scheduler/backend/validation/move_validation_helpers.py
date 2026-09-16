@@ -1,6 +1,7 @@
 """MoveList 校验的运输、设备配置和数据解析辅助函数。"""
 
 import math
+from bisect import bisect_left, bisect_right
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .move_validation_core import (
@@ -73,6 +74,37 @@ def _station_access_error(robot: RobotState, station: StationState, start_time: 
     return None
 
 
+class _IndexedMoves(list):
+    """保存一代计划及运输站点索引；重算建立新对象，不跨代复用。"""
+
+    def __init__(self, moves: Iterable[Mapping[str, Any]]) -> None:
+        """按原顺序保存 Move，并仅索引 Pick/Place/Swap 实际访问的站点。"""
+        super().__init__(moves)
+        self.transports_by_station: Dict[str, list] = {}
+        self.transport_dependents: Dict[int, list] = {}
+        for index, move in enumerate(self):
+            move_type = move.get("MoveType")
+            field = (
+                "SrcStationList" if move_type in {PICK_MOVE, MULTI_PICK_MOVE}
+                else "DestStationList" if move_type == PLACE_MOVE
+                else "StationList" if move_type == SWAP_MOVE
+                else None
+            )
+            if field is not None:
+                entry = (index, move)
+                for predecessor in set(_integer_values(move, "PreMoveID")):
+                    self.transport_dependents.setdefault(predecessor, []).append(entry)
+                start = _number(move.get("StartTime"))
+                if start is None:
+                    continue
+                for station in {str(value) for value in _values(move, field)}:
+                    self.transports_by_station.setdefault(station, []).append((start, index, move))
+        self.transport_start_times = {}
+        for station, entries in self.transports_by_station.items():
+            entries.sort(key=lambda entry: (entry[0], entry[1]))
+            self.transport_start_times[station] = [entry[0] for entry in entries]
+
+
 def _related_move(move: Mapping[str, Any], moves: Sequence[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
     """查找与开门动作关联、访问同一站点的实际运输动作。
 
@@ -99,7 +131,19 @@ def _related_move(move: Mapping[str, Any], moves: Sequence[Mapping[str, Any]]) -
     dependency_candidates: List[Mapping[str, Any]] = []
     adjacent_candidates: List[Mapping[str, Any]] = []
 
-    for candidate in moves:
+    if isinstance(moves, _IndexedMoves):
+        # 必须保留全部直接依赖和容差范围内的时间邻接候选，不能取第一条。
+        times = moves.transport_start_times.get(station_name, ())
+        entries = moves.transports_by_station.get(station_name, ())
+        lower = math.nextafter(end_time - TIME_TOLERANCE, -math.inf)
+        upper = math.nextafter(end_time + TIME_TOLERANCE, math.inf)
+        adjacent = entries[bisect_left(times, lower):bisect_right(times, upper)]
+        indexed = dict(moves.transport_dependents.get(move_id, ())) if isinstance(move_id, int) else {}
+        indexed.update((index, candidate) for _, index, candidate in adjacent)
+        candidates = indexed.values()
+    else:
+        candidates = moves
+    for candidate in candidates:
         move_type = candidate.get("MoveType")
         candidate_action = action_by_move_type.get(move_type)
         if candidate_action is None:
@@ -475,7 +519,10 @@ def _clean_task_state_variables(payload: Mapping[str, Any]) -> Dict[str, Set[str
 
 def _clean_wac_trigger_rules(
     payload: Mapping[str, Any],
-) -> Dict[Tuple[str, str], Tuple[Tuple[str, str, float, str], ...]]:
+) -> Dict[
+    Tuple[str, str],
+    Tuple[Tuple[str, str, float, str, Optional[str]], ...],
+]:
     """读取按腔室和工艺 Recipe 生效的 WAC 计数阈值。
 
     标准 update 把 WAC 条件放在 ``ProcessJobs[].OriginRoute`` 的
@@ -483,7 +530,10 @@ def _clean_wac_trigger_rules(
     在初始化时按 ``(PJobName, ModuleName, ProcessRecipe)`` 关联，校验器就能
     在产品 ``ProcessMove`` 开始前判断清洁是否已经到期。
     """
-    result: Dict[Tuple[str, str], List[Tuple[str, str, float, str]]] = {}
+    result: Dict[
+        Tuple[str, str],
+        List[Tuple[str, str, float, str, Optional[str]]],
+    ] = {}
 
     def rows(value: Any) -> Sequence[Any]:
         """把标准接口中可能是数组或对象的集合统一为可遍历序列。"""
@@ -511,6 +561,10 @@ def _clean_wac_trigger_rules(
         for step in rows(route.get("RouteSteps") or []):
             if not isinstance(step, Mapping):
                 continue
+            raw_step_id = step.get("StepID")
+            source_step_id = (
+                str(raw_step_id) if raw_step_id not in (None, "") else None
+            )
             for visit in rows(step.get("Visits") or []):
                 if not isinstance(visit, Mapping):
                     continue
@@ -564,6 +618,7 @@ def _clean_wac_trigger_rules(
                                     variable_name,
                                     lower,
                                     clean_task_name,
+                                    source_step_id,
                                 )
                                 if rule not in result.setdefault(key, []):
                                     result[key].append(rule)
@@ -575,21 +630,27 @@ def _wac_rules_for_clean_move(
     station_name: str,
     pjob_names: Set[str],
     clean_task_name: str,
-) -> Tuple[Tuple[str, str, float, str], ...]:
+) -> Tuple[Tuple[str, str, float, str, Optional[str]], ...]:
     """反查当前无片 WAC 清洁对应的产品工艺阈值规则。
 
     WAC 条件由产品 Recipe 索引，而无片清洁 Move 仅携带 CleanTaskName；因此按
     PM、PJob 和任务名关联。对多个 Route Visit 的重复规则去重，保证一个非法
     清洁 Move 只生成一条稳定诊断。
     """
-    matched: List[Tuple[str, str, float, str]] = []
+    matched: List[Tuple[str, str, float, str, Optional[str]]] = []
     for (rule_station_name, _recipe_name), rules in (
         state.clean_wac_trigger_rules.items()
     ):
         if rule_station_name != station_name:
             continue
         for rule in rules:
-            rule_pjob_name, _variable_name, _lower, rule_task_name = rule
+            (
+                rule_pjob_name,
+                _variable_name,
+                _lower,
+                rule_task_name,
+                _source_step_id,
+            ) = rule
             if rule_task_name != clean_task_name:
                 continue
             if rule_pjob_name and rule_pjob_name not in pjob_names:
@@ -718,6 +779,13 @@ def _missing_pre_clean_obligation(
             task_name,
             material_count=expected_count if required_count > 0 else 0,
         )
+        if clean_type == "dummywac":
+            # 产品准入要求每一片 Dummy 的带片段和尾随空腔 WAC 都已成对完成；
+            # 仅达到带片数量仍不能视为 PreWacClean 完成。
+            actual_count = min(
+                actual_count,
+                state.completed_dummy_wac_counts.get(clean_key, 0),
+            )
         if (
             actual_count < expected_count
             and clean_type not in state.skipped_clean_validation_types
@@ -757,9 +825,21 @@ def _validate_clean_start(
     pjob_names = _values(move, "PJobName")
     pjob_name = str(pjob_names[0]) if pjob_names else ""
     if material_ids and not clean_task_name:
+        pending = [
+            key
+            for key in state.pending_wac_obligations
+            if key[0] == station.name and (not pjob_name or key[1] == pjob_name)
+        ]
+        if pending and not skipped("wacclean"):
+            task_name = pending[0][3]
+            return _issue(
+                move,
+                ValidationErrorCode.CLEAN_WAC_MISSING,
+                f"{task_name} 到期后仍开始产品工艺 PJob={pjob_name}",
+            )
         recipe_name = str(move.get("ProcessRecipe") or move.get("RecipeName") or "").strip()
         rules = state.clean_wac_trigger_rules.get((station.name, recipe_name), ()) or state.clean_wac_trigger_rules.get((station.name, ""), ())
-        for rule_pjob_name, variable_name, lower, task_name in rules:
+        for rule_pjob_name, variable_name, lower, task_name, _step_id in rules:
             if rule_pjob_name and rule_pjob_name != pjob_name:
                 continue
             value = state.wac_counter_value(station, pjob_name, variable_name)
@@ -776,23 +856,44 @@ def _validate_clean_start(
                 return _issue(move, code, f"{task_name} 未完成就开始产品工艺 required={required} actual={actual} PJob={pjob_name}")
         return None
     if clean_task_name:
-        recipe_name = str(move.get("ProcessRecipe") or move.get("CleanRecipe") or "").strip()
         selected_pjobs = {str(name) for name in pjob_names}
+        has_pending_wac = any(
+            key[0] == station.name
+            and key[3] == clean_task_name
+            and (not selected_pjobs or key[1] in selected_pjobs)
+            for key in state.pending_wac_obligations
+        )
         for (required_pjob, required_station, task_name), requirement in state.clean_obligations.items():
             if (
-                required_station == station.name
+                requirement[0] == "pre"
+                and required_station == station.name
                 and task_name == clean_task_name
-                and (not selected_pjobs or required_pjob in selected_pjobs)
-                and requirement[2]
-                and recipe_name not in requirement[2]
+                and required_pjob in selected_pjobs
+                and _clean_validation_type(
+                    task_name,
+                    material_count=requirement[1],
+                ) == "preclean"
+                and not skipped("preclean")
             ):
-                return _issue(move, ValidationErrorCode.CLEAN_RECIPE_INVALID, f"{clean_task_name} Recipe={recipe_name or '<empty>'}，期望 {list(requirement[2])} PJob={required_pjob}")
+                clean_key = (required_pjob, required_station, task_name)
+                actual_count = state.completed_clean_counts.get(clean_key, 0)
+                expected_count = max(1, requirement[1])
+                if actual_count >= expected_count:
+                    return _issue(
+                        move,
+                        ValidationErrorCode.CLEAN_PRE_DUPLICATE,
+                        f"{clean_task_name} 已完成，不能重复执行 "
+                        f"required={expected_count} actual={actual_count} "
+                        f"PJob={required_pjob}",
+                    )
     if not clean_task_name or "wac" not in clean_task_name.casefold() or skipped(
         _clean_validation_type(clean_task_name)
     ):
         return None
     names = {str(name).strip() for name in pjob_names if str(name).strip()}
-    for _pjob, variable_name, lower, task_name in _wac_rules_for_clean_move(state, station.name, names, clean_task_name):
+    if has_pending_wac:
+        return None
+    for _pjob, variable_name, lower, task_name, _step_id in _wac_rules_for_clean_move(state, station.name, names, clean_task_name):
         rule_pjob_name = _pjob or next(iter(sorted(names)), "")
         value = state.wac_counter_value(
             station,

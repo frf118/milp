@@ -36,6 +36,7 @@ export async function requestScheduleAnalysis(input: {
   rounds?: Array<Record<string, any>>;
   cpuTimeMs?: number | null;
   recomputeCount?: number;
+  metricGroups?: string[];
 }): Promise<{
   analysis: SchedulePerformance;
   bottleneck: BottleneckUtilizationSummary | null;
@@ -76,6 +77,63 @@ export async function requestReplayDecision(input: {
     body: JSON.stringify(input),
   });
   return result.decision as Record<string, any>;
+}
+
+/** 创建测试组后台分析任务，使长耗时指标不阻塞页面请求。 */
+export async function createTestGroupAnalysisJob(
+  input: Record<string, any>,
+): Promise<Record<string, any>> {
+  const result = await requestJson("/api/analysis-jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  return result.job as Record<string, any>;
+}
+
+/** 读取测试组后台分析任务的进度和已完成结果。 */
+export async function readTestGroupAnalysisJob(jobId: string): Promise<Record<string, any>> {
+  const result = await requestJson(`/api/analysis-jobs/${encodeURIComponent(jobId)}`, {
+    cache: "no-store",
+  });
+  return result.job as Record<string, any>;
+}
+
+/** 请求取消正在运行的测试组分析任务。 */
+export async function cancelTestGroupAnalysisJob(jobId: string): Promise<Record<string, any>> {
+  const result = await requestJson(`/api/analysis-jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+  return result.job as Record<string, any>;
+}
+
+/** 请求服务端生成死锁诊断 JSON；返回文件内容与响应头中的下载名。 */
+export async function requestDeadlockDiagnostic(input: {
+  resultId?: string;
+  moves?: MoveRecord[];
+  plan?: Record<string, any> | null;
+  time: number;
+  snapshot: Record<string, any>;
+  includeActions?: boolean;
+}): Promise<{ blob: Blob; fileName: string }> {
+  const response = await fetch("/api/analysis/deadlock-diagnostic", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result?.error || `服务返回 ${response.status}`);
+  }
+  const disposition = response.headers.get("Content-Disposition") ?? "";
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const fallbackName = disposition.match(/filename="([^"]+)"/i)?.[1];
+  return {
+    blob: await response.blob(),
+    fileName: encodedName
+      ? decodeURIComponent(encodedName)
+      : fallbackName || "deadlock-diagnostic.json",
+  };
 }
 
 /** 读取 Search Tree 搜索快照；版本未变化时后端只返回紧凑标记。 */

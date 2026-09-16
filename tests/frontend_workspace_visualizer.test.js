@@ -4,7 +4,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const logic = require("../realtime_scheduler/frontend/workspace_visualizer_logic.js");
+const logic = require(
+  process.env.CT_WORKSPACE_VISUALIZER_TEST_BUILD
+    || "../realtime_scheduler/frontend/workspace_visualizer_logic.js",
+);
 const frontendCss = fs.readFileSync(
   path.join(__dirname, "../realtime_scheduler/frontend/assets/config_editor.css"),
   "utf8",
@@ -75,6 +78,18 @@ test("拓扑晶圆标签保留 ID 并显示首次来源模块和槽位", () => {
   const markup = logic.renderEquipmentTopology(snapshot, null, new Set(), device);
   assert.match(markup, /class="wafer-origin-label">LP1\.1</);
   assert.doesNotMatch(markup, /wafer-dummy/);
+});
+
+test("槽位视图使用来源 LP 相对槽号，不把全局物料 ID 当晶圆编号", () => {
+  const snapshot = logic.buildWorkspaceSnapshot([
+    { MoveID: 1, MoveType: 0, ModuleName: "ATR", SrcStationList: ["LP2"],
+      SrcSlotList: [4], MatIDList: [79], StartTime: 0, EndTime: 1 },
+    { MoveID: 2, MoveType: 1, ModuleName: "ATR", DestStationList: ["LA"],
+      DestSlotList: [2], MatIDList: [79], StartTime: 1, EndTime: 2 },
+  ], { ...device, Stations: { ...device.Stations, LP2: { Type: "LoadPort" } } }, 2);
+  const markup = logic.renderFrontSlotOverview(snapshot.modules, snapshot.waferOrigins);
+  assert.match(markup, /LA\.2 · 晶圆 LP2\.4/);
+  assert.doesNotMatch(markup, /晶圆 79/);
 });
 
 test("Dummy 晶圆使用独立颜色，表面显示原始物料 ID", () => {
@@ -155,7 +170,7 @@ test("前端回放识别单臂持片且目标满腔依赖同一机器手排空",
   assert.match(deadlock.Message, /R.*唯一手臂.*W_NEW.*PM1.*W_OLD.*没有空手接走腔内晶圆.*相互等待/);
 });
 
-test("前端回放识别双臂单片持有且目标满腔无交换出口", () => {
+test("前端回放不再将双臂单片持有且目标满腔识别为死锁", () => {
   const replayMoves = [
     {
       MoveID: 1, MoveType: 5, ModuleName: "R", SrcStationList: ["PM2"],
@@ -195,9 +210,7 @@ test("前端回放识别双臂单片持有且目标满腔无交换出口", () =>
 
   const deadlock = logic.detectTerminalPlaybackDeadlock(replayMoves, replayDevice, replayPlan);
 
-  assert.equal(deadlock.Code, "DEADLOCK.DUAL_ARM_SINGLE_HELD_TARGET_FULL");
-  assert.match(deadlock.Message, /R.*W_HELD.*PM1.*尚未完成整组 PreDummyClean.*W_BLOCKING/);
-  assert.match(deadlock.Message, /W_HELD.*清洗完成前禁止进入.*不能直接换片.*只能由 R 取出/);
+  assert.equal(deadlock, null);
 });
 
 test("前端回放识别双臂同时持有两片且目标腔室均已满", () => {
@@ -348,7 +361,6 @@ function fakeWorkspaceDocument() {
     "visualDecisionLens",
     "visualActionStatusFilter",
     "visualActionKindFilter",
-    "visualPauseOnDecisionChangeButton",
     "visualActiveMoves",
     "visualSource",
     "visualCurrentTime",
@@ -366,15 +378,19 @@ function fakeWorkspaceDocument() {
     "performanceWindow",
   ];
   const elements = new Map(ids.map(id => [id, new FakeElement()]));
+  // 此夹具不包含真实画布祖先；补齐 DOM 查询接口，保持原有业务测试边界。
+  elements.get("visualDeviceStage").closest = () => null;
   const workspaceTab = new FakeElement();
+  const playbackTab = new FakeElement();
   return {
     elements,
     workspaceTab,
+    playbackTab,
     getElementById(id) {
       return elements.get(id) ?? null;
     },
     querySelector(selector) {
-      return selector === '[data-tab-target="workspace"]' ? workspaceTab : null;
+      return selector === '[data-tab-target="workspace"]' ? workspaceTab : selector === '[data-tab-target="playback"]' ? playbackTab : null;
     },
     querySelectorAll() {
       return [];
@@ -391,33 +407,14 @@ test("MoveList 输入同时支持数组和结果对象", () => {
   );
 });
 
-test("回放进度、MoveList 与中文工具入口合并在顶部紧凑工具栏", () => {
-  const html = fs.readFileSync(
-    path.join(__dirname, "../realtime_scheduler/frontend/config_editor.html"),
-    "utf8",
-  );
-  const css = fs.readFileSync(
-    path.join(__dirname, "../realtime_scheduler/frontend/assets/config_editor.css"),
-    "utf8",
-  );
-  const toolbarStart = html.indexOf('<section class="timeline-console petri-top-playback-controls"');
-  const toolbarEnd = html.indexOf("</section>", toolbarStart);
-  const toolbar = html.slice(toolbarStart, toolbarEnd);
-  assert.ok(toolbarStart >= 0 && toolbarEnd > toolbarStart);
-  assert.match(toolbar, /class="timeline-primary-zone"[\s\S]*class="timeline-range"[\s\S]*class="timeline-tools-zone"/);
-  assert.match(toolbar, /id="visualPlayButton"/);
-  assert.match(toolbar, /id="visualSource"[^>]*title="—"/);
-  assert.match(toolbar, /id="visualTimeline"/);
-  assert.match(toolbar, /id="visualImportButton"[^>]*>[\s\S]*导入 MoveList/);
-  assert.match(toolbar, /id="visualOpenGantt"[^>]*>[\s\S]*打开甘特图/);
-  assert.match(css, /\.petri-top-playback-controls \{[^\n]*--playback-control-height: 44px/);
-  assert.match(css, /grid-template-columns: auto minmax\(320px, 1fr\) auto/);
-  assert.match(css, /@media \(max-width: 1100px\)/);
-  assert.match(css, /@media \(max-width: 800px\)[\s\S]*grid-template-areas: "primary tools" "range range"/);
-  assert.match(css, /\.petri-top-playback-controls :is\([^\n]*:focus-visible/);
-  assert.doesNotMatch(html, /petri-utils/);
-  assert.match(html, /id="visualPauseOnDecisionChangeButton"/);
-  assert.doesNotMatch(html, /id="visualTransitionButtons"|MODEL EVALUATION/);
+test("回放控制保留稳定入口且动作查询默认关闭", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../realtime_scheduler/frontend/config_editor.html"), "utf8");
+  for (const id of ["visualPlayButton", "visualSource", "visualTimeline", "visualSpeed", "visualTotalTime", "visualExportDeadlockDiagnostic", "visualWaferProgress"]) {
+    assert.ok(html.includes(`id="${id}"`));
+  }
+  assert.match(html, /id="visualActionsEnabled"[^>]*role="switch"/);
+  assert.doesNotMatch(html, /id="visualActionsEnabled"[^>]*checked/);
+  assert.doesNotMatch(html, /id="visualPauseOnDecisionChangeButton"/);
 });
 
 test("正视槽位卡片按内容收缩，不以画布高度拉长模块槽位", () => {
@@ -445,7 +442,8 @@ test("合法动作空间面板保持两列卡片与默认全状态视觉契约",
     "utf8",
   );
 
-  assert.match(html, /<h2 class="petri-panel-title">合法动作空间<\/h2>/);
+  assert.match(html, /<h3>合法动作空间<\/h3>/);
+  assert.match(html, /class="replay-dock-window model-evaluation-section" data-replay-dock-window data-expanded="false"/);
   assert.match(html, /data-action-status-filter value="enabled" checked/);
   assert.match(html, /data-action-status-filter value="physical-blocked" checked/);
   assert.match(html, /data-action-status-filter value="deadlock-blocked" checked/);
@@ -502,32 +500,26 @@ test("结果分析与拓扑回放使用独立界面并共享当前 MoveList", as
     },
   });
   assert.equal(root.elements.get("visualToolbar").hidden, false);
-  assert.equal(root.elements.get("testGroupAnalysisPanel").hidden, true);
-  assert.equal(root.elements.get("visualContent").hidden, false);
+  assert.equal(root.elements.get("testGroupAnalysisPanel").hidden, false);
+  assert.equal(root.elements.get("testGroupAnalysisPanel").innerHTML, "<h2>组级统计</h2>");
+  assert.equal(root.elements.get("visualContent").hidden, true);
   assert.equal(topology.hidden, false);
   assert.equal(root.elements.get("visualPlaybackEmpty").hidden, true);
   assert.equal(root.elements.get("visualSource").title, "t1.json");
   const lens = root.elements.get("visualDecisionLens").innerHTML;
-  assert.match(lens, /当前动作卡片为空/);
+  assert.equal(lens, "");
   assert.doesNotMatch(lens, /E2E推荐|Δ 基准|模型偏好|剩余工期/);
   assert.doesNotMatch(root.elements.get("visualDeviceStage").innerHTML, /PM2/);
-
-  const pauseOnChange = root.elements.get("visualPauseOnDecisionChangeButton");
-  assert.equal(pauseOnChange.getAttribute("aria-pressed"), "false");
-  assert.equal(pauseOnChange.getAttribute("aria-checked"), "false");
-  pauseOnChange.click();
-  assert.equal(pauseOnChange.getAttribute("aria-pressed"), "true");
-  assert.equal(pauseOnChange.getAttribute("aria-checked"), "true");
-  assert.match(pauseOnChange.innerHTML, /已开启/);
 
   workspace.showGroupAnalysis("<h2>组级统计</h2>");
   assert.equal(topology.hidden, false);
   assert.equal(root.elements.get("visualContent").hidden, true);
 
   workspace.show();
-  assert.equal(root.elements.get("testGroupAnalysisPanel").hidden, true);
-  assert.equal(root.elements.get("visualContent").hidden, false);
-  assert.equal(root.workspaceTab.clicked, true);
+  assert.equal(root.elements.get("testGroupAnalysisPanel").hidden, false);
+  assert.equal(root.elements.get("visualContent").hidden, true);
+  assert.notEqual(root.workspaceTab.clicked, true);
+  assert.equal(root.playbackTab.clicked, true);
 });
 
 test("动作空间按状态筛选并把原因放进悬浮提示", () => {
@@ -540,7 +532,7 @@ test("动作空间按状态筛选并把原因放进悬浮提示", () => {
     actionDiagnostics: [
       { actionId: "p1", kind: "pick", status: "enabled", robot: "ATR", source: "LP1", sourceSlot: 1, destination: "ATR", destinationSlot: 1, materialIds: ["1"], reason: "当前物理可行，死锁规则允许执行" },
       { actionId: "p2", kind: "place", status: "physical-blocked", robot: "ATR", source: "ATR", sourceSlot: 1, destination: "LA", destinationSlot: 1, reason: "目标槽已满", duplicateCount: 23 },
-      { actionId: "s1", kind: "swap", status: "deadlock-blocked", robot: "VTR", source: "PM1", destination: "PM2", reason: "无回程槽" },
+      { actionId: "s1", kind: "swap", status: "deadlock-blocked", robot: "VTR", source: "VTR", sourceSlot: 1, destination: "PM2", destinationSlot: 1, materialIds: ["1", "2"], reason: "无回程槽" },
     ],
   }] })[0];
 
@@ -549,7 +541,7 @@ test("动作空间按状态筛选并把原因放进悬浮提示", () => {
   assert.match(enabled, /action-status-tooltip[\s\S]*当前物理可行/);
   assert.doesNotMatch(enabled, /decision-tag action-status|action-block-reason|目标槽已满|无回程槽|E2E|推荐|剩余工期|LA#1/);
   const blockedSwap = logic.renderDecisionLens(decision, "idle", "", ["deadlock-blocked"]);
-  assert.match(blockedSwap, /Swap PM1 → PM2/);
+  assert.match(blockedSwap, /Swap\(1,2\) VTR#1 → PM2#1/);
   assert.doesNotMatch(blockedSwap, /decision-tag action-status/);
   assert.match(blockedSwap, /action-status-tooltip[\s\S]*无回程槽/);
   assert.doesNotMatch(blockedSwap, /<p class="action-block-reason">/);
@@ -601,7 +593,7 @@ test("旧模型推荐轨迹不再进入动作状态卡片", async () => {
   });
 
   const lens = root.elements.get("visualDecisionLens").innerHTML;
-  assert.match(lens, /当前动作卡片为空/);
+  assert.equal(lens, "");
   assert.doesNotMatch(lens, /Actor|推荐|policyPreference/);
 });
 
@@ -697,11 +689,11 @@ test("旧联合动作推荐不再进入动作状态卡片", async () => {
   });
 
   const lens = root.elements.get("visualDecisionLens").innerHTML;
-  assert.match(lens, /当前动作卡片为空/);
+  assert.equal(lens, "");
   assert.doesNotMatch(lens, /E2E推荐|与计划一致/);
 });
 
-test("开启保护后，回放在下一个原子动作边界暂停", async () => {
+test("连续回放不恢复已经取消的决策边界自动暂停", async () => {
   const originalRequestAnimationFrame = global.requestAnimationFrame;
   const originalCancelAnimationFrame = global.cancelAnimationFrame;
   let scheduledFrame = null;
@@ -740,18 +732,13 @@ test("开启保护后，回放在下一个原子动作边界暂停", async () =>
       },
     });
 
-    const autoPause = root.elements.get("visualPauseOnDecisionChangeButton");
-    autoPause.click();
     root.elements.get("visualPlayButton").click();
     assert.match(root.elements.get("visualPlayButton").innerHTML, /暂停/);
     assert.equal(typeof scheduledFrame, "function");
 
     scheduledFrame(performance.now() + 800);
-    assert.match(root.elements.get("visualPlayButton").innerHTML, /播放/);
-    assert.match(autoPause.innerHTML, /已暂停/);
-    assert.equal(root.elements.get("visualCurrentTime").textContent, "2.0");
-    assert.equal(autoPause.getAttribute("aria-checked"), "true");
-    assert.equal(autoPause.getAttribute("aria-label"), "已到达下一个原子动作决策，回放已暂停");
+    assert.match(root.elements.get("visualPlayButton").innerHTML, /暂停/);
+    assert.ok(Number(root.elements.get("visualCurrentTime").textContent) > 2);
   } finally {
     global.requestAnimationFrame = originalRequestAnimationFrame;
     global.cancelAnimationFrame = originalCancelAnimationFrame;
@@ -812,7 +799,9 @@ test("短门动作、LoadLock 相位和 PRE_TRANS 转位保持可观察", () => 
     },
   ];
   const snapshot = logic.buildWorkspaceSnapshot(animationMoves, device, 9.4);
-  assert.equal(moduleAt(snapshot, "PM1").door, "opening");
+  assert.equal(moduleAt(snapshot, "PM1").door, "open");
+  assert.equal(moduleAt(logic.buildWorkspaceSnapshot(animationMoves, device, 9.05), "PM1").door, "opening");
+  assert.equal(moduleAt(logic.buildWorkspaceSnapshot(animationMoves, device, 9.1), "PM1").door, "open");
   assert.equal(moduleAt(snapshot, "LA").loadLockPhase, "pumping");
   assert.equal(snapshot.robots[0].source, "LP1");
   assert.equal(snapshot.robots[0].target, "LA");
@@ -941,10 +930,10 @@ test("单真空机械手拓扑以方框架固定四个 PM、Heater 与两把 Loa
   assert.equal(dummyPort.y, lp1.y, "DummyPort 应与实际 LoadPort 共用大气框架底边");
   assert.ok(lp1.x < dummyPort.x, "DummyPort 应排在实际 LoadPort 之后");
   const atr = robotPosition("ATR");
-  assert.equal(lp1.y - atr.y, 116, "LoadPort 整排应由大气框架下边固定");
-  assert.equal(modulePosition("Aligner").x, 33.95, "Aligner 应位于大气框架内左上角");
-  assert.equal(modulePosition("Cooler").x, 66.05, "Cooler 应位于大气框架内右上角");
-  assert.equal(modulePosition("Cooler").y - modulePosition("Aligner").y, 9, "Aligner 与 Cooler 应使用紧凑的顶部纵向间距");
+  assert.equal(lp1.y - atr.y, 123, "LoadPort 整排应由大气框架下边固定");
+  assert.equal(modulePosition("Aligner").x, 33.95, "Aligner 上移时保持左侧横坐标");
+  assert.equal(modulePosition("Cooler").x, 66.05, "Cooler 上移时保持右侧横坐标");
+  assert.equal(modulePosition("Cooler").y - modulePosition("Aligner").y, -9, "不同高度的辅助模块底边应对齐在框架上方");
   const pm2 = modulePosition("PM2");
   const pm3 = modulePosition("PM3");
   const pm4 = modulePosition("PM4");
@@ -1140,7 +1129,7 @@ test("级联与非级联拓扑的大气侧布局和区域高度保持一致", ()
     assert.doesNotMatch(topology, /topology-interface-bay|VACUUM \/ ATM INTERFACE/, "LoadLock 后方不应绘制接口框");
     assert.equal(
       verticalPosition(topology, "module", "LP1") - verticalPosition(topology, "robot", "ATR"),
-      116,
+      123,
       "ATR 到 LoadPort 的垂直间距应由大气框架固定",
     );
   }
@@ -1238,8 +1227,8 @@ test("三类设备以机器框架和不可见附着点固定真空腔室位置",
   const singleAtmosphereFrame = frameOf(singleTopology, "atmosphere-main");
   for (const name of ["LA", "LB"]) {
     const lock = positionOf(singleTopology, "module", name);
-    assert.equal(lock.y, singleFrame.y + singleFrame.height / 2 + 41, `${name} 应贴合真空框架下边`);
-    assert.equal(lock.y, singleAtmosphereFrame.y - singleAtmosphereFrame.height / 2 - 41, `${name} 应贴合大气框架上边`);
+    assert.equal(lock.y, singleFrame.y + singleFrame.height / 2 + 41 + 7, `${name} 应留出 7px 门条空间并连接真空框架下边`);
+    assert.equal(lock.y, singleAtmosphereFrame.y - singleAtmosphereFrame.height / 2 - 41 - 7, `${name} 应留出 7px 门条空间并连接大气框架上边`);
   }
   assert.equal(
     positionOf(singleTopology, "module", "LA").x + positionOf(singleTopology, "module", "LB").x,
@@ -1270,8 +1259,8 @@ test("三类设备以机器框架和不可见附着点固定真空腔室位置",
   const dualAtmosphereFrame = frameOf(dualTopology, "atmosphere-main");
   for (const name of ["LA", "LB", "LC", "LD"]) {
     const lock = positionOf(dualTopology, "module", name);
-    assert.equal(lock.y, dualFrame.y + dualFrame.height / 2 + 41, `${name} 应贴合双腔真空框架下边`);
-    assert.equal(lock.y, dualAtmosphereFrame.y - dualAtmosphereFrame.height / 2 - 41, `${name} 应贴合双腔大气框架上边`);
+    assert.equal(lock.y, dualFrame.y + dualFrame.height / 2 + 41 + 7, `${name} 应留出 7px 门条空间并连接双腔真空框架下边`);
+    assert.equal(lock.y, dualAtmosphereFrame.y - dualAtmosphereFrame.height / 2 - 41 - 7, `${name} 应留出 7px 门条空间并连接双腔大气框架上边`);
   }
   const dualLockPositions = ["LC", "LA", "LB", "LD"].map(name => positionOf(dualTopology, "module", name));
   for (let index = 1; index < dualLockPositions.length; index += 1) {
@@ -1357,8 +1346,8 @@ test("三类设备以机器框架和不可见附着点固定真空腔室位置",
   const cascadeLA = positionOf(cascadeTopology, "module", "LA");
   const cascadeLB = positionOf(cascadeTopology, "module", "LB");
   for (const [name, position] of [["LA", cascadeLA], ["LB", cascadeLB]]) {
-    assert.equal(position.y, lowerFrame.y + lowerFrame.height / 2 + 41, `${name} 应贴合 VTR_1 下边`);
-    assert.equal(position.y, cascadeAtmosphereFrame.y - cascadeAtmosphereFrame.height / 2 - 41, `${name} 应贴合大气框架上边`);
+    assert.equal(position.y, lowerFrame.y + lowerFrame.height / 2 + 41 + 7, `${name} 应留出 7px 门条空间并连接 VTR_1 下边`);
+    assert.equal(position.y, cascadeAtmosphereFrame.y - cascadeAtmosphereFrame.height / 2 - 41 - 7, `${name} 应留出 7px 门条空间并连接大气框架上边`);
   }
   assert.equal(cascadeLA.x + cascadeLB.x, lowerFrame.x * 2, "级联 LA/LB 应严格围绕 VTR_1 中轴对称");
   assert.ok(cascadeLB.x - cascadeLA.x - 82 <= 2.01, "级联 LA/LB 外框之间只应保留极小间隔");
@@ -1484,6 +1473,7 @@ test("双腔拓扑使用 init 机器手名称和 Type，并用双片错层效果
     Robot: "AtmosphereArm",
     SrcStationList: ["LP1", "LP1"],
     SrcSlotList: [1, 2],
+    RobotSlotList: [1, 2],
     MatIDList: ["W1", "W2"],
     StartTime: 0,
     EndTime: 1,
@@ -1495,11 +1485,12 @@ test("双腔拓扑使用 init 机器手名称和 Type，并用双片错层效果
   const robot = snapshot.robots.find(item => item.name === "AtmosphereArm");
   assert.deepEqual(robot.wafers, ["W1", "W2"]);
   const topology = logic.renderEquipmentTopology(snapshot, null);
-  assert.match(topology, /class="robot-environment-badge">AtmosphereArm</);
+  assert.doesNotMatch(topology, /class="robot-environment-badge"/);
   assert.doesNotMatch(topology, />ATMRobot</);
   assert.match(topology, /aria-label="AtmosphereArm，双片机械手/);
   assert.match(topology, /class="robot-held-wafer robot-held-wafer-0"/);
-  assert.match(topology, /class="robot-held-wafer robot-held-wafer-1"/);
+  assert.match(topology, /data-held-slot="1"/);
+  assert.match(topology, /data-held-slot="2"/);
   assert.doesNotMatch(topology, /robot-external-name|robot-capacity-badge|robot-holding-count|is-dual-hold/);
   assert.doesNotMatch(topology, />2片</);
   assert.doesNotMatch(topology, /loadlock-pressure-state/);
@@ -1581,9 +1572,9 @@ test("LoadPort 按物理槽位显示未加工、空槽与回片后的已加工�
     logic.buildWorkspaceSnapshot(slotMoves, slotDevice, 1),
     null,
   );
-  assert.match(departedTopology, /class="load-port-cassette"/);
-  assert.match(departedTopology, /槽位 1，空/);
-  assert.match(departedTopology, /槽位 2，晶圆 W2，未加工/);
+  assert.match(departedTopology, /class="equipment-card equipment-port-top-view/);
+  assert.match(departedTopology, /class="port-top-cassette is-occupied"/);
+  assert.match(departedTopology, /晶圆 W2，来源 LP1\.2，未加工/);
 
   const returned = moduleAt(logic.buildWorkspaceSnapshot(slotMoves, slotDevice, 5), "LP1");
   assert.deepEqual(returned.loadPortSlots[0], { slot: 1, wafer: "W1", processed: true });
@@ -1591,9 +1582,8 @@ test("LoadPort 按物理槽位显示未加工、空槽与回片后的已加工�
     logic.buildWorkspaceSnapshot(slotMoves, slotDevice, 5),
     null,
   );
-  assert.match(returnedTopology, /槽位 1，晶圆 W1，已加工/);
-  assert.match(returnedTopology, /load-port-slot is-processed/);
-  assert.match(returnedTopology, /--load-port-slot-count:3/);
+  assert.match(returnedTopology, /wafer-token wafer-processed/);
+  assert.match(returnedTopology, /晶圆 W1，来源 LP1\.1，已加工/);
   assert.match(returnedTopology, /equipment-external-name equipment-external-name-port">LP1</);
   assert.doesNotMatch(returnedTopology, /load-port-slot-summary|>RAW\s|>DONE\s/);
 });
@@ -1691,7 +1681,7 @@ test("CJobCycle 在重算边界立即显示整盒补片，不等待新片首次 
   ]);
 });
 
-test("Aligner 使用紧凑叉形，Cooler 使用多槽前视图", () => {
+test("Aligner 使用紧凑叉形，Cooler 在俯视图显示顶部可见槽位", () => {
   const auxiliaryDevice = {
     Stations: {
       LP1: { Type: "LoadPort" },
@@ -1708,8 +1698,8 @@ test("Aligner 使用紧凑叉形，Cooler 使用多槽前视图", () => {
   );
   assert.match(topology, /class="equipment-utility equipment-aligner/);
   assert.match(topology, /class="aligner-cross is-empty"/);
-  assert.match(topology, /class="equipment-utility equipment-cooler/);
-  assert.equal((topology.match(/class="cooler-slot is-empty"/g) || []).length, 4);
+  assert.match(topology, /class="equipment-utility equipment-cooler-top-view/);
+  assert.equal((topology.match(/class="cooler-top-pocket is-empty"/g) || []).length, 1);
   assert.doesNotMatch(topology, /cooler-plate/);
 });
 
@@ -1729,11 +1719,11 @@ test("E2E 决策在机器人尚未执行时驱动单槽机械臂朝向且不再�
   };
   const topology = logic.renderEquipmentTopology(idleSnapshot, decision);
   assert.match(topology, /class="robot-hub robot-hub-atmosphere[^>]*style="--robot-arm-angle:[\d.-]+deg"[^>]*aria-label="ATR，单槽机械手/);
-  assert.match(topology, /class="robot-end-effector is-empty"/);
+  assert.match(topology, /class="parallel-robot-mechanism"/);
   assert.doesNotMatch(topology, /class="robot-wrist-joint"/);
   assert.doesNotMatch(topology, /robot-fork-tine/);
   assert.doesNotMatch(topology, /robot-reach-sector/);
-  assert.match(topology, /class="robot-environment-badge">ATR</);
+  assert.doesNotMatch(topology, /class="robot-environment-badge"/);
   assert.doesNotMatch(topology, /topology-target-arrows|<line /);
 });
 
@@ -1777,8 +1767,8 @@ test("机械手清除旧坐标偏移，并按 PRE_TRANS 进度连续旋转", () 
   assert.match(css, /\.load-port-slot-bank[^}]*grid-template-rows:\s*repeat\(var\(--load-port-slot-count\), minmax\(0, 1fr\)\);[^}]*gap:\s*0;/);
   assert.match(css, /\.load-port-slot\.is-unprocessed::after[^}]*width:\s*30px;[^}]*height:\s*3px;/);
   assert.doesNotMatch(css, /\.load-port-kind|\.topology-module-filter/);
-  assert.match(css, /\.load-port-cassette[^}]*align-self:\s*center;/);
-  assert.match(css, /\.equipment-buffer[^}]*width:\s*104px;\s*height:\s*56px;/);
+  assert.match(css, /\.port-top-cassette[^}]*place-items:\s*center;/);
+  assert.match(css, /\.equipment-buffer[^}]*width:\s*104px;\s*height:\s*72px;/);
   assert.match(css, /\.equipment-cooler[^}]*width:\s*76px;\s*height:\s*56px;/);
   assert.match(css, /\.robot-arm[^}]*width:\s*88px;/);
   assert.match(css, /\.robot-end-effector \{[^}]*width:\s*26px;[^}]*border-radius:\s*50%;/);
@@ -1793,8 +1783,31 @@ test("机械手清除旧坐标偏移，并按 PRE_TRANS 进度连续旋转", () 
   assert.doesNotMatch(css, /\.robot-reach-sector/);
   assert.doesNotMatch(css, /\.robot-effector-palm/);
   assert.doesNotMatch(css, /\.robot-end-effector::after/);
-  assert.match(css, /\.equipment-card\.door-open :is\(\.chamber-door, \.loadlock-door\)[^}]*visibility:\s*hidden;\s*opacity:\s*0;/);
-  assert.match(css, /\.equipment-card\.door-opening :is\(\.chamber-door, \.loadlock-door\)[^}]*visibility:\s*hidden;\s*opacity:\s*0;/);
+  assert.match(css, /\.equipment-card\.door-open :is\(\.port-top-gate, \.loadlock-top-gate\)[^}]*visibility:\s*hidden;\s*opacity:\s*0;/);
+  assert.match(css, /\.equipment-card\.door-opening :is\(\.port-top-gate, \.loadlock-top-gate\)[^}]*visibility:\s*hidden;\s*opacity:\s*0;/);
+});
+
+test("拓扑回放的晶圆尺寸统一以机器手持片为基准", () => {
+  const css = fs.readFileSync(
+    path.join(__dirname, "../realtime_scheduler/frontend/assets/config_editor.css"),
+    "utf8",
+  );
+  const uniformToken = "width: var(--topology-wafer-size); min-width: var(--topology-wafer-size); height: var(--topology-wafer-size);";
+
+  assert.match(css, /\.reference-grid-canvas \{ --topology-wafer-size:\s*54px; \}/);
+  [
+    ".process-wafer-slot .wafer-token",
+    ".port-top-cassette .wafer-token",
+    ".loadlock-top-seat .wafer-token",
+    ".cooler-top-pocket .wafer-token",
+    ".auxiliary-wafer-slot .wafer-token",
+    ".buffer-tray .wafer-token",
+    ".aligner-cross .wafer-token",
+    ".robot-held-wafer .wafer-token",
+  ].forEach(selector => {
+    const escapedSelector = selector.replaceAll(".", "\\.").replaceAll(" ", "\\s+");
+    assert.match(css, new RegExp(`${escapedSelector}[^}]*${uniformToken.replaceAll("(", "\\(").replaceAll(")", "\\)").replaceAll(".", "\\.")}`));
+  });
 });
 
 test("LoadLock 空层不画晶圆线，并区分已加工晶圆且按环境变化蓝色液位", () => {
@@ -1816,11 +1829,10 @@ test("LoadLock 空层不画晶圆线，并区分已加工晶圆且按环境变�
   assert.match(atmosphereTopology, /--loadlock-atmosphere-ratio:1\.000/);
   assert.match(atmosphereTopology, /class="equipment-external-name">LA</);
   assert.doesNotMatch(atmosphereTopology, /loadlock-environment|loadlock-layer-index/);
-  assert.match(atmosphereTopology, /class="loadlock-door loadlock-door-vacuum"/);
-  assert.match(atmosphereTopology, /class="loadlock-door loadlock-door-atmosphere"/);
-  assert.match(atmosphereTopology, /loadlock-wafer-line wafer-processed/);
-  assert.match(atmosphereTopology, /loadlock-wafer-line wafer-unprocessed/);
-  assert.doesNotMatch(atmosphereTopology, /loadlock-empty-slot/);
+  assert.match(atmosphereTopology, /external-module-door external-module-door-top door-closed/);
+  assert.match(atmosphereTopology, /external-module-door external-module-door-bottom door-closed/);
+  assert.match(atmosphereTopology, /loadlock-top-seat is-unprocessed/);
+  assert.match(atmosphereTopology, /wafer-token wafer-unprocessed/);
   assert.doesNotMatch(atmosphereTopology, /loadlock-pressure-state/);
 
   const pumpingTopology = logic.renderEquipmentTopology(
@@ -1841,7 +1853,8 @@ test("LoadLock 空层不画晶圆线，并区分已加工晶圆且按环境变�
     logic.snapshotWithFullDeviceModules(logic.buildWorkspaceSnapshot([], device, 0), device),
     null,
   );
-  assert.doesNotMatch(emptyTopology, /loadlock-wafer-line/);
+  assert.match(emptyTopology, /loadlock-top-seat is-empty/);
+  assert.doesNotMatch(emptyTopology, /loadlock-top-seat[^>]*>[\s\S]*wafer-token/);
 });
 
 test("初始状态按设备 LastItem 解析 LoadLock 环境，缺省按大气充满蓝色", () => {
@@ -1870,10 +1883,10 @@ test("初始状态按设备 LastItem 解析 LoadLock 环境，缺省按大气充
   assert.equal(atmosphereOf("LD"), 100, "LastItem ATR 初始为大气，充满蓝色");
 });
 
-test("ATR 指向大气侧入口，VTR 放入 LA/LB 时指向两腔中点", () => {
+test("ATR 指向大气侧入口，VTR 放入 LA/LB 时朝向内侧入口", () => {
   const portalDevice = {
     Stations: {
-      LP1: { Type: "LoadPort" }, PM1: { Type: "Process" },
+      LP1: { Type: "LoadPort" }, PM1: { Type: "MultiProcessChamber", Capacity: 2 },
       LA: { Type: "LoadLock" }, LB: { Type: "LoadLock" },
       LC: { Type: "LoadLock" }, LD: { Type: "LoadLock" },
     },
@@ -1893,12 +1906,12 @@ test("ATR 指向大气侧入口，VTR 放入 LA/LB 时指向两腔中点", () =>
     assert.ok(match, `应找到 ${name} 的机械臂角度`);
     return Number(match[1]);
   };
-  assert.ok(robotAngle("ATR") < -90, "ATR 应向左上方的下排 LoadLock 入口旋转");
-  assert.ok(Math.abs(robotAngle("VTR") - 90) < 0.1, "VTR 应垂直指向 LA/LB 的中点");
+  assert.ok(Math.abs(robotAngle("ATR") + 90) < 0.1, "ATR 应指向大气侧下排 LoadLock 入口");
+  assert.ok(robotAngle("VTR") > 45 && robotAngle("VTR") < 135, "VTR 应朝向真空侧 LA/LB 内侧入口");
   assert.doesNotMatch(topology, /topology-target-arrows/);
 });
 
-test("VTR 目标为 LA 或 LB 时使用相同的两腔中点角度", () => {
+test("VTR 取放 LA 或 LB 时分别深入实际腔室", () => {
   const midpointDevice = {
     Stations: {
       LA: { Type: "LoadLock" }, LB: { Type: "LoadLock" }, PM1: { Type: "Process" },
@@ -1926,8 +1939,26 @@ test("VTR 目标为 LA 或 LB 时使用相同的两腔中点角度", () => {
     assert.ok(match);
     return Number(match[1]);
   };
-  assert.ok(Math.abs(angleFor("LA") - 90) < 0.1);
-  assert.ok(Math.abs(angleFor("LB") - 90) < 0.1);
+  assert.ok(angleFor("LA") > 90);
+  assert.ok(angleFor("LB") < 90);
+});
+
+test("单腔和级联取放配置臂伸入后收回，大气框架显示轨道", () => {
+  for (const robots of [{ ATR: {}, VTR: {} }, { ATR: {}, VTR_1: {}, VTR_2: {} }]) {
+    const testDevice = { Stations: { LP1: { Type: "LoadPort" }, PM1: { Type: "Process" } }, Robots: robots };
+    const transfer = [{ MoveID: 1, MoveType: 0, ModuleName: "ATR", SrcStationList: ["LP1"], MatIDList: ["W1"], RobotSlotList: [1], StartTime: 0, EndTime: 10 }];
+    const renderAt = time => logic.renderEquipmentTopology(logic.snapshotWithFullDeviceModules(
+      logic.buildWorkspaceSnapshot(transfer, testDevice, time), testDevice), null, undefined, testDevice);
+    const reachAt = time => Number(/robot-hub-atmosphere[\s\S]*?--robot-reach:([\d.]+)px/.exec(renderAt(time))[1]);
+    const midpoint = renderAt(5);
+    assert.match(midpoint, /class="topology-atmosphere-rail"/);
+    assert.equal((midpoint.match(/class="parallel-robot-arm(?: is-transferring)?"/g) || []).length, Object.keys(robots).length);
+    assert.equal((midpoint.match(/class="parallel-robot-joint"/g) || []).length, Object.keys(robots).length - 1);
+    assert.equal(reachAt(0), 42);
+    assert.ok(reachAt(5) > reachAt(4));
+    assert.equal(reachAt(4), reachAt(8.5));
+    assert.equal(reachAt(10), 42);
+  }
 });
 
 test("完成取放动作后晶圆位置与机器人状态一致", () => {
@@ -1974,9 +2005,9 @@ test("LoadLock 初始不预显示未来入片，交换后双层仍按物理槽�
     { slot: 2, wafer: "W1", processed: true },
   ]);
   const topology = logic.renderEquipmentTopology(snapshot, null);
-  const layerTitles = [...topology.matchAll(/loadlock-layer is-occupied">[\s\S]*?title="([^"]*)"/g)]
-    .map(match => match[1]);
-  assert.deepEqual(layerTitles, ["晶圆 W9（未加工）", "晶圆 W1（已加工）"]);
+  const layerTitles = [...topology.matchAll(/loadlock-top-seat is-[^"]+" title="[^"]*晶圆 ([^，]+)，(未加工|已加工)"/g)]
+    .map(match => `晶圆 ${match[1]}（${match[2]}）`);
+  assert.deepEqual(layerTitles, ["晶圆 W9（未加工）"]);
 });
 
 test("SWAP 交换后送入片落在站上、收回片回到机器人", () => {
@@ -2005,12 +2036,12 @@ test("SWAP 交换后送入片落在站上、收回片回到机器人", () => {
     { slot: 2, wafer: "W2", processed: true },
   ]);
   const topology = logic.renderEquipmentTopology(snapshot, null);
-  const layerTitles = [...topology.matchAll(/loadlock-layer is-occupied">[\s\S]*?title="([^"]*)"/g)]
-    .map(match => match[1]);
+  const layerTitles = [...topology.matchAll(/loadlock-top-seat is-[^"]+" title="[^"]*晶圆 ([^，]+)，(未加工|已加工)"/g)]
+    .map(match => `晶圆 ${match[1]}（${match[2]}）`);
   assert.deepEqual(layerTitles, ["晶圆 W2（已加工）"]);
   assert.match(
     topology,
-    /loadlock-layer is-empty"><\/div><div class="loadlock-layer is-occupied">[\s\S]*?晶圆 W2（已加工）/,
+    /loadlock-top-seat is-processed[^>]*title="LA\.2，晶圆 W2，已加工"/,
   );
 });
 
@@ -2164,7 +2195,8 @@ test("KPI 总览按产能、重算、瓶颈和 LoadLock 效率展示，并将说
 
 test("产能图可在从零累计和可选 2 至 10 片滑动窗口间切换", () => {
   const chart = logic.renderThroughputChart(visualPerformanceFixture());
-  assert.match(chart, /id="throughputMetricSelect"[\s\S]*累计产能（公司口径）[\s\S]*滑动窗口/);
+  // 累计曲线从仿真零点计时，不是居中 120 片的最终稳态 KPI 口径。
+  assert.match(chart, /id="throughputMetricSelect"[\s\S]*累计产能（从 0 开始）[\s\S]*滑动窗口/);
   assert.match(chart, /id="throughputWindowSize"[\s\S]*2 片[\s\S]*10 片/);
   assert.match(chart, /data-throughput-chart="cumulative"/);
   assert.match(chart, /data-throughput-chart="rolling-2"[\s\S]*? hidden/);
@@ -2194,7 +2226,7 @@ test("大批量产能趋势精简绘图点并保留首尾和尖峰", () => {
   assert.ok(simplified.includes(points[149]));
 });
 
-test("动作接口回放在 Pick 结束后的原子决策边界暂停", async () => {
+test("动作接口回放跨过 Pick 边界时保持连续播放", async () => {
   const originalRequestAnimationFrame = global.requestAnimationFrame;
   const originalCancelAnimationFrame = global.cancelAnimationFrame;
   let scheduledFrame = null;
@@ -2213,13 +2245,11 @@ test("动作接口回放在 Pick 结束后的原子决策边界暂停", async ()
         return JSON.stringify({ MoveList: moves });
       },
     });
-    const autoPause = root.elements.get("visualPauseOnDecisionChangeButton");
-    autoPause.click();
     root.elements.get("visualPlayButton").click();
     scheduledFrame(performance.now() + 800);
 
-    assert.equal(root.elements.get("visualCurrentTime").textContent, "2.0");
-    assert.equal(autoPause.getAttribute("aria-label"), "已到达下一个原子动作决策，回放已暂停");
+    assert.ok(Number(root.elements.get("visualCurrentTime").textContent) > 2);
+    assert.match(root.elements.get("visualPlayButton").innerHTML, /暂停/);
   } finally {
     global.requestAnimationFrame = originalRequestAnimationFrame;
     global.cancelAnimationFrame = originalCancelAnimationFrame;
@@ -2436,4 +2466,52 @@ test("驻留时间分析展示逐片腔室和机器手驻留，并提供说明",
   assert.match(html, /id="residenceAnalysisHelpDialog"[\s\S]*三种驻留时间分别表示什么？[\s\S]*已扣除显式 PreTrans 搬运时间/);
   assert.match(editorSource, /residenceAnalysisHelpDialog\.showModal\(\)/);
   assert.match(editorSource, /data-residence-metric-chart/);
+});
+
+
+test("LoadLock 双侧门按访问机械手独立回放并支持反向拖动", () => {
+  const definition = {Stations:{LA:{Type:"LoadLock"}},Robots:{入口:{Type:"ATMRobot"},真空:{Type:"VTMRobot"}}};
+  const timeline = [
+    {MoveID:1,MoveType:6,ModuleName:"LA",StartTime:0,EndTime:1},
+    {MoveID:2,MoveType:1,ModuleName:"入口",DestStationList:["LA"],PreMoveID:[1],StartTime:2,EndTime:3},
+    {MoveID:3,MoveType:7,ModuleName:"LA",StartTime:3,EndTime:4},
+    {MoveID:4,MoveType:6,ModuleName:"LA",StartTime:5,EndTime:6},
+    {MoveID:5,MoveType:0,ModuleName:"真空",SrcStationList:["LA"],PreMoveID:[4],StartTime:7,EndTime:8},
+    {MoveID:6,MoveType:7,ModuleName:"LA",StartTime:8,EndTime:9},
+  ];
+  const gates = time => moduleAt(logic.buildWorkspaceSnapshot(timeline,definition,time),"LA").loadLockDoors;
+  for(const [time,top,bottom] of [[0.5,"closed","opening"],[1,"closed","open"],[3.5,"closed","closing"],[4,"closed","closed"],[5.5,"opening","closed"],[6,"open","closed"],[8.5,"closing","closed"],[9,"closed","closed"],[1,"closed","open"]]) {
+    assert.equal(gates(time).top,top); assert.equal(gates(time).bottom,bottom);
+  }
+  const topology=logic.renderEquipmentTopology(logic.buildWorkspaceSnapshot(timeline,definition,1),null,undefined,definition);
+  assert.match(topology,/external-module-door-top door-closed/);
+  assert.match(topology,/external-module-door-bottom door-open/);
+  assert.match(topology,/title="大气侧门已打开"/);
+});
+
+test("桥接 LoadLock 使用关联 Robot 区分上下级而非全局枚举", () => {
+  const definition={Stations:{DBR:{Type:"LoadLock"}},Robots:{下级:{Type:"VTMRobot"},上级:{Type:"HighVTMRobot"}}};
+  const timeline=[
+    {MoveID:1,MoveType:6,ModuleName:"DBR",RelatedRobotType:1,StartTime:0,EndTime:1},
+    {MoveID:2,MoveType:0,ModuleName:"下级",SrcStationList:["DBR"],PreMoveID:[1],StartTime:2,EndTime:3},
+    {MoveID:3,MoveType:7,ModuleName:"DBR",StartTime:3,EndTime:4},
+    {MoveID:4,MoveType:6,ModuleName:"DBR",RelatedRobotType:2,StartTime:5,EndTime:6},
+    {MoveID:5,MoveType:0,ModuleName:"上级",SrcStationList:["DBR"],PreMoveID:[4],StartTime:7,EndTime:8},
+  ];
+  const first=moduleAt(logic.buildWorkspaceSnapshot(timeline,definition,1),"DBR").loadLockDoors;
+  const second=moduleAt(logic.buildWorkspaceSnapshot(timeline,definition,6),"DBR").loadLockDoors;
+  assert.equal(first.bottom,"open");assert.equal(first.top,"closed");
+  assert.equal(second.top,"open");assert.equal(second.bottom,"closed");
+  assert.equal(second.topLabel,"上级真空侧");
+});
+
+test("LoadLock 缺失方向不制造双侧开门，零时长动作直接完成", () => {
+  const definition={Stations:{LA:{Type:"LoadLock"}}};
+  const unknown=moduleAt(logic.buildWorkspaceSnapshot([{MoveID:1,MoveType:6,ModuleName:"LA",StartTime:0,EndTime:1}],definition,1),"LA").loadLockDoors;
+  assert.equal(unknown.top,"unknown");assert.equal(unknown.bottom,"unknown");
+  const closed=moduleAt(logic.buildWorkspaceSnapshot([
+    {MoveID:1,MoveType:6,ModuleName:"LA",RelatedRobotType:0,StartTime:0,EndTime:0},
+    {MoveID:2,MoveType:7,ModuleName:"LA",StartTime:0,EndTime:0},
+  ],definition,0),"LA").loadLockDoors;
+  assert.equal(closed.top,"closed");assert.equal(closed.bottom,"closed");
 });

@@ -102,6 +102,7 @@ class ValidationErrorCode(str, Enum):
     CLEAN_WAC_MISSING = "MVL-CLEAN-WAC-MISSING"
     CLEAN_WAC_EARLY = "MVL-CLEAN-WAC-EARLY"
     CLEAN_PRE_MISSING = "MVL-CLEAN-PRE-MISSING"
+    CLEAN_PRE_DUPLICATE = "MVL-CLEAN-PRE-DUPLICATE"
     CLEAN_DUMMY_MISSING = "MVL-CLEAN-DUMMY-MISSING"
     CLEAN_POST_MISSING = "MVL-CLEAN-POST-MISSING"
     CLEAN_RECIPE_INVALID = "MVL-CLEAN-RECIPE-INVALID"
@@ -233,13 +234,26 @@ class MachineState:
     robot_aliases: Dict[str, str] = field(default_factory=dict)
     process_recipe_weights: Dict[Tuple[str, str], Dict[str, float]] = field(default_factory=dict)
     clean_task_state_variables: Dict[str, Set[str]] = field(default_factory=dict)
-    clean_wac_trigger_rules: Dict[Tuple[str, str], Tuple[Tuple[str, str, float, str], ...]] = field(default_factory=dict)
+    # ``(PM, 产品Recipe) -> (PJob, 状态变量, 阈值, CleanTask, 来源StepID)``。
+    # 同一 PJob 可能在同一 PM 重入，必须按来源工步识别实际触发 WAC 的 Visit。
+    clean_wac_trigger_rules: Dict[
+        Tuple[str, str],
+        Tuple[Tuple[str, str, float, str, Optional[str]], ...],
+    ] = field(default_factory=dict)
     #: 单腔 PM 的 WAC 计数按 ``(PM, PJob, 状态变量)`` 隔离。双腔仍使用
     #: ``StationState.state_variables`` 的腔室全局计数，以保持双片同步加工语义。
     pjob_wac_counters: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
     clean_obligations: Dict[Tuple[str, str, str], Tuple[str, int, Tuple[str, ...]]] = field(default_factory=dict)
+    #: 产品 Process 越过阈值时形成的待执行 WAC，成员为
+    #: ``(PM, PJob, 状态变量, CleanTask)``。
+    pending_wac_obligations: Set[Tuple[str, str, str, str]] = field(
+        default_factory=set
+    )
     #: 本次运行跳过的 Clean 触发/次数规则；物理状态回放与计数仍照常执行。
     skipped_clean_validation_types: Set[str] = field(default_factory=set)
+    #: Dummy WAC 中已经完成尾随空腔 WAC 的片数。该计数与带片清洁数分离，
+    #: 用于强制每片 Dummy 按“带片清洁 → 出片 → 空腔 WAC”成对完成。
+    completed_dummy_wac_counts: Dict[Tuple[str, str, str], int] = field(default_factory=dict)
     completed_clean_counts: Dict[Tuple[str, str, str], int] = field(default_factory=dict)
     product_clean_entries: Set[Tuple[str, str]] = field(default_factory=set)
     #: 外部算法可省略的零时长产品 ProcessMove；键为（物料、Route Step、PM）。
@@ -450,7 +464,7 @@ class MachineState:
             for (rule_station_name, _recipe_name), rules in self.clean_wac_trigger_rules.items():
                 if rule_station_name != station_name:
                     continue
-                for pjob_name, variable_name, _lower, _task_name in rules:
+                for pjob_name, variable_name, _lower, _task_name, _step_id in rules:
                     if pjob_name:
                         pjobs_by_variable.setdefault(variable_name, set()).add(pjob_name)
             for variable_name, pjob_names in pjobs_by_variable.items():
@@ -482,7 +496,7 @@ class MachineState:
             rule_variable_name == variable_name
             for (rule_station_name, _recipe_name), rules in self.clean_wac_trigger_rules.items()
             if rule_station_name == station_name
-            for _pjob_name, rule_variable_name, _lower, _task_name in rules
+            for _pjob_name, rule_variable_name, _lower, _task_name, _step_id in rules
         )
 
     def wac_counter_value(
@@ -736,7 +750,7 @@ class MoveStateReplay:
     ) -> None:
         """用计划和初始快照创建实时状态记录器。"""
         self.task = task
-        self.moves = [dict(move) for move in sorted(moves, key=_sort_key)]
+        self.moves = _IndexedMoves(dict(move) for move in sorted(moves, key=_sort_key))
         self.state = MachineState.from_sources(task, init_data)
         _supplement_state_from_moves(self.state, self.moves)
         self.current_time = 0.0
@@ -831,7 +845,8 @@ def materialize_module_parallel_moves(
     Move 按计划开始时刻和 MoveID 排序，实际开始时刻不得早于模块上一条 Move
     的结束时刻。当前 Move 引用的本代 ``PreMoveID`` 也必须全部结束，并把最晚
     前驱结束时刻作为开始下界。跨代前驱不在本 MoveList 中，其完成事实已经包含
-    在本代初始快照里，因此不会阻塞。
+    在本代初始快照里，因此不会阻塞。已有本代前驱或模块前项的 Move 按实际完成
+    时刻推进，保留原计划在前驱之后的等待间隔；独立首项保留起点，现场时刻始终是下界。
 
     参数:
         moves: 当前代算法输出的 MoveList。
@@ -862,6 +877,12 @@ def materialize_module_parallel_moves(
     actual_end_by_id: Dict[int, float] = {}
     ended_ids: Set[int] = set()
     materialized: List[dict] = []
+    planned_end_by_id = {
+        move["MoveID"]: (_number(move.get("EndTime")) if _number(move.get("EndTime")) is not None
+                         else (_number(move.get("StartTime")) or 0.0))
+        for move in copied if isinstance(move.get("MoveID"), int)
+    }
+    planned_module_end: Dict[str, float] = {}
 
     while queues:
         candidates: List[Tuple[float, str, int, dict]] = []
@@ -875,9 +896,18 @@ def materialize_module_parallel_moves(
                 if isinstance(value, int) and int(value) in known_ids
             }
             planned_start = _number(move.get("StartTime")) or 0.0
+            # 原计划可能含驻留、释放或工艺等待。只传播前驱完成时刻的变化，
+            # 不把这些等待误当成可删除的空白；零间隔依赖可随前驱完成直接提前。
+            planned_bounds = [planned_end_by_id[value] for value in predecessors]
+            if module_name in planned_module_end:
+                planned_bounds.append(planned_module_end[module_name])
+            wait_after_predecessors = max(0.0, planned_start - max(planned_bounds)) if planned_bounds else 0.0
+            actual_bounds = [actual_end_by_id[value] for value in predecessors if value in actual_end_by_id]
+            if module_name in planned_module_end:
+                actual_bounds.append(module_available[module_name])
             earliest_start = max(
                 normalized_floor,
-                planned_start,
+                (max(actual_bounds) + wait_after_predecessors) if actual_bounds else planned_start,
                 module_available[module_name],
                 *(actual_end_by_id[value] for value in predecessors if value in actual_end_by_id),
             )
@@ -902,6 +932,7 @@ def materialize_module_parallel_moves(
         move["StartTime"] = actual_start
         move["EndTime"] = actual_end
         materialized.append(move)
+        planned_module_end[module_name] = planned_end if planned_end is not None else planned_start
         module_available[module_name] = actual_end
         if isinstance(move.get("MoveID"), int):
             actual_end_by_id[move_id] = actual_end
@@ -921,12 +952,15 @@ def validate_move_list(
     check_residency: bool = True,
     external_predecessors: "Optional[Mapping[int, Mapping[str, Any]]]" = None,
     skipped_clean_validation_types: "Optional[Iterable[str]]" = None,
+    initial_state: "Optional[MachineState]" = None,
 ) -> List[str]:
     """按时间线校验 MoveList；覆盖依赖 DAG、Route 时限与物理状态。
 
     ``external_predecessors`` 提供上一代已提交或正在执行的 Move（按 MoveID
     索引），供重算增量输出引用：其 MoveID 不属于本代 ``moves``，但可被本代
     ``PreMoveID`` 合法引用为已完成的前驱；首排校验不传该参数。
+    ``initial_state`` 可提供重算现场（含门、持片和占用窗口）；静态时长校验
+    仍读取 ``init_data`` 的设备配置，现场快照只用于物理回放且不会被修改。
     """
     for index, move in enumerate(moves):
         if not isinstance(move, Mapping):
@@ -950,7 +984,9 @@ def validate_move_list(
         if route_time_error:
             return [route_time_error]
     try:
-        state = MachineState.from_sources(task, init_data)
+        state = MachineState.from_sources(
+            task, initial_state if initial_state is not None else init_data,
+        )
     except ValueError as error:
         return [str(error)]
     state.skipped_clean_validation_types = {
@@ -959,7 +995,7 @@ def validate_move_list(
         if str(value).strip().lower() in CLEAN_VALIDATION_TYPES
     }
     scheduled: List[_ScheduledCompletion] = []
-    ordered_moves = sorted(moves, key=_sort_key)
+    ordered_moves = _IndexedMoves(sorted(moves, key=_sort_key))
     _supplement_state_from_moves(state, ordered_moves)
     for move in ordered_moves:
         start_time = _number(move.get("StartTime"))
@@ -2061,12 +2097,26 @@ def _start_process(state: MachineState, move: Mapping[str, Any], end_time: float
         return _issue(move, ValidationErrorCode.STATION_UNKNOWN, f"未知站点 {station_name or '<empty>'}")
     start_time = _start_time(move)
     clean_task_name = str(move.get("CleanTaskName") or "").strip()
-    matched_clean_obligations = [
+    station_clean_obligations = [
         ((pjob_name, required_station, task_name), requirement)
         for (pjob_name, required_station, task_name), requirement in state.clean_obligations.items()
         if required_station == station_name
-        and task_name == clean_task_name
         and (not _values(move, "PJobName") or pjob_name in {str(value) for value in _values(move, "PJobName")})
+    ]
+    matched_clean_obligations = [
+        (clean_key, requirement)
+        for clean_key, requirement in station_clean_obligations
+        if clean_key[2] == clean_task_name
+    ]
+    # 调度器为 Dummy WAC 空腔尾段使用通用 ``WacClean`` 任务名。平台不校验
+    # 清洗配方，因此依据空腔形态和待完成的 DummyWAC 义务识别尾段。
+    dummy_wac_tail_obligations = [
+        (clean_key, requirement)
+        for clean_key, requirement in station_clean_obligations
+        if requirement[0] == "pre"
+        and requirement[1] > 0
+        and len(requirement[2]) >= 2
+        and "wac" in clean_task_name.casefold()
     ]
     clean_material_count = max(
         (requirement[1] for _key, requirement in matched_clean_obligations),
@@ -2077,34 +2127,45 @@ def _start_process(state: MachineState, move: Mapping[str, Any], end_time: float
         if clean_task_name
         else ""
     )
-    recipe_name = str(
-        move.get("ProcessRecipe") or move.get("CleanRecipe") or ""
-    ).strip()
+    if not material_ids and dummy_wac_tail_obligations:
+        clean_type = "dummywac"
+        matched_clean_obligations = dummy_wac_tail_obligations
+    dummy_wac_tail_key: Optional[Tuple[str, str, str]] = None
     if clean_type in {"dummy", "dummywac"}:
         if material_ids:
-            wrong_main_recipe = next((
-                requirement[2][0]
-                for _key, requirement in matched_clean_obligations
-                if requirement[2] and recipe_name != requirement[2][0]
+            pending_wac_key = next((
+                clean_key
+                for clean_key, _requirement in matched_clean_obligations
+                if clean_type == "dummywac"
+                and state.completed_clean_counts.get(clean_key, 0)
+                > state.completed_dummy_wac_counts.get(clean_key, 0)
             ), None)
-            if wrong_main_recipe is not None:
+            if pending_wac_key is not None:
                 return _issue(
                     move,
-                    ValidationErrorCode.CLEAN_RECIPE_INVALID,
-                    f"{clean_task_name} 带片阶段 Recipe={recipe_name or '<empty>'}，期望 {wrong_main_recipe}",
+                    ValidationErrorCode.PROCESS_STATE_INVALID,
+                    f"{clean_task_name} 上一片 Dummy 离腔后必须先完成空腔 WAC",
                 )
         else:
-            valid_empty_tail = clean_type == "dummywac" and any(
-                len(requirement[2]) >= 2
-                and recipe_name == requirement[2][-1]
-                and state.completed_clean_counts.get(clean_key, 0) >= requirement[1]
-                for clean_key, requirement in matched_clean_obligations
-            )
-            if not valid_empty_tail:
+            if clean_type == "dummy":
                 return _issue(
                     move,
                     ValidationErrorCode.PROCESS_STATE_INVALID,
                     f"{clean_task_name} 必须先完成足量 Dummy 带片清洁",
+                )
+            dummy_wac_tail_key = next((
+                clean_key
+                for clean_key, requirement in matched_clean_obligations
+                if clean_type == "dummywac"
+                and len(requirement[2]) >= 2
+                and state.completed_clean_counts.get(clean_key, 0)
+                > state.completed_dummy_wac_counts.get(clean_key, 0)
+            ), None)
+            if dummy_wac_tail_key is None:
+                return _issue(
+                    move,
+                    ValidationErrorCode.PROCESS_STATE_INVALID,
+                    f"{clean_task_name} 空腔 WAC 必须紧跟一片尚未完成尾段的 Dummy 清洁",
                 )
     if clean_type in {"preclean", "postclean", "wacclean"} and material_ids:
         return _issue(
@@ -2194,6 +2255,45 @@ def _start_process(state: MachineState, move: Mapping[str, Any], end_time: float
                     )
             else:
                 state.add_wac_counter(station, "", variable_name, increment)
+        # Process 完成后立即把“哪一个 Route Visit 触发了 WAC”固化到状态中。
+        # 后续无片 Clean Move 没有产品 StepID，不能再从整条 Route 取首个同名任务。
+        process_steps_by_pjob: Dict[str, Set[str]] = {}
+        for _slot, material, _slot_id in targets:
+            if material is None or not str(material.pjob_name or "").strip():
+                continue
+            process_steps_by_pjob.setdefault(
+                str(material.pjob_name).strip(), set()
+            ).add(str(material.step_id))
+        for (
+            rule_pjob_name,
+            variable_name,
+            lower,
+            rule_task_name,
+            source_step_id,
+        ) in state.clean_wac_trigger_rules.get((station.name, recipe_name), ()):
+            matching_pjobs = (
+                {rule_pjob_name}
+                if rule_pjob_name
+                else set(process_steps_by_pjob)
+            )
+            for matching_pjob in matching_pjobs:
+                if matching_pjob not in process_steps_by_pjob:
+                    continue
+                if (
+                    source_step_id is not None
+                    and source_step_id not in process_steps_by_pjob[matching_pjob]
+                ):
+                    continue
+                value = state.wac_counter_value(
+                    station, matching_pjob, variable_name
+                )
+                if value + TIME_TOLERANCE >= lower:
+                    state.pending_wac_obligations.add((
+                        station.name,
+                        matching_pjob,
+                        variable_name,
+                        rule_task_name,
+                    ))
         clean_task_name = str(move.get("CleanTaskName") or "")
         if clean_task_name:
             for pjob_name in _values(move, "PJobName"):
@@ -2211,7 +2311,23 @@ def _start_process(state: MachineState, move: Mapping[str, Any], end_time: float
                     state.completed_clean_counts[clean_key] = (
                         state.completed_clean_counts.get(clean_key, 0) + increment
                     )
+        if dummy_wac_tail_key is not None:
+            state.completed_dummy_wac_counts[dummy_wac_tail_key] = (
+                state.completed_dummy_wac_counts.get(dummy_wac_tail_key, 0) + 1
+            )
         if clean_task_name and move.get("IsLastCleanTaskMove") is True:
+            selected_pjobs = {
+                str(name).strip()
+                for name in _values(move, "PJobName")
+                if str(name).strip()
+            }
+            for pending_key in list(state.pending_wac_obligations):
+                if (
+                    pending_key[0] == station.name
+                    and pending_key[3] == clean_task_name
+                    and (not selected_pjobs or pending_key[1] in selected_pjobs)
+                ):
+                    state.pending_wac_obligations.discard(pending_key)
             for variable_name in state.clean_task_state_variables.get(
                 clean_task_name,
                 set(),

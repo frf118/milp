@@ -15,6 +15,12 @@ from realtime_scheduler.backend.workspace.catalog_service import *
 from realtime_scheduler.backend.workspace.exchange_service import *
 from realtime_scheduler.backend.workspace.transfer_jobs import *
 from realtime_scheduler.backend.artifacts.repository import *
+from realtime_scheduler.backend.artifacts.deadlock_diagnostic import *
+from realtime_scheduler.backend.analysis_jobs import (
+    cancel_test_group_analysis_job,
+    create_test_group_analysis_job,
+    read_test_group_analysis_job,
+)
 from realtime_scheduler.backend.wiring import *
 
 
@@ -26,6 +32,97 @@ def _download_content_disposition(download_name: str) -> str:
     fallback = f"{fallback_stem}{suffix}"
     encoded_name = quote(download_name, safe="")
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded_name}'
+
+
+def _evaluate_replay_action_context(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """解析回放请求并调用对应算法，返回诊断导出与页面共用的完整上下文。"""
+    if not BUILTIN_ALGORITHM_AVAILABLE:
+        raise RuntimeError("当前部署未提供 Machine，无法评估回放动作")
+    result_id = str(payload.get("resultId") or "").strip()
+    saved_result = read_result(result_id) if result_id else None
+    if result_id and saved_result is None:
+        raise ValueError("结果不存在或已过期")
+    moves = normalize_move_payload(
+        saved_result
+        if saved_result is not None
+        else payload.get("moves", payload.get("result")),
+    )
+    raw_plan = payload.get("plan")
+    replay_context = (
+        saved_result.get("ReplayContext")
+        if isinstance(saved_result, Mapping)
+        else None
+    )
+    if not isinstance(raw_plan, Mapping) and isinstance(replay_context, Mapping):
+        raw_plan = replay_context.get("plan")
+    if not isinstance(raw_plan, Mapping):
+        raise ValueError("缺少生成该 MoveList 的完整计划，无法重建 Machine")
+    replay_time = _finite_number(payload.get("time"), 0.0)
+    replay_updates = (
+        replay_context.get("updates") or []
+        if isinstance(replay_context, Mapping)
+        else []
+    )
+    replay_machine = ReplayMachine(raw_plan, moves, replay_updates)
+    update_params = replay_machine.replay_update_at(replay_time)
+    replay_move_states = [
+        {
+            "MoveID": move.get("MoveID"),
+            "MoveState": (
+                "Done"
+                if float(move.get("EndTime") or 0.0)
+                <= replay_time + TIME_TOLERANCE
+                else "Running"
+            ),
+        }
+        for move in moves
+        if float(move.get("StartTime") or 0.0)
+        <= replay_time + TIME_TOLERANCE
+    ]
+    action_context = {
+        "schemaVersion": 1,
+        "CurrentTime": replay_time,
+        "ToolTopo": raw_plan["device"],
+        "UpdateParams": update_params,
+        "MoveList": moves,
+        "MoveStates": replay_move_states,
+    }
+    algorithm_action_diagnostics = None
+    plan_strategy = str(raw_plan.get("strategy") or "")
+    if payload.get("includeActions", True):
+        if plan_strategy.startswith(OTHER_ALGORITHM_STRATEGY_PREFIX):
+            algorithm_id = plan_strategy.removeprefix(OTHER_ALGORITHM_STRATEGY_PREFIX)
+            with algorithm_session(algorithm_id):
+                algorithm_init(raw_plan["device"])
+                algorithm_action_diagnostics = algorithm_get_replay_actions(action_context)
+        elif plan_strategy in builtin_supported_algorithms:
+            algorithm_action_diagnostics = json.loads(
+                builtin_algorithm_api.get_replay_actions(
+                    json.dumps(action_context, ensure_ascii=False)
+                )
+            )
+    replay_machine.algorithm_action_diagnostics = (
+        algorithm_action_diagnostics
+        if isinstance(algorithm_action_diagnostics, Mapping)
+        else None
+    )
+    available_updates = [
+        update
+        for update in replay_updates
+        if isinstance(update, Mapping)
+        and _finite_number(update.get("CurrentTime"), 0.0)
+        <= replay_time + TIME_TOLERANCE
+    ]
+    return {
+        "resultId": result_id,
+        "time": replay_time,
+        "plan": raw_plan,
+        "moves": moves,
+        "updateParams": update_params,
+        "moveStates": replay_move_states,
+        "decision": replay_machine.evaluate_actions(replay_time) if payload.get("includeActions", True) else {},
+        "recomputeRound": max(1, len(available_updates)),
+    }
 
 class ConfigEditorHandler(BaseHTTPRequestHandler):
     """暴露调度控制台、设备测试集、甘特图和运行 API 的本地 HTTP 处理器。"""
@@ -104,10 +201,7 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/documentation":
             try:
-                document = load_documentation((
-                    DOCUMENTATION_DIR,
-                    ALGORITHM_DOCUMENTATION_DIR,
-                ))
+                document = load_documentation(documentation_directory())
             except DocumentationError as error:
                 self._send_json(
                     {"ok": False, "error": str(error)},
@@ -141,6 +235,29 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json({"ok": True, "transfer": transfer})
                 return
+        analysis_job_parts = [part for part in path.split("/") if part]
+        if (
+            len(analysis_job_parts) == 3
+            and analysis_job_parts[:2] == ["api", "analysis-jobs"]
+        ):
+            job = read_test_group_analysis_job(analysis_job_parts[2])
+            if job is None:
+                self._send_json(
+                    {"ok": False, "error": "分析任务不存在或已过期"},
+                    HTTPStatus.NOT_FOUND,
+                )
+            else:
+                self._send_json({"ok": True, "job": job})
+            return
+        if path == "/api/preferences/analysis-settings":
+            try:
+                self._send_json({"ok": True, "analysisSettings": read_analysis_preferences()})
+            except Exception as error:  # noqa: BLE001
+                self._send_json(
+                    {"ok": False, "error": str(error)},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return
         if path == "/api/search-telemetry":
             if not BUILTIN_ALGORITHM_AVAILABLE:
                 self._send_json(
@@ -254,6 +371,25 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """接收控制台配置并同步运行后端策略。"""
         path = unquote(urlparse(self.path).path)
+        if path == "/api/analysis-jobs":
+            try:
+                job = create_test_group_analysis_job(self._read_json_object())
+                self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
+            except Exception as error:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        analysis_job_parts = [part for part in path.split("/") if part]
+        if (
+            len(analysis_job_parts) == 4
+            and analysis_job_parts[:2] == ["api", "analysis-jobs"]
+            and analysis_job_parts[3] == "cancel"
+        ):
+            try:
+                job = cancel_test_group_analysis_job(analysis_job_parts[2])
+                self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
+            except LookupError as error:
+                self._send_json({"ok": False, "error": str(error)}, HTTPStatus.NOT_FOUND)
+            return
         if path == "/api/workspace-transfers":
             try:
                 payload = self._read_json_object()
@@ -353,86 +489,43 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/analysis/replay-decision":
             try:
-                if not BUILTIN_ALGORITHM_AVAILABLE:
-                    raise RuntimeError("当前部署未提供 Machine，无法评估回放动作")
                 payload = self._read_json_object()
-                result_id = str(payload.get("resultId") or "").strip()
-                saved_result = read_result(result_id) if result_id else None
-                if result_id and saved_result is None:
-                    raise ValueError("结果不存在或已过期")
-                moves = normalize_move_payload(
-                    saved_result
-                    if saved_result is not None
-                    else payload.get("moves", payload.get("result")),
+                context = _evaluate_replay_action_context(payload)
+                self._send_json({"ok": True, "decision": context["decision"]})
+            except Exception as error:  # noqa: BLE001
+                self._send_json(
+                    {"ok": False, "error": str(error)},
+                    HTTPStatus.BAD_REQUEST,
                 )
-                raw_plan = payload.get("plan")
-                replay_context = (
-                    saved_result.get("ReplayContext")
-                    if isinstance(saved_result, Mapping)
-                    else None
+            return
+        if path == "/api/analysis/deadlock-diagnostic":
+            try:
+                payload = self._read_json_object()
+                context = _evaluate_replay_action_context(payload)
+                snapshot = payload.get("snapshot")
+                if snapshot is not None and not isinstance(snapshot, Mapping):
+                    raise ValueError("snapshot 必须是 JSON 对象或 null")
+                bundle = build_deadlock_diagnostic_bundle(
+                    replay_time=context["time"],
+                    plan=context["plan"],
+                    moves=context["moves"],
+                    update_params=context["updateParams"],
+                    move_states=context["moveStates"],
+                    decision=context["decision"],
+                    recompute_round=context["recomputeRound"],
+                    playback_snapshot=snapshot,
+                    result_id=context["resultId"],
                 )
-                if not isinstance(raw_plan, Mapping) and isinstance(replay_context, Mapping):
-                    raw_plan = replay_context.get("plan")
-                if not isinstance(raw_plan, Mapping):
-                    raise ValueError("缺少生成该 MoveList 的完整计划，无法重建 Machine")
-                replay_time = _finite_number(payload.get("time"), 0.0)
-                algorithm_action_diagnostics = None
-                plan_strategy = str(raw_plan.get("strategy") or "")
-                replay_updates = (
-                    replay_context.get("updates") or []
-                    if isinstance(replay_context, Mapping)
-                    else []
+                content, download_name = serialize_deadlock_diagnostic_bundle(
+                    bundle,
+                    replay_time=context["time"],
+                    result_id=context["resultId"],
                 )
-                replay_machine = ReplayMachine(
-                    raw_plan,
-                    moves,
-                    replay_updates,
+                self._send_bytes(
+                    content,
+                    "application/json; charset=utf-8",
+                    download_name,
                 )
-                update_params = replay_machine.replay_update_at(replay_time)
-                replay_move_states = [
-                    {
-                        "MoveID": move.get("MoveID"),
-                        "MoveState": (
-                            "Done"
-                            if float(move.get("EndTime") or 0.0)
-                            <= replay_time + TIME_TOLERANCE
-                            else "Running"
-                        ),
-                    }
-                    for move in moves
-                    if float(move.get("StartTime") or 0.0)
-                    <= replay_time + TIME_TOLERANCE
-                ]
-                action_context = {
-                    "schemaVersion": 1,
-                    "CurrentTime": replay_time,
-                    "ToolTopo": raw_plan["device"],
-                    "UpdateParams": update_params,
-                    "MoveList": moves,
-                    "MoveStates": replay_move_states,
-                }
-                if plan_strategy.startswith(OTHER_ALGORITHM_STRATEGY_PREFIX):
-                    algorithm_id = plan_strategy.removeprefix(
-                        OTHER_ALGORITHM_STRATEGY_PREFIX
-                    )
-                    with algorithm_session(algorithm_id):
-                        algorithm_init(raw_plan["device"])
-                        algorithm_action_diagnostics = algorithm_get_replay_actions(
-                            action_context
-                        )
-                elif plan_strategy in builtin_supported_algorithms:
-                    algorithm_action_diagnostics = json.loads(
-                        builtin_algorithm_api.get_replay_actions(
-                            json.dumps(action_context, ensure_ascii=False)
-                        )
-                    )
-                replay_machine.algorithm_action_diagnostics = (
-                    algorithm_action_diagnostics
-                    if isinstance(algorithm_action_diagnostics, Mapping)
-                    else None
-                )
-                decision = replay_machine.evaluate_actions(replay_time)
-                self._send_json({"ok": True, "decision": decision})
             except Exception as error:  # noqa: BLE001
                 self._send_json(
                     {"ok": False, "error": str(error)},
@@ -494,6 +587,7 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
                     str(payload.get("windowMode") or "steady"),
                     context,
                     run_metrics,
+                    metric_groups=payload.get("metricGroups"),
                 )
                 self._send_json({
                     "ok": True,
@@ -542,7 +636,6 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
                     options,
                     hongye_check=bool(payload.get("hongYeCheck", True)),
                     skip_baseline=bool(payload.get("skipBaseline")),
-                    compatibility_mode=bool(payload.get("compatibilityMode", True)),
                     execution_timing_enabled=bool(payload.get("executionTimingEnabled", False)),
                     maximum_workers=int(payload.get("maximumWorkers", DEFAULT_BATCH_WORKERS)),
                     validation_workers=int(payload.get("validationWorkers", DEFAULT_VALIDATION_WORKERS)),
@@ -631,7 +724,6 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
                             selected_plan=selected_plan,
                             hongye_check=bool(payload.get("hongYeCheck", True)),
                             skip_baseline=bool(payload.get("skipBaseline")),
-                            compatibility_mode=bool(payload.get("compatibilityMode", True)),
                         )
                 else:
                     result, baseline, run_error = _execute_workspace_test_with_baseline(
@@ -642,7 +734,6 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
                         selected_plan=selected_plan,
                         hongye_check=bool(payload.get("hongYeCheck", True)),
                         skip_baseline=bool(payload.get("skipBaseline")),
-                        compatibility_mode=bool(payload.get("compatibilityMode", True)),
                     )
                 baseline_response = deepcopy(baseline)
                 if run_error is not None or result is None:
@@ -747,6 +838,14 @@ class ConfigEditorHandler(BaseHTTPRequestHandler):
                 payload = self._read_json_object()
                 settings = update_run_preferences(payload.get("runSettings"))
                 self._send_json({"ok": True, "runSettings": settings})
+            except Exception as error:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/preferences/analysis-settings":
+            try:
+                payload = self._read_json_object()
+                settings = update_analysis_preferences(payload.get("analysisSettings"))
+                self._send_json({"ok": True, "analysisSettings": settings})
             except Exception as error:  # noqa: BLE001
                 self._send_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
             return

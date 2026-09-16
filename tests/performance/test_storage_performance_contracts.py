@@ -18,14 +18,14 @@ from unittest.mock import patch
 from realtime_scheduler.backend import application as server
 from realtime_scheduler.backend.execution import batch_service
 from tests.performance.fixture_factory import (
-    generate_v8_dataset,
+    generate_current_dataset,
     load_performance_profiles,
 )
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE_PATH = ROOT / "docs" / "performance" / "profiles.json"
-BUDGET_PATH = ROOT / "docs" / "performance" / "budgets.json"
+PROFILE_PATH = ROOT / "tests" / "performance" / "config" / "profiles.json"
+BUDGET_PATH = ROOT / "tests" / "performance" / "config" / "budgets.json"
 
 
 def _test_file_hashes(store_dir: Path) -> dict[Path, str]:
@@ -73,8 +73,8 @@ class PerformanceFixtureTests(unittest.TestCase):
                 "payload_bytes_per_test": 128,
                 "round_count": 2,
             }
-            first = generate_v8_dataset(root / "first", **arguments)
-            second = generate_v8_dataset(root / "second", **arguments)
+            first = generate_current_dataset(root / "first", **arguments)
+            second = generate_current_dataset(root / "second", **arguments)
 
         self.assertEqual(first, second)
         self.assertEqual(2, first["deviceCount"])
@@ -84,7 +84,7 @@ class PerformanceFixtureTests(unittest.TestCase):
         """生成器必须拒绝超出产品上限的规模定义。"""
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "1~10"):
-                generate_v8_dataset(
+                generate_current_dataset(
                     Path(directory) / "datasets",
                     device_count=11,
                     tests_per_device=1,
@@ -100,7 +100,7 @@ class WorkspaceStorageComplexityTests(unittest.TestCase):
         """为每项测试创建包含多设备、多测试的可读数据目录。"""
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.store_dir = Path(self.temporary_directory.name) / "datasets"
-        generate_v8_dataset(
+        generate_current_dataset(
             self.store_dir,
             device_count=3,
             tests_per_device=12,
@@ -196,6 +196,30 @@ class WorkspaceStorageComplexityTests(unittest.TestCase):
         read_test_files = [path for path in reads if path.name == "test.json"]
         self.assertEqual(self.device_id, device["id"])
         self.assertEqual(self.test_id, test_case["id"])
+        self.assertEqual(1, len(read_test_files))
+        self.assertEqual(self.test_id, read_test_files[0].parent.name)
+
+    def test_selected_batch_run_context_opens_only_target_test(self) -> None:
+        """卡片双击复用批量入口时也只能读取所选测试。"""
+        context, reads = self._record_json_reads()
+        with context, patch.object(
+            server,
+            "_read_workspace_catalog_unlocked",
+            side_effect=AssertionError("所选批量运行不得读取完整工作区目录"),
+        ), patch.object(
+            server,
+            "_workspace_data_update_required",
+            side_effect=AssertionError("所选批量运行不得扫描数据文件时间戳"),
+        ):
+            device = server.get_workspace_batch_run_context(
+                self.device_id,
+                "性能",
+                [self.test_id],
+                self.store_dir,
+            )
+
+        read_test_files = [path for path in reads if path.name == "test.json"]
+        self.assertEqual([self.test_id], [test["id"] for test in device["tests"]])
         self.assertEqual(1, len(read_test_files))
         self.assertEqual(self.test_id, read_test_files[0].parent.name)
 

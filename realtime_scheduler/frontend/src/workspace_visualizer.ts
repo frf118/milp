@@ -6,7 +6,20 @@
  * 本文件不实现分析规则，也不持久化业务数据。
  */
 
-import { requestReplayDecision, requestScheduleAnalysis } from "./api_client";
+import {
+  requestDeadlockDiagnostic,
+  requestReplayDecision,
+  requestScheduleAnalysis,
+} from "./api_client";
+import { renderWaferDispatchProgress, updateWaferProgressPanel } from "./wafer_dispatch_progress";
+import { updateReplayThroughput } from "./replay_throughput";
+import { mountAnalysisWorkspace } from "./analysis_workspace";
+import { mountReplayInspectorDock } from "./replay_inspector_dock";
+import { configuredRobotArms, renderParallelRobotArms, robotSlotWafers, type RobotArmDefinition } from "./topology_robot_mechanism";
+import { projectTopologyTransfers } from "./topology_transfer_projection";
+import { projectLoadLockDoors, type LoadLockDoors } from "./topology_loadlock_doors";
+import { atmosphereRailMotion, type AtmosphereRailMotion } from "./topology_atmosphere_rail";
+import { renderRobotSlotRow } from "./topology_robot_slots";
 import type {
   ActivityCategory,
   BottleneckUtilizationSummary,
@@ -34,10 +47,14 @@ export interface ModuleSnapshot {
   type: string;
   status: ModuleStatus;
   door: DoorStatus;
+  /** LoadLock 上下两侧的独立门态；普通腔室不设置。 */
+  loadLockDoors?: LoadLockDoors;
   wafers: string[];
   processedWafers: string[];
   loadPortSlots: LoadPortSlotSnapshot[];
   loadLockSlots: LoadPortSlotSnapshot[];
+  /** 双腔按真实站点槽位保留空位，取走一片不能让另一片换腔。 */
+  processSlots?: LoadPortSlotSnapshot[];
   /** 设备声明的物理槽位容量；辅助设备用它绘制固定前视槽位。 */
   slotCapacity: number;
   activeMoveName: string;
@@ -51,6 +68,12 @@ export interface RobotSnapshot {
   name: string;
   type: string;
   capacity: number;
+  /** 配置中的物理臂与槽位；旧快照缺省时允许按容量回退。 */
+  arms?: RobotArmDefinition[];
+  /** 以 RobotSlot 为键的已完成动作占位，不能用晶圆排序替代。 */
+  slotWafers?: Record<number, string>;
+  /** 大气侧沿导轨的源、目标及对齐进度。 */
+  railMotion?: AtmosphereRailMotion;
   environment: RobotEnvironment;
   wafers: string[];
   processedWafers: string[];
@@ -78,7 +101,6 @@ export interface WorkspaceSnapshot {
 export interface PlaybackDeadlock {
   Code:
     | "DEADLOCK.SINGLE_ARM_TARGET_FULL"
-    | "DEADLOCK.DUAL_ARM_SINGLE_HELD_TARGET_FULL"
     | "DEADLOCK.DUAL_ARM_TARGETS_FULL";
   Category:
     | "single-arm-target-full"
@@ -220,8 +242,9 @@ interface WorkspaceElements {
   speed: HTMLSelectElement;
   fileInput: HTMLInputElement;
   importButton: HTMLButtonElement | null;
+  exportDiagnosticButton: HTMLButtonElement | null;
   openGantt: HTMLAnchorElement;
-  resultButton: HTMLButtonElement;
+  resultButton: HTMLButtonElement | null;
   performance: HTMLElement;
   performanceWindow: HTMLSelectElement;
 }
@@ -245,7 +268,6 @@ const VENT_MOVE = 13;
 const CLEAN_MOVE = 14;
 const LOADLOCK_ENVIRONMENT_MOVE_TYPES = new Set([PRE_PREPARE_MOVE, PUMP_MOVE, VENT_MOVE]);
 const PLAYBACK_FRAME_INTERVAL_MS = 40;
-const DOOR_VISUAL_MIN_SECONDS = 0.7;
 const DEFAULT_PLAYBACK_SPEED = 4;
 const PERFORMANCE_DISPLAY_TOLERANCE = 1e-6;
 const DEFAULT_LOAD_PORT_CAPACITY = 25;
@@ -1240,16 +1262,16 @@ function buildLoadPortSlots(
 }
 
 /**
- * 从完整 MoveList 重建 LoadLock 正视双层的槽位占用。
+ * 从完整 MoveList 重建 LoadLock 和双腔加工模块的真实槽位占用。
  *
  * LoadPort 已有 buildLoadPortSlots 按 SrcSlotList/DestSlotList 精确跟踪；
- * LoadLock 双层同样携带槽位字段（PICK/PLACE 的 Src/DestSlotList，SWAP 的
+ * LoadLock 与双腔加工模块同样携带槽位字段（PICK/PLACE 的 Src/DestSlotList，SWAP 的
  * StnSendSlotList/StnRecvSlotList）。这里按槽位号重建占用：槽位 1 对应上层、
- * 槽位 2 对应下层。只有时间零点确实位于 LoadLock 的晶圆，才会借助未来第一次
+ * 槽位 2 对应下层；双腔槽号对应展开后的腔号。只有时间零点确实位于站点的晶圆，才会借助未来第一次
  * 取片/换片动作定位初始槽位；已完成动作再逐条更新，因此后续进入的晶圆不会提前
  * 出现在初始画面，真空交换后新片也会落在真实物理槽位而不受名称排序影响。
  */
-function buildLoadLockSlots(
+function buildReplayStationSlots(
   records: NormalizedMove[],
   device: DeviceDefinition | null,
   time: number,
@@ -1257,36 +1279,39 @@ function buildLoadLockSlots(
   processedMaterials: Set<string>,
   currentMaterialInstances: ReadonlyMap<string, string>,
 ): Map<string, LoadPortSlotSnapshot[]> {
+  /** LoadLock 与双腔都必须按槽号恢复，不能按剩余晶圆顺序压缩空槽。 */
+  const isSlottedStation = (name: string, type: string): boolean => isLoadLockName(name, type)
+    || type.toLowerCase() === "multiprocesschamber";
   const names = new Set<string>();
   for (const [name, definition] of Object.entries(device?.Stations ?? {})) {
-    if (isLoadLockName(name, String(definition?.Type ?? ""))) names.add(name);
+    if (isSlottedStation(name, String(definition?.Type ?? ""))) names.add(name);
   }
   for (const location of initialLocations.values()) {
-    if (isLoadLockName(location, String(device?.Stations?.[location]?.Type ?? ""))) names.add(location);
+    if (isSlottedStation(location, String(device?.Stations?.[location]?.Type ?? ""))) names.add(location);
   }
 
-  const initialByLock = new Map<string, Map<number, string>>();
+  const initialByStation = new Map<string, Map<number, string>>();
   const observedMaximum = new Map<string, number>();
-  /** 仅为时间零点已经位于指定 LoadLock 的晶圆记录初始槽位。 */
-  const occupyInitial = (lock: string, slot: number, material: string): void => {
-    if (!lock || !slot || !material || initialLocations.get(material) !== lock) return;
-    names.add(lock);
-    const occupancy = initialByLock.get(lock) ?? new Map<number, string>();
+  /** 仅为时间零点已经位于指定站点 的晶圆记录初始槽位。 */
+  const occupyInitial = (station: string, slot: number, material: string): void => {
+    if (!station || !slot || !material || initialLocations.get(material) !== station) return;
+    names.add(station);
+    const occupancy = initialByStation.get(station) ?? new Map<number, string>();
     if (!occupancy.has(slot)) occupancy.set(slot, material);
-    initialByLock.set(lock, occupancy);
-    observedMaximum.set(lock, Math.max(observedMaximum.get(lock) ?? 0, slot));
+    initialByStation.set(station, occupancy);
+    observedMaximum.set(station, Math.max(observedMaximum.get(station) ?? 0, slot));
   };
   for (const move of records) {
     if (PICK_MOVE_TYPES.has(move.MoveType)) {
       materialIds(move).forEach((material, index) => {
         const source = indexedStation(move, "SrcStationList", index);
-        if (!isLoadLockName(source, String(device?.Stations?.[source]?.Type ?? ""))) return;
+        if (!isSlottedStation(source, String(device?.Stations?.[source]?.Type ?? ""))) return;
         occupyInitial(source, indexedSlot(move, "SrcSlotList", index), material);
       });
     } else if (move.MoveType === SWAP_MOVE) {
       materialIds(move, "RecvMatList").forEach((material, index) => {
         const station = indexedStation(move, "StationList", index);
-        if (!isLoadLockName(station, String(device?.Stations?.[station]?.Type ?? ""))) return;
+        if (!isSlottedStation(station, String(device?.Stations?.[station]?.Type ?? ""))) return;
         occupyInitial(station, indexedSlot(move, "StnSendSlotList", index), material);
       });
     }
@@ -1294,7 +1319,7 @@ function buildLoadLockSlots(
 
   const result = new Map<string, LoadPortSlotSnapshot[]>();
   for (const name of names) {
-    const occupancy = new Map(initialByLock.get(name) ?? []);
+    const occupancy = new Map(initialByStation.get(name) ?? []);
     const initialMaterials = [...initialLocations.entries()]
       .filter(([, location]) => location === name)
       .map(([material]) => material)
@@ -1372,7 +1397,7 @@ function buildLoadLockSlots(
 }
 
 /** 返回动作在给定时刻的线性进度。 */
-function moveProgress(move: NormalizedMove, time: number): number {
+function moveProgress(move: Pick<NormalizedMove, "StartTime" | "EndTime">, time: number): number {
   const duration = move.EndTime - move.StartTime;
   if (duration <= 0) return time >= move.EndTime ? 1 : 0;
   return Math.max(0, Math.min(1, (time - move.StartTime) / duration));
@@ -1406,6 +1431,7 @@ export function buildWorkspaceSnapshot(
   const waferOrigins = initialMaterialOrigins(records);
   const locations = new Map(initialLocations);
   const doorStates = new Map<string, DoorStatus>();
+  const loadLockDoors = projectLoadLockDoors(records, device, time, [...definitions].filter(([name, definition]) => isLoadLockName(name, definition.type)).map(([name]) => name));
   const environments = new Map<string, string>();
   // 每片晶圆在整个计划中需要完成的加工工序数；只有全部工序完成才视为已加工。
   const requiredProcesses = new Map<string, number>();
@@ -1463,7 +1489,7 @@ export function buildWorkspaceSnapshot(
     }
 
     const doorVisualActive = move.StartTime <= time
-      && time < Math.max(move.EndTime, move.StartTime + DOOR_VISUAL_MIN_SECONDS);
+      && time < move.EndTime;
     if (move.MoveType === PREPARE_MOVE) {
       if (doorVisualActive) doorStates.set(move.ModuleName, "opening");
       else if (completed) doorStates.set(move.ModuleName, "open");
@@ -1517,7 +1543,7 @@ export function buildWorkspaceSnapshot(
     processedMaterials,
     replenishments,
   );
-  const loadLockSlots = buildLoadLockSlots(
+  const stationSlotSnapshots = buildReplayStationSlots(
     records,
     device,
     time,
@@ -1558,10 +1584,12 @@ export function buildWorkspaceSnapshot(
       type: definition.type,
       status,
       door: doorStates.get(name) ?? "closed",
+      loadLockDoors: loadLockDoors.get(name),
       wafers: wafersByLocation.get(name) ?? [],
       processedWafers: (wafersByLocation.get(name) ?? []).filter(isProcessed),
       loadPortSlots: loadPortSlots.get(name) ?? [],
-      loadLockSlots: loadLockSlots.get(name) ?? [],
+      loadLockSlots: isLoadLockName(name, definition.type) ? stationSlotSnapshots.get(name) ?? [] : [],
+      processSlots: definition.type.toLowerCase() === "multiprocesschamber" ? stationSlotSnapshots.get(name) : undefined,
       slotCapacity: stationSlotCapacity(device, name, isCoolerModule(name, definition.type) ? 3 : 1),
       activeMoveName: primaryMove ? (isCleaningMove(primaryMove) ? "清洁" : MOVE_NAMES[primaryMove.MoveType] ?? `动作 ${primaryMove.MoveType}`) : "",
       progress: primaryMove ? moveProgress(primaryMove, time) : 0,
@@ -1579,7 +1607,10 @@ export function buildWorkspaceSnapshot(
       name,
       type: String(definition.Type ?? ""),
       capacity: robotCapacity(definition, wafers.length),
+      arms: configuredRobotArms(definition),
+      slotWafers: robotSlotWafers(records, time, name, wafers),
       environment: robotEnvironment(name, definition),
+      railMotion: robotEnvironment(name, definition) === "atmosphere" ? atmosphereRailMotion(records, name, time) : undefined,
       wafers,
       processedWafers: wafers.filter(isProcessed),
       busy: Boolean(move),
@@ -1755,7 +1786,7 @@ function hasConsistentTransferReplay(
 }
 
 /**
- * 在 MoveList 回放终点识别三种明确的持片满腔死锁。
+ * 在 MoveList 回放终点识别两种明确的持片满腔死锁。
  *
  * 判定只读取前端回放出的最终位置、Route 下一步和设备容量，不信任算法提供的
  * DEADLOCK 分类。目标腔内晶圆的下一步也必须由同一机器手搬出，才算形成依赖。
@@ -1787,31 +1818,6 @@ export function detectTerminalPlaybackDeadlock(
     return blocked.length === targets.length ? blocked : [];
   };
 
-  /** 找出仍占用目标腔室、且尚未完成整组清洗的 Dummy。 */
-  const unfinishedCleaningBlockers = (targets: string[]): Array<{
-    target: string;
-    wafer: string;
-    taskName: string;
-  }> => targets.flatMap(target => {
-    const occupants = modules.get(target)?.wafers ?? [];
-    return occupants.flatMap(wafer => {
-      const latestCleaningMove = [...records]
-        .filter(move => (
-          move.MoveType === PROCESS_MOVE
-          && move.ModuleName === target
-          && materialIds(move).includes(wafer)
-          && isCleaningMove(move)
-        ))
-        .sort((left, right) => right.EndTime - left.EndTime || right.MoveID - left.MoveID)[0];
-      if (!latestCleaningMove || latestCleaningMove.IsLastCleanTaskMove !== false) return [];
-      return [{
-        target,
-        wafer,
-        taskName: String(latestCleaningMove.CleanTaskName || latestCleaningMove.ProcessRecipe || "清洗任务"),
-      }];
-    });
-  });
-
   for (const robot of snapshot.robots) {
     const held = [...robot.wafers].sort(naturalCompare);
     if (robot.capacity === 1 && held.length === 1) {
@@ -1822,24 +1828,6 @@ export function detectTerminalPlaybackDeadlock(
         Code: "DEADLOCK.SINGLE_ARM_TARGET_FULL",
         Category: "single-arm-target-full",
         Message: `${robot.name} 的唯一手臂持有晶圆 ${held[0]}，目标 ${targets.join("、")} 被晶圆 ${occupants.join("、")} 占用；它没有空手接走腔内晶圆，持片又必须等目标腾空才能放下，形成相互等待。`,
-      };
-    }
-    if (robot.capacity === 2 && held.length === 1) {
-      const targets = blockingTargets(robot, held[0]);
-      if (!targets.length) continue;
-      const occupants = [...new Set(targets.flatMap(target => modules.get(target)?.wafers ?? []))].sort(naturalCompare);
-      const cleaningBlockers = unfinishedCleaningBlockers(targets);
-      const reason = cleaningBlockers.length
-        ? cleaningBlockers.map(blocker => (
-          `${blocker.target} 被尚未完成整组 ${blocker.taskName} 的清洗片 ${blocker.wafer} 占用；`
-          + `晶圆 ${held[0]} 在清洗完成前禁止进入，不能直接换片。`
-        )).join("")
-        : `直接换片会让腔内晶圆 ${occupants.join("、")} 转到 ${robot.name} 的第二只手臂，`
-          + `但回放终点没有能将这些晶圆继续放下的合法后继出口，换片链无法闭合。`;
-      return {
-        Code: "DEADLOCK.DUAL_ARM_SINGLE_HELD_TARGET_FULL",
-        Category: "dual-arm-single-held-target-full",
-        Message: `${robot.name} 已持有晶圆 ${held[0]}。${reason}腔内片又只能由 ${robot.name} 取出，形成持片等待闭环。`,
       };
     }
     if (robot.capacity === 2 && held.length === 2) {
@@ -1892,8 +1880,9 @@ function collectElements(root: Document): WorkspaceElements {
     speed: required<HTMLSelectElement>("visualSpeed"),
     fileInput: required<HTMLInputElement>("visualFileInput"),
     importButton: root.getElementById("visualImportButton") as HTMLButtonElement | null,
+    exportDiagnosticButton: root.getElementById("visualExportDeadlockDiagnostic") as HTMLButtonElement | null,
     openGantt: required<HTMLAnchorElement>("visualOpenGantt"),
-    resultButton: required<HTMLButtonElement>("workspaceResultButton"),
+    resultButton: root.getElementById("workspaceResultButton") as HTMLButtonElement | null,
     performance: required("visualPerformance"),
     performanceWindow: required<HTMLSelectElement>("performanceWindow"),
   };
@@ -2068,7 +2057,7 @@ function expandDualProcessChambers(modules: ModuleSnapshot[]): DualChamberView[]
       continue;
     }
     for (let index = 0; index < module.slotCapacity; index += 1) {
-      const wafer = module.wafers[index] ?? "";
+      const wafer = module.processSlots ? module.processSlots.find(slot => slot.slot === index + 1)?.wafer ?? "" : module.wafers[index] ?? "";
       expanded.push({
         view: {
           ...module,
@@ -2108,7 +2097,7 @@ function moduleDoorSides(
   attachmentId = "",
 ): Array<"top" | "right" | "bottom" | "left"> {
   if (module.door === "doorless") return [];
-  if (role === "lock") return [];
+  if (role === "lock") return ["top", "bottom"];
   if (role === "port") return ["top"];
   const name = module.name.trim().toUpperCase();
   if (role === "process" && attachmentId) {
@@ -2163,6 +2152,9 @@ function visibleModuleSlots(module: ModuleSnapshot, kind: "port" | "lock" | "coo
 export function renderFrontSlotOverview(
   modules: ModuleSnapshot[],
   waferOrigins: Readonly<Record<string, string>> = {},
+  robots: RobotSnapshot[] = [],
+  layout: TopologyLayout = "single",
+  device?: DeviceDefinition | null,
 ): string {
   const visibleModules = modules.filter(module => !isTopologyHiddenModule(module));
   type FrontSlotModule = { module: ModuleSnapshot; kind: "port" | "lock" | "cooler" };
@@ -2188,6 +2180,15 @@ export function renderFrontSlotOverview(
     .filter(module => isLoadLockName(module.name, module.type))
     .map(module => ({ module, kind: "lock" as const }))
     .sort(moduleNameOrder);
+  const bridgeNames = layout === "cascade" ? cascadeBridgeLoadLockNames(
+    Object.keys(device?.Stations ?? {}).filter(name => loadLocks.some(item => item.module.name === name)),
+    device, robots.filter(robot => robot.environment === "vacuum").map(robot => robot.name),
+  ) : new Set<string>();
+  /** 槽位侧栏与俯视画布共用模块坐标，级联桥接腔不能混入大气 LoadLock 行。 */
+  const lockPosition = (item: FrontSlotModule): TopologyPosition => moduleTopologyPosition(item.module, "lock", 0,
+    loadLocks.map(item => item.module), layout, bridgeNames);
+  if (robots.length && layout !== "dual") loadLocks.sort((left, right) => lockPosition(left).topPixels - lockPosition(right).topPixels
+    || lockPosition(left).leftPercent - lockPosition(right).leftPercent);
   const splitRows = (items: FrontSlotModule[], columns: number): FrontSlotModule[][] => (
     Array.from({ length: Math.ceil(items.length / columns) }, (_, index) => items.slice(index * columns, (index + 1) * columns))
   );
@@ -2197,7 +2198,7 @@ export function renderFrontSlotOverview(
     ...splitRows(loadPorts, 2),
     ...splitRows(coolers, 2),
   ].filter(row => row.length);
-  const renderSlots = (slots: LoadPortSlotSnapshot[], module: ModuleSnapshot): string => (
+  const renderSlots = (slots: LoadPortSlotSnapshot[], module: { name: string }): string => (
     slots.map(slot => {
       const state = !slot.wafer ? "empty" : slot.processed ? "processed" : "unprocessed";
       const dummy = Boolean(slot.wafer) && isDummyWafer(
@@ -2206,12 +2207,12 @@ export function renderFrontSlotOverview(
       );
       const identity = `${module.name}.${slot.slot}`;
       const detail = slot.wafer
-        ? `${identity} · 晶圆 ${slot.wafer}，${slot.processed ? "已加工" : "未加工"}`
+        ? `${identity} · 晶圆 ${waferSurfaceLabel(slot.wafer, waferOrigins[slot.wafer] ?? "")}，${slot.processed ? "已加工" : "未加工"}`
         : `${identity} · 空槽`;
       return `<span class="front-slot is-${state}${dummy ? " is-dummy" : ""}" tabindex="0" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}"></span>`;
     }).join("")
   );
-  if (!slotRows.length) return "";
+  if (!slotRows.length && !robots.length) return "";
   const renderModule = ({ module, kind }: FrontSlotModule): string => {
     const slots = visibleModuleSlots(module, kind);
     return `<div class="front-module">
@@ -2219,7 +2220,21 @@ export function renderFrontSlotOverview(
       <div class="front-slot-board" style="--front-slot-count:${slots.length}" role="group" aria-label="${escapeHtml(`${module.name} 正视槽位`)}">${renderSlots(slots, module)}</div>
     </div>`;
   };
-  const content = slotRows.map(row => `<div class="front-slot-row front-slot-row-${row[0].kind}" style="--front-row-module-count:${row.length}">${row.map(renderModule).join("")}</div>`).join("");
+  // 侧栏按设备纵向位置排列；每台机械手独占行，不能与另一台机器手补齐空列。
+  const positionedRows = slotRows.map(row => {
+    const role = row[0].kind === "port" ? "port" : row[0].kind === "lock" ? "lock" : "auxiliary";
+    const peers = visibleModules.filter(module => role === "port" ? isLoadPortName(module.name, module.type)
+      : role === "lock" ? isLoadLockName(module.name, module.type) : isCoolerModule(module.name, module.type));
+    return { top: moduleTopologyPosition(row[0].module, role, peers.indexOf(row[0].module), peers, layout, bridgeNames).topPixels,
+      category: role === "lock" ? 1 : role === "port" ? 2 : 3,
+      markup: `<div class="front-slot-row front-slot-row-${row[0].kind}" style="--front-row-module-count:${row.length}">${row.map(renderModule).join("")}</div>` };
+  });
+  for (const robot of robots) {
+    const peers = robots.filter(item => item.environment === robot.environment);
+    positionedRows.push({ top: robotTopologyPosition(peers.indexOf(robot), peers.length, robot.environment, layout).topPixels, category: 0,
+      markup: renderRobotSlotRow(robot, layout === "dual", slots => renderSlots(slots, robot), escapeHtml) });
+  }
+  const content = positionedRows.sort((a, b) => layout === "dual" ? a.category - b.category || (a.category === 0 ? a.top - b.top : 0) : a.top - b.top).map(row => row.markup).join("");
   return `<div class="topology-front-content" role="group" aria-label="设备正视槽位">${content}</div>`;
 }
 
@@ -2237,9 +2252,8 @@ function renderLoadPortTopView(
   const isDummy = isDummyPortName(module.name) || module.type.trim().toLowerCase() === "dummyport";
   return `<strong class="equipment-external-name equipment-external-name-port">${escapeHtml(module.name)}</strong>
     <article class="equipment-card equipment-port-top-view status-${module.status} door-${module.door} ${isDummy ? "is-dummy-port" : ""} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""}" aria-label="${escapeHtml(`${accessibleStatus}，俯视装载台，共 ${slots.length} 个槽位，未加工 ${unprocessed}，已加工 ${processed}${candidateLabel}`)}">
-      <span class="port-top-gate" aria-hidden="true"></span>
       <span class="port-top-cassette ${wafers ? "is-occupied" : "is-empty"}">${wafers || "<i></i>"}</span>
-    </article>`;
+    </article>${module.door === "doorless" ? "" : `<div class="external-module-doors door-${module.door}" title="${escapeHtml(DOOR_LABELS[module.door])}"><i class="external-module-door external-module-door-top"></i></div>`}`;
 }
 
 /** 绘制拓扑中的紧凑腔室；晶圆标签只展示首次确认的来源模块。 */
@@ -2265,7 +2279,12 @@ function renderModule(
     ? `<span class="wafer-more">+ ${layerCount - visibleWaferCount}</span>`
     : "";
   const doors = moduleDoorSides(module, role, layout, roleIndex, attachmentId)
-    .map(side => `<i class="chamber-door chamber-door-${side}"></i>`)
+    .map(side => {
+      const state = role === "lock" && (side === "top" || side === "bottom") ? module.loadLockDoors?.[side] ?? "closed" : module.door;
+      const direction = role === "lock" ? (side === "top" ? module.loadLockDoors?.topLabel ?? "真空侧" : module.loadLockDoors?.bottomLabel ?? "大气侧") : "";
+      const label = state === "unknown" ? "开门方向未知" : DOOR_LABELS[state];
+      return `<i class="external-module-door external-module-door-${side} door-${state}" title="${escapeHtml(`${direction}${label}`)}"></i>`;
+    })
     .join("");
   const accessibleStatus = `${module.name}，${STATUS_LABELS[module.status]}，${DOOR_LABELS[module.door]}`;
   const candidateLabel = candidate
@@ -2351,8 +2370,8 @@ function renderModule(
   const article = `
     <article class="equipment-card equipment-${role} status-${module.status} door-${module.door} ${module.loadLockPhase ? `loadlock-${module.loadLockPhase}` : ""} ${module.isRobotTarget ? "is-target" : ""} ${candidate ? "is-candidate-destination" : ""} ${candidate?.selected ? "is-model-selected" : ""}" style="--module-progress:${Math.round(module.progress * 100)}%;--loadlock-atmosphere:${Math.max(0, Math.min(100, atmosphereLevel)).toFixed(1)}%;--loadlock-atmosphere-ratio:${Math.max(0, Math.min(1, atmosphereLevel / 100)).toFixed(3)}" aria-label="${escapeHtml(`${accessibleStatus}${candidateLabel ? `，${candidateLabel}` : ""}`)}">
        ${bodyMarkup}
-      <div class="chamber-doors" aria-hidden="true">${role === "lock" ? '<i class="loadlock-top-gate loadlock-top-gate-vacuum"></i><i class="loadlock-top-gate loadlock-top-gate-atmosphere"></i>' : doors}</div>
-    </article>`;
+    </article>
+    <div class="external-module-doors door-${module.door}" title="${escapeHtml(DOOR_LABELS[module.door])}">${doors}</div>`;
   if (role === "process" || role === "auxiliary" || role === "lock") {
     return `<strong class="equipment-external-name">${escapeHtml(module.name)}</strong>${article}`;
   }
@@ -2362,12 +2381,13 @@ function renderModule(
 const ROBOT_DOUBLE_HOLD_CAPACITY = 2;
 const ROBOT_DISPLAY_WAFER_LIMIT = 2;
 
-/** 绘制机器手：双片仅用轻微错层区分，不额外显示数量标签。 */
+/** 绘制机器手与持片；单腔/级联传入按真实配置生成的分臂机构，否则保留双腔外观。 */
 function renderRobotHub(
   robot: RobotSnapshot,
   waferOrigins: Readonly<Record<string, string>>,
   environment: RobotEnvironment,
   angleDegrees: number,
+  mechanismMarkup?: string,
 ): string {
   const visibleWafers = robot.wafers.slice(0, ROBOT_DISPLAY_WAFER_LIMIT);
   const capacityLabel = robot.capacity >= ROBOT_DOUBLE_HOLD_CAPACITY ? "双片机械手" : "单槽机械手";
@@ -2381,15 +2401,14 @@ function renderRobotHub(
     : "";
   return `
     <article class="robot-hub robot-hub-${environment} ${robot.busy ? "is-busy" : ""}" style="--robot-arm-angle:${angleDegrees.toFixed(1)}deg" aria-label="${escapeHtml(robot.name)}，${capacityLabel}，${robot.busy ? "工作中" : "待命"}${holdingLabel}">
-      <span class="robot-environment-badge">${escapeHtml(robot.name)}</span>
       <div class="robot-mechanism" aria-hidden="true">
         <span class="robot-base"><i></i></span>
-        <span class="robot-arm">
+        ${mechanismMarkup === undefined ? `<span class="robot-arm">
           <i class="robot-arm-beam"></i>
           <span class="robot-end-effector ${visibleWafers.length ? "is-occupied" : "is-empty"}">
             <span class="robot-held-wafers">${waferMarkup}${overflow}</span>
           </span>
-        </span>
+        </span>` : mechanismMarkup}
       </div>
     </article>`;
 }
@@ -2422,11 +2441,15 @@ const TOPOLOGY_ITEM_SIZE = 96;
 const TOPOLOGY_PROCESS_WIDTH = 82;
 const TOPOLOGY_PROCESS_HEIGHT = 82;
 const TOPOLOGY_ROBOT_SIZE = 132;
+/** 俯视晶圆的遮挡半径，机构在已放置晶圆的实心区域下方通过。 */
+const TOPOLOGY_WAFER_OCCLUSION_RADII = { process: 24, port: 21, lock: 21, cooler: 16, aligner: 15 };
 /* 单腔、双腔均沿用原双腔的紧凑 LoadLock 尺寸。 */
 const TOPOLOGY_LOADLOCK_WIDTH = 82;
 const TOPOLOGY_LOADLOCK_HEIGHT = 82;
 /** 同一桥接链相邻 LoadLock 外框之间保留的最小可读间隙。 */
 const TOPOLOGY_LOADLOCK_BRIDGE_GAP = 2;
+/** 门条厚度 5px，两侧各留 1px，避免覆盖机器框架。 */
+const TOPOLOGY_EXTERNAL_DOOR_CLEARANCE = 7;
 /* 级联双框等宽，LoadLock 的中心距离等于其自身宽度，从而形成紧贴的一对。 */
 const TOPOLOGY_CASCADE_FRAME_WIDTH = 240;
 const TOPOLOGY_CASCADE_VTR1_HEIGHT = 128;
@@ -2483,8 +2506,8 @@ const TOPOLOGY_MACHINE_FRAMES: Record<TopologyLayout, readonly TopologyMachineFr
       id: "vacuum-vtr-1",
       label: "",
       centerLeftPercent: 50,
-      /* 上移 8px，使 UBR/DBR 同时贴合 VTR_2 底边与 VTR_1 顶边。 */
-      centerTopPixels: 496,
+      /* 桥接腔上下两侧均预留外置门空间。 */
+      centerTopPixels: 496 + 2 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
       widthPixels: TOPOLOGY_CASCADE_FRAME_WIDTH,
       heightPixels: TOPOLOGY_CASCADE_VTR1_HEIGHT,
       shape: "flat",
@@ -2499,7 +2522,7 @@ const TOPOLOGY_ATMOSPHERE_FRAMES: Record<TopologyLayout, TopologyMachineFrame> =
     label: "",
     centerLeftPercent: 50,
     /* LoadLock 作为真空与大气框架之间的桥接腔。 */
-    centerTopPixels: 547,
+    centerTopPixels: 547 + 2 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
     widthPixels: 425,
     heightPixels: 150,
     shape: "atmosphere",
@@ -2508,7 +2531,7 @@ const TOPOLOGY_ATMOSPHERE_FRAMES: Record<TopologyLayout, TopologyMachineFrame> =
     id: "atmosphere-main",
     label: "",
     centerLeftPercent: 50,
-    centerTopPixels: 547,
+    centerTopPixels: 547 + 2 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
     widthPixels: 425,
     heightPixels: 150,
     shape: "atmosphere",
@@ -2517,7 +2540,7 @@ const TOPOLOGY_ATMOSPHERE_FRAMES: Record<TopologyLayout, TopologyMachineFrame> =
     id: "atmosphere-main",
     label: "",
     centerLeftPercent: 50,
-    centerTopPixels: 717,
+    centerTopPixels: 717 + 4 * TOPOLOGY_EXTERNAL_DOOR_CLEARANCE,
     widthPixels: 425,
     heightPixels: 150,
     shape: "atmosphere",
@@ -2541,7 +2564,7 @@ function topologyAtmosphereFrame(layout: TopologyLayout): TopologyMachineFrame {
 }
 
 /**
- * 由机器框架边缘生成模块中心点，使模块外框与框架边缘严格相切。
+ * 由机器框架边缘生成模块中心点，在模块外框与框架之间预留外置门空间。
  * offset 取 -1～1，表示沿该边从左/上到右/下的位置。
  */
 function topologyFrameAttachment(
@@ -2568,22 +2591,22 @@ function topologyFrameAttachment(
   const verticalOffset = offset * frame.heightPixels / 2;
   return {
     leftPercent: side === "left"
-      ? frame.centerLeftPercent - frameWidthPercent / 2 - halfWidthPercent
+      ? frame.centerLeftPercent - frameWidthPercent / 2 - halfWidthPercent - TOPOLOGY_EXTERNAL_DOOR_CLEARANCE / TOPOLOGY_VIEWBOX_WIDTH * 100
       : side === "right"
-        ? frame.centerLeftPercent + frameWidthPercent / 2 + halfWidthPercent
+        ? frame.centerLeftPercent + frameWidthPercent / 2 + halfWidthPercent + TOPOLOGY_EXTERNAL_DOOR_CLEARANCE / TOPOLOGY_VIEWBOX_WIDTH * 100
         : frame.centerLeftPercent + horizontalOffset,
     topPixels: Math.round(side === "top"
-      ? frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2
+      ? frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2 - TOPOLOGY_EXTERNAL_DOOR_CLEARANCE
       : side === "bottom"
-        ? frame.centerTopPixels + frame.heightPixels / 2 + heightPixels / 2
+        ? frame.centerTopPixels + frame.heightPixels / 2 + heightPixels / 2 + TOPOLOGY_EXTERNAL_DOOR_CLEARANCE
         : frame.centerTopPixels + verticalOffset),
     widthPixels,
     heightPixels,
     attachmentId,
     fixedLeftOffsetPixels: (side === "left"
-      ? -frame.widthPixels / 2 - widthPixels / 2
+      ? -frame.widthPixels / 2 - widthPixels / 2 - TOPOLOGY_EXTERNAL_DOOR_CLEARANCE
       : side === "right"
-        ? frame.widthPixels / 2 + widthPixels / 2
+        ? frame.widthPixels / 2 + widthPixels / 2 + TOPOLOGY_EXTERNAL_DOOR_CLEARANCE
         : horizontalOffset / 100 * TOPOLOGY_VIEWBOX_WIDTH),
   };
 }
@@ -2591,7 +2614,7 @@ function topologyFrameAttachment(
 /**
  * 计算连接真空与大气侧的 LoadLock 位置。
  *
- * LoadLock 的上缘由真空框架下边锚定，下缘与大气框架上边相切。横坐标从真空
+ * LoadLock 的上缘由真空框架下边锚定，下缘与大气框架上边之间保留门条间距。横坐标从真空
  * 框架推导，并按两框架宽度换算为大气框架上的同一物理位置，避免缩放后偏离中轴。
  */
 function topologyVacuumAtmosphereLoadLockBridge(
@@ -2622,7 +2645,7 @@ function topologyVacuumAtmosphereLoadLockBridge(
   );
   return {
     ...vacuumAttachment,
-    /* 两端框架的中心距由常量固定；保留大气锚点的纵坐标以表达两侧同时相切。 */
+    /* 两端框架的中心距由常量固定；保留大气锚点的纵坐标以表达两侧相同的门条间距。 */
     topPixels: atmosphereAttachment.topPixels,
     attachmentId: `${vacuumAttachment.attachmentId}|${atmosphereAttachment.attachmentId}`,
   };
@@ -2639,8 +2662,8 @@ function topologyTightLoadLockOffsets(count: number, frameWidthPixels: number): 
   );
 }
 
-/** 把辅助设备固定在框架内部四角，避免随画布宽度变化而漂移。 */
-function topologyFrameInteriorCorner(
+/** 将辅助设备附着在大气框架上方两端，保持横向位置并为底边留出接缝。 */
+function topologyFrameUpperUtilityAttachment(
   frame: TopologyMachineFrame,
   attachmentId: string,
   horizontal: "left" | "right",
@@ -2650,7 +2673,7 @@ function topologyFrameInteriorCorner(
   const horizontalOffset = frame.widthPixels / 2 - TOPOLOGY_ATMOSPHERE_INTERIOR_INSET - widthPixels / 2;
   return {
     leftPercent: frame.centerLeftPercent + (horizontal === "left" ? -horizontalOffset : horizontalOffset) / TOPOLOGY_VIEWBOX_WIDTH * 100,
-    topPixels: frame.centerTopPixels - frame.heightPixels / 2 + TOPOLOGY_ATMOSPHERE_INTERIOR_INSET + heightPixels / 2,
+    topPixels: frame.centerTopPixels - frame.heightPixels / 2 - heightPixels / 2 - TOPOLOGY_LOADLOCK_BRIDGE_GAP,
     widthPixels,
     heightPixels,
     attachmentId,
@@ -2924,18 +2947,22 @@ function moduleTopologyPosition(
     };
   }
   if (isAlignerModule(module.name, module.type)) {
-    return topologyFrameInteriorCorner(
+    if (layout === "dual") return topologyFrameAttachment(topologyAtmosphereFrame(layout),
+      "atmosphere-aligner@left", "left", 0, TOPOLOGY_ALIGNER_WIDTH, TOPOLOGY_ALIGNER_HEIGHT);
+    return topologyFrameUpperUtilityAttachment(
       topologyAtmosphereFrame(layout),
-      "atmosphere-aligner-top-left@inside",
+      "atmosphere-aligner-top-left@top",
       "left",
       TOPOLOGY_ALIGNER_WIDTH,
       TOPOLOGY_ALIGNER_HEIGHT,
     );
   }
   if (role === "auxiliary" && isCoolerModule(module.name, module.type)) {
-    return topologyFrameInteriorCorner(
+    if (layout === "dual") return topologyFrameAttachment(topologyAtmosphereFrame(layout),
+      "atmosphere-cooler@right", "right", 0, TOPOLOGY_COOLER_WIDTH, TOPOLOGY_COOLER_HEIGHT);
+    return topologyFrameUpperUtilityAttachment(
       topologyAtmosphereFrame(layout),
-      "atmosphere-cooler-top-right@inside",
+      "atmosphere-cooler-top-right@top",
       "right",
       TOPOLOGY_COOLER_WIDTH,
       TOPOLOGY_COOLER_HEIGHT,
@@ -3181,14 +3208,16 @@ function isModuleFilteredOut(module: ModuleSnapshot, hiddenFilters?: ReadonlySet
     || (hiddenFilters.has("cooler") && (/^(CL|COOL(?:ER)?)$/.test(normalized) || type === "cooler"));
 }
 
-/** 按参考仓库的四列网格绘制机械手、腔室、Load Lock 与装载端口。 */
+/** 按物理拓扑绘制设备；布局约定见 D:/ct-scheduler-docs/pages/platform/09-topology-robot-layout.md。 */
 export function renderEquipmentTopology(
   snapshot: WorkspaceSnapshot,
   decision: DecisionTraceStep | null,
   hiddenFilters?: ReadonlySet<string>,
   device?: DeviceDefinition | null,
 ): string {
-  const visibleModules = snapshot.modules.filter(module => (
+  const layout = device ? detectDeviceTopologyLayout(device) : detectTopologyLayout(snapshot.modules, snapshot.robots.length);
+  const projection = projectTopologyTransfers(snapshot, device);
+  const visibleModules = projection.modules.filter(module => (
     !isTopologyHiddenModule(module) && !isModuleFilteredOut(module, hiddenFilters)
   ));
   const groups = topologyGroups(visibleModules);
@@ -3199,9 +3228,6 @@ export function renderEquipmentTopology(
   ));
   const atmosphereNames = new Set(atmosphereRobots.map(robot => robot.name));
   const vacuumRobots = snapshot.robots.filter(robot => !atmosphereNames.has(robot.name));
-  const layout = device
-    ? detectDeviceTopologyLayout(device)
-    : detectTopologyLayout(visibleModules, snapshot.robots.length);
   const machineFrames = TOPOLOGY_MACHINE_FRAMES[layout].map(frame => ({ ...frame }));
   /* 双腔布局把 MultiProcessChamber 拆成独立腔室卡片，占满单腔 6 腔室 U 形布局。 */
   const processChamberViews = layout === "dual"
@@ -3340,10 +3366,35 @@ export function renderEquipmentTopology(
     robots: RobotSnapshot[],
     environment: "vacuum" | "atmosphere",
   ): string => robots.map(robot => {
-    const position = robotPositions.get(robot.name);
-    if (!position) return "";
+    const originalPosition = robotPositions.get(robot.name);
+    if (!originalPosition) return "";
+    const position = { ...originalPosition };
+    // 大气机械手先沿水平轨道到达目标正上/下方，真空手仍固定在框架中心。
+    if (environment === "atmosphere" && robot.railMotion?.target) {
+      const motion = robot.railMotion;
+      const source = modulePositions.get(motion.source);
+      const destination = modulePositions.get(motion.target);
+      const sourceX = source?.fixedLeftOffsetPixels ?? (source ? (source.leftPercent - 50) / 100 * TOPOLOGY_VIEWBOX_WIDTH : 0);
+      const destinationX = destination?.fixedLeftOffsetPixels ?? (destination ? (destination.leftPercent - 50) / 100 * TOPOLOGY_VIEWBOX_WIDTH : sourceX);
+      const progress = motion.progress * motion.progress * (3 - 2 * motion.progress);
+      const offset = sourceX + (destinationX - sourceX) * progress;
+      position.fixedLeftOffsetPixels = offset;
+      position.leftPercent = 50 + offset / TOPOLOGY_VIEWBOX_WIDTH * 100;
+    }
+    const activeMove = snapshot.activeMoves.find(move => move.ModuleName === robot.name);
+    const transferring = activeMove && (PICK_MOVE_TYPES.has(activeMove.MoveType) || PLACE_MOVE_TYPES.has(activeMove.MoveType) || activeMove.MoveType === SWAP_MOVE);
     const target = robot.target || decisionTargetForRobot(robot, decision);
-    const targetPosition = robotTargetTopologyPosition(robot, target, modulePositions);
+    // 双腔双片访问 LoadLock 时，LC/LD 的画布入口统一落到内侧 LA/LB，业务站名不变。
+    const pairedLoadLock = (station: string): boolean => layout === "dual" && environment === "vacuum"
+      && /^(LA|LB|LC|LD)$/i.test(station) && Boolean(activeMove)
+      && ["RobotSlotList", "RecvSlotList", "SendSlotList"].some(field => listValue(activeMove?.[field]).length >= 2);
+    const transferPosition = (station: string): TopologyPosition | undefined => pairedLoadLock(station)
+      ? robotTargetTopologyPosition(robot, "LA", modulePositions) : modulePositions.get(station);
+
+    // 取放必须深入真实目标腔室，不能沿用转位预览中 LA/LB 的公共中点。
+    const targetPosition = transferring
+      ? transferPosition(target)
+      : robotTargetTopologyPosition(robot, target, modulePositions);
     const targetAngle = targetPosition
       ? Math.atan2(
           targetPosition.topPixels - position.topPixels,
@@ -3365,10 +3416,43 @@ export function renderEquipmentTopology(
       }
     }
     const angleDegrees = armAngle * 180 / Math.PI;
+    const distance = targetPosition ? Math.hypot(
+      targetPosition.topPixels - position.topPixels,
+      (targetPosition.leftPercent - position.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH,
+    ) : 0;
+    const mechanism = renderParallelRobotArms(projection.animations.get(robot.name) ?? [], distance,
+      wafer => `<span class="robot-held-wafer robot-held-wafer-0">${renderWaferToken(wafer, snapshot.waferOrigins[wafer] ?? "", 0,
+        robot.processedWafers.includes(wafer) || snapshot.modules.some(module => module.processedWafers.includes(wafer)))}</span>`, escapeHtml,
+      station => {
+        const target = transferPosition(station);
+        if (!target) return undefined;
+        const dx = (target.leftPercent - position.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH;
+        const dy = target.topPixels - position.topPixels;
+        const firstChamber = modulePositions.get(pairedLoadLock(station) ? "LA" : `${station}-1`);
+        const secondChamber = modulePositions.get(pairedLoadLock(station) ? "LB" : `${station}-2`);
+        const targetRadians = Math.atan2(dy, dx);
+        const slotSpacing = firstChamber && secondChamber
+          ? -(secondChamber.leftPercent - firstChamber.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH * Math.sin(targetRadians)
+            + (secondChamber.topPixels - firstChamber.topPixels) * Math.cos(targetRadians)
+          : undefined;
+        return { distance: Math.hypot(dx, dy), angle: targetRadians * 180 / Math.PI - angleDegrees, slotSpacing };
+      }, [...processChamberViews.map(item => item.view), ...groups.loadLocks, ...groups.loadPorts, ...groups.auxiliaryModules]
+        .filter(module => module.wafers.length > 0).flatMap(module => {
+        const location = modulePositions.get(module.name);
+        if (!location) return [];
+        const dx = (location.leftPercent - position.leftPercent) / 100 * TOPOLOGY_VIEWBOX_WIDTH;
+        const dy = location.topPixels - position.topPixels;
+        const type = module.type.toLowerCase();
+        const radius = type.includes("loadport") || type.includes("dummyport") ? TOPOLOGY_WAFER_OCCLUSION_RADII.port
+          : type.includes("loadlock") ? TOPOLOGY_WAFER_OCCLUSION_RADII.lock
+          : type.includes("cooler") ? TOPOLOGY_WAFER_OCCLUSION_RADII.cooler
+          : type.includes("aligner") ? TOPOLOGY_WAFER_OCCLUSION_RADII.aligner : TOPOLOGY_WAFER_OCCLUSION_RADII.process;
+        return [{ x: dx * Math.cos(armAngle) + dy * Math.sin(armAngle), y: -dx * Math.sin(armAngle) + dy * Math.cos(armAngle), radius }];
+      }), robot.name, environment === "atmosphere" ? "telescopic" : "articulated", layout === "dual" && environment === "vacuum");
     const fixedLeft = position.fixedLeftOffsetPixels === undefined
       ? ""
       : `;--fixed-left:calc(50% ${position.fixedLeftOffsetPixels < 0 ? "-" : "+"} ${Math.abs(position.fixedLeftOffsetPixels)}px)`;
-    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px${fixedLeft}">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees)}</div>`;
+    return `<div class="reference-robot-position" style="--robot-left:${position.leftPercent}%;--robot-top:${position.topPixels}px${fixedLeft}">${renderRobotHub(robot, snapshot.waferOrigins, environment, angleDegrees, mechanism)}</div>`;
   }).join("");
   const robotMarkup = renderRobotGroup(vacuumRobots, "vacuum")
     + renderRobotGroup(atmosphereRobots, "atmosphere");
@@ -3385,6 +3469,7 @@ export function renderEquipmentTopology(
         </div>
         ${machineAreaMarkup}
         ${machineFrameMarkup}
+        ${atmosphereRobots.length ? `<div class="topology-atmosphere-rail" aria-label="大气机械手轨道" style="top:${atmosphereFrame.centerTopPixels}px;width:${atmosphereFrame.widthPixels - TOPOLOGY_ATMOSPHERE_INTERIOR_INSET * 2}px"></div>` : ""}
         ${attachmentPointMarkup}
         ${moduleMarkup}
         ${robotMarkup}
@@ -3431,9 +3516,9 @@ function formatActionEndpoint(name: string, slot: number): string {
 /** 生成 Pick(1) LP1#1 → ATR#1 形式的动作路径。 */
 function formatActionPath(action: ReplayActionDiagnostic): string {
   const kindLabels = { pick: "Pick", place: "Place", swap: "Swap" };
-  const materialId = action.materialIds[0] || "";
+  const materialIds = action.materialIds.filter(Boolean).join(",");
   const kindLabel = kindLabels[action.kind];
-  const prefix = materialId ? `${kindLabel}(${materialId})` : kindLabel;
+  const prefix = materialIds ? `${kindLabel}(${materialIds})` : kindLabel;
   const source = formatActionEndpoint(action.source, action.sourceSlot);
   const destination = formatActionEndpoint(action.destination, action.destinationSlot);
   const path = [source, destination].filter(Boolean).join(" → ");
@@ -3598,35 +3683,22 @@ export function groupedBottleneckResources(
 /** 渲染合并后的瓶颈分析区域：候选排序 + 各资源占用比例。 */
 function renderBottleneckAnalysis(performance: SchedulePerformance): string {
   const { window } = performance;
-  const confidenceLabels = { high: "证据较强", medium: "证据中等", low: "证据较弱" };
-  const resourceKindLabels: Record<ResourceKind, string> = {
-    robot: "机械手",
-    process: "工艺腔",
-    loadlock: "LoadLock",
-    loadport: "LoadPort",
-    auxiliary: "辅助模块",
-  };
 
   // 表格聚焦最需要优先处理的三个资源；完整分组结果仍保留给既有数据逻辑使用。
   const displayedResources = groupedBottleneckResources(performance).slice(0, 3);
   const resourceRows = (items: BottleneckResourceGroup[]): string => items.map((resource, index) => {
     const candidate = resource.candidate;
     const evidenceScore = candidate ? Math.round(candidate.score * 100) : null;
-    const evidenceLabel = candidate ? confidenceLabels[candidate.confidence] : "未入选候选";
-    const resourceLabel = resource.memberNames.length > 1
-      ? `${resourceKindLabels[resource.kind]} · ${resource.memberNames.length} 台平均`
-      : resourceKindLabels[resource.kind];
     return `
       <li class="resource-utilization-row">
         <div class="resource-utilization-summary">
           <div class="resource-utilization-name">
             <span>${index + 1}</span>
-            <div><strong>${escapeHtml(resource.name)}</strong><small>${escapeHtml(resourceLabel)}</small></div>
+            <div><strong>${escapeHtml(resource.name)}</strong></div>
           </div>
           <strong class="resource-utilization-percent">${formatPercent(resource.utilization)}</strong>
           <div class="utilization-track" aria-label="${escapeHtml(resource.name)} 占用率 ${formatPercent(resource.utilization)}">${renderCategoryBars(resource, window.duration)}</div>
-          <div class="resource-evidence-score"><strong>${evidenceScore ?? "—"}</strong><small>${evidenceLabel}</small></div>
-          <span aria-hidden="true"></span>
+          <div class="resource-evidence-score" aria-label="瓶颈证据得分 ${evidenceScore ?? "无候选分数"}"><strong>${evidenceScore ?? "—"}</strong></div>
         </div>
       </li>`;
   }).join("");
@@ -3777,8 +3849,10 @@ export function simplifyThroughputPoints(points: ThroughputTimelinePoint[]): Thr
 function renderThroughputSvg(
   points: ThroughputTimelinePoint[],
   title: string,
+  chartWidth = 760,
 ): string {
-  const width = 760;
+  if (!points.length) return '<div class="analysis-empty-state">当前时刻样本不足</div>';
+  const width = Math.max(240, chartWidth);
   const height = 174;
   const left = 12;
   const right = 12;
@@ -3814,7 +3888,8 @@ function renderThroughputSvg(
   const latest = displayPoints[displayPoints.length - 1];
   const yForValue = (value: number): number => top + (1 - (value - minimum) / yRange) * usableHeight;
   const meanY = yForValue(mean);
-  const labelStride = Math.max(1, Math.ceil(displayPoints.length / MAXIMUM_THROUGHPUT_VALUE_LABELS));
+  const labelCapacity = Math.min(MAXIMUM_THROUGHPUT_VALUE_LABELS, Math.max(3, Math.floor(width / 60)));
+  const labelStride = Math.max(1, Math.ceil(displayPoints.length / labelCapacity));
   const pointTargets = displayPoints.map((point, index) => {
     const coordinate = coordinates[index];
     const value = values[index];
@@ -3867,7 +3942,7 @@ export function updateThroughputChartRange(chart: HTMLElement, range: string): v
   const points = filterThroughputPoints(JSON.parse(rawPoints) as ThroughputTimelinePoint[], range);
   const canvas = chart.querySelector<HTMLElement>(".throughput-chart-canvas");
   if (!canvas || !points.length) return;
-  canvas.innerHTML = renderThroughputSvg(points, title);
+  canvas.innerHTML = renderThroughputSvg(points, title, canvas.clientWidth || 760);
 }
 
 /** 渲染从仿真零点累计或按用户选择的 2–10 片窗口计算的逐片产能趋势。 */
@@ -3918,7 +3993,7 @@ export function renderThroughputChart(performance: SchedulePerformance): string 
       <div class="analysis-section-title"><strong>产能分析</strong></div>
       <div class="analysis-filter-group">
       <label class="analysis-filter throughput-metric-control"><select id="throughputMetricSelect" aria-label="选择产能口径">
-        <option value="cumulative">累计产能（公司口径）</option>
+        <option value="cumulative">累计产能（从 0 开始）</option>
         <option value="rolling" selected>滑动窗口</option>
       </select></label>
       <label class="analysis-filter throughput-window-control" data-throughput-window-control><select id="throughputWindowSize" aria-label="滑动窗口大小">${windowOptions.map(windowSize => `<option value="${windowSize}"${windowSize === defaultWindow ? " selected" : ""}>${windowSize} 片</option>`).join("")}</select></label>
@@ -3978,15 +4053,15 @@ export function renderSchedulePerformance(performance: SchedulePerformance): str
       </div>
     </section>
 
-    <section class="result-card throughput-analysis-card">
+    <section class="analysis-window throughput-analysis-card" data-analysis-window="throughput">
       ${renderThroughputChart(performance)}
     </section>
 
-    <section class="result-card bottleneck-analysis-card">
+    <section class="analysis-window bottleneck-analysis-card" data-analysis-window="bottleneck">
       ${renderBottleneckAnalysis(performance)}
     </section>
 
-    <section class="result-card wafer-residence-card">
+    <section class="analysis-window wafer-residence-card" data-analysis-window="residence">
       ${renderWaferResidenceChart(performance)}
     </section>
 
@@ -4003,6 +4078,8 @@ export class VisualizationWorkspace {
   private moves: MoveRecord[] = [];
   private loadPortReplenishments: LoadPortReplenishment[] = [];
   private replayPlan: Record<string, any> | null = null;
+  private actionsEnabled = false;
+  private waferProgressEnabled = false;
   private actionStatusFilters: ActionDiagnosticStatus[] = [...ALL_ACTION_DIAGNOSTIC_STATUSES];
   private liveDecision: DecisionTraceStep | null = null;
   private liveDecisionKey = "";
@@ -4037,8 +4114,23 @@ export class VisualizationWorkspace {
       .map(item => item.value as ActionDiagnosticStatus);
     if (selectedFilters.length) this.actionStatusFilters = selectedFilters;
     this.bindEvents();
+    const inspectorDock = root.querySelector<HTMLElement>(".replay-inspector-dock");
+    if (inspectorDock) mountReplayInspectorDock(inspectorDock);
     this.updatePlayButton();
     this.setTopologyVisible(false);
+  }
+
+  /** 按设备类型设置原始画布尺寸，固定 100% 比例；外层负责居中与页面滚动。 */
+  private configureTopologyCanvas(): void {
+    const canvas = this.elements.stage.closest<HTMLElement>(".topology-unified-canvas");
+    if (!canvas) return;
+    const slotOverviewWidth = 180;
+    const compactMachineWidth = 700;
+    const layout = this.elements.stage.querySelector<HTMLElement>(".equipment-schematic")?.dataset.topologyLayout;
+    const machineWidth = layout === "dual" ? TOPOLOGY_VIEWBOX_WIDTH : compactMachineWidth;
+    const fullCanvasWidth = slotOverviewWidth + machineWidth;
+    canvas.style.width = `${fullCanvasWidth}px`;
+    canvas.style.gridTemplateColumns = `${slotOverviewWidth}px ${machineWidth}px`;
   }
 
   /** 更新当前设备拓扑；已有 MoveList 会立即按新拓扑重绘。 */
@@ -4106,7 +4198,11 @@ export class VisualizationWorkspace {
         if (replayContext && typeof replayContext === "object" && !Array.isArray(replayContext)) {
           const embeddedPlan = (replayContext as UnknownRecord).plan;
           if (embeddedPlan && typeof embeddedPlan === "object" && !Array.isArray(embeddedPlan)) {
-            this.setReplayPlan(embeddedPlan as Record<string, any>);
+            const plan = embeddedPlan as Record<string, any>;
+            this.device = plan.device || this.device;
+            this.analysisRoutes = structuredClone(plan.routes || []);
+            this.analysisRounds = structuredClone(plan.rounds || []);
+            this.setReplayPlan(plan);
           }
         }
       }
@@ -4147,6 +4243,9 @@ export class VisualizationWorkspace {
     this.liveDecisionKey = "";
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     this.replayDecisionRequestVersion += 1;
+    if (this.elements.exportDiagnosticButton) {
+      this.elements.exportDiagnosticButton.disabled = !this.replayPlan || !this.moves.length;
+    }
     if (this.moves.length) this.render();
   }
 
@@ -4176,6 +4275,7 @@ export class VisualizationWorkspace {
     this.elements.playButton.disabled = true;
     this.elements.openGantt.href = "#";
     this.elements.openGantt.setAttribute("aria-disabled", "true");
+    if (this.elements.exportDiagnosticButton) this.elements.exportDiagnosticButton.disabled = true;
     this.showSingleResult();
     this.setTopologyVisible(true);
     this.render(buildWorkspaceSnapshot([], this.device, 0));
@@ -4191,6 +4291,9 @@ export class VisualizationWorkspace {
     const previousTime = this.time;
     this.pause();
     this.moves = normalizeMovePayload({ MoveList: rawMoves });
+    if (this.elements.exportDiagnosticButton) {
+      this.elements.exportDiagnosticButton.disabled = !this.replayPlan;
+    }
     this.primitiveDecisionBoundaries = primitiveDecisionBoundaryTimes(this.moves);
     const latestSnapshot = buildWorkspaceSnapshot(
       this.moves,
@@ -4244,12 +4347,9 @@ export class VisualizationWorkspace {
     return detectTerminalPlaybackDeadlock(this.moves, this.device, this.replayPlan);
   }
 
-  /** 切换到工作台标签。 */
+  /** 单次结果入口直接进入回放诊断；结果分析页仅用于测试组报告。 */
   show(): void {
-    if (this.moves.length) this.showSingleResult();
-    const tab = this.root.querySelector<HTMLElement>('[data-tab-target="workspace"]');
-    tab?.click();
-    this.elements.performanceWindow.focus({ preventScroll: true });
+    this.showPlayback();
   }
 
   /** 显示测试组统计，并隐藏当前单例诊断；独立回放页保留已加载的数据。 */
@@ -4288,7 +4388,7 @@ export class VisualizationWorkspace {
     this.bottleneckSummary = null;
     this.analysisRequestVersion += 1;
     this.time = 0;
-    this.elements.resultButton.disabled = true;
+    if (this.elements.resultButton) this.elements.resultButton.disabled = true;
     this.elements.range.disabled = false;
     this.elements.playButton.disabled = false;
     this.elements.openGantt.href = "#";
@@ -4304,7 +4404,7 @@ export class VisualizationWorkspace {
     this.elements.empty.innerHTML = `
       <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="3"/><path d="M8 9h8M8 13h5"/></svg>
       <strong>等待分析数据</strong>
-      <span>运行一次计划，或在拓扑回放界面导入已有的 MoveList JSON 文件后查看结果分析。</span>`;
+      <span>批量运行测试组后，在结果预览中选择“测试组结果分析”。单次测试请使用回放诊断。</span>`;
     this.elements.playbackEmpty.classList.remove("is-loading", "is-error");
     this.elements.playbackEmpty.innerHTML = `
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="m7 7.3 2.8 2.8M17 7.3l-2.8 2.8M7 16.7l2.8-2.8M17 16.7l-2.8-2.8"/></svg>
@@ -4355,7 +4455,10 @@ export class VisualizationWorkspace {
       ? `/movelist_gantt_viewer.html?src=${encodeURIComponent(resultUrl)}`
       : "#";
     this.elements.openGantt.setAttribute("aria-disabled", resultUrl ? "false" : "true");
-    this.elements.resultButton.disabled = false;
+    if (this.elements.exportDiagnosticButton) {
+      this.elements.exportDiagnosticButton.disabled = !this.replayPlan;
+    }
+    if (this.elements.resultButton) this.elements.resultButton.disabled = false;
     this.showSingleResult();
     this.setTopologyVisible(true);
     this.render(snapshot);
@@ -4364,7 +4467,23 @@ export class VisualizationWorkspace {
 
   /** 绑定文件、时间轴、播放和快捷控制事件。 */
   private bindEvents(): void {
+    this.elements.performance.addEventListener("change", () => {
+      updateReplayThroughput(this.root, this.time, updateThroughputChartRange);
+    });
+    this.root.getElementById("visualWaferProgressEnabled")?.addEventListener("change", event => {
+      this.waferProgressEnabled = (event.target as HTMLInputElement).checked;
+      this.render();
+    });
+    this.root.getElementById("visualActionsEnabled")?.addEventListener("change", event => {
+      this.actionsEnabled = (event.target as HTMLInputElement).checked;
+      this.replayDecisionRequestVersion += 1;
+      this.pendingReplayDecisionKeys.clear();
+      this.render();
+    });
     this.elements.importButton?.addEventListener("click", () => this.elements.fileInput.click());
+    this.elements.exportDiagnosticButton?.addEventListener("click", () => {
+      void this.exportDeadlockDiagnostic();
+    });
     this.elements.fileInput.addEventListener("change", () => {
       const file = this.elements.fileInput.files?.item(0);
       if (!file) return;
@@ -4393,10 +4512,46 @@ export class VisualizationWorkspace {
       this.performanceWindowMode = this.elements.performanceWindow.value === "full" ? "full" : "steady";
       void this.renderPerformance();
     });
-    this.elements.resultButton.addEventListener("click", () => this.show());
+    this.elements.resultButton?.addEventListener("click", () => this.show());
     this.elements.openGantt.addEventListener("click", event => {
       if (this.elements.openGantt.getAttribute("aria-disabled") === "true") event.preventDefault();
     });
+  }
+
+  /** 导出当前回放帧及算法候选动作，供离线复现死锁。 */
+  private async exportDeadlockDiagnostic(): Promise<void> {
+    if (!this.moves.length || !this.replayPlan) {
+      this.showError("当前 MoveList 缺少完整计划，无法重建 Machine 诊断上下文");
+      return;
+    }
+    const button = this.elements.exportDiagnosticButton;
+    if (button) button.disabled = true;
+    try {
+      const snapshot = buildWorkspaceSnapshot(
+        this.moves,
+        this.device,
+        this.time,
+        this.loadPortReplenishments,
+      );
+      const result = await requestDeadlockDiagnostic({
+        resultId: this.analysisResultId || undefined,
+        moves: this.analysisResultId ? undefined : this.moves,
+        plan: this.analysisResultId ? undefined : this.replayPlan,
+        time: this.time,
+        includeActions: this.actionsEnabled,
+        snapshot: snapshot as unknown as Record<string, any>,
+      });
+      const downloadUrl = URL.createObjectURL(result.blob);
+      const link = this.root.createElement("a");
+      link.href = downloadUrl;
+      link.download = result.fileName;
+      link.click();
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      this.showError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (button) button.disabled = false;
+    }
   }
 
   /** 从当前时间开始播放；到达末尾时自动回到起点。 */
@@ -4452,12 +4607,10 @@ export class VisualizationWorkspace {
     this.elements.playButton.classList.toggle("is-playing", this.playing);
   }
 
-  /** 切换单例分析模式，测试组统计与单例诊断不会同时出现。 */
+  /** 单次结果只更新回放，不改变首页已经生成的批量报告。 */
   private showSingleResult(): void {
     this.elements.toolbar.hidden = false;
-    this.elements.groupAnalysis.hidden = true;
-    this.elements.empty.hidden = true;
-    this.elements.content.hidden = false;
+    this.elements.content.hidden = true;
     this.elements.playbackEmpty.hidden = true;
   }
 
@@ -4496,10 +4649,11 @@ export class VisualizationWorkspace {
       this.liveDecision = cachedDecision;
       this.liveDecisionKey = replayKey;
     }
-    const currentDecision = cachedDecision
-      ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null);
+    const currentDecision = this.actionsEnabled ? (cachedDecision
+      ?? (this.liveDecisionKey === replayKey ? this.liveDecision : null)) : null;
     if (
-      this.replayPlan
+      this.actionsEnabled
+      && this.replayPlan
       && !this.liveSolving
       && !cachedDecision
       && this.liveDecisionKey !== replayKey
@@ -4524,16 +4678,31 @@ export class VisualizationWorkspace {
     this.elements.frontSlotOverview.innerHTML = renderFrontSlotOverview(
       topologySnapshot.modules,
       topologySnapshot.waferOrigins,
+      topologySnapshot.robots,
+      this.device ? detectDeviceTopologyLayout(this.device) : detectTopologyLayout(topologySnapshot.modules, topologySnapshot.robots.length),
+      this.device,
     );
+    this.configureTopologyCanvas();
     const requestState = this.pendingReplayDecisionKeys.has(replayKey)
       ? "loading"
       : this.replayDecisionErrorKey === replayKey ? "error" : "idle";
-    this.elements.decisionLens.innerHTML = renderDecisionLens(
+    this.elements.decisionLens.innerHTML = !this.actionsEnabled ? "" : renderDecisionLens(
       currentDecision,
       requestState,
       this.replayDecisionErrorMessage,
       this.actionStatusFilters,
     );
+
+    const progressPanel = this.root.getElementById("visualWaferProgress");
+    if (progressPanel) {
+      progressPanel.hidden = !this.waferProgressEnabled;
+      updateWaferProgressPanel(progressPanel, this.waferProgressEnabled
+        ? renderWaferDispatchProgress(this.moves, snapshot, this.device,
+          job => routeByPJobName(this.replayPlan, job)) : "");
+    }
+    const filters = this.root.querySelector<HTMLElement>(".action-filter-controls");
+    if (filters) filters.hidden = !this.actionsEnabled;
+    if (this.analysis) updateReplayThroughput(this.root, this.time, updateThroughputChartRange);
 
     this.elements.activeMoves.innerHTML = snapshot.activeMoves.length
       ? snapshot.activeMoves.map(move => `
@@ -4613,6 +4782,11 @@ export class VisualizationWorkspace {
   private async renderPerformance(): Promise<void> {
     if (!this.moves.length) return;
     const requestVersion = ++this.analysisRequestVersion;
+    this.analysis = null;
+    for (const id of ["visualReplayKpis"]) {
+      const container = this.root.getElementById(id);
+      if (container) container.textContent = "正在计算指标…";
+    }
     this.elements.performance.innerHTML = `
       <section class="result-card analysis-skeleton" aria-label="正在加载结果分析">
         <div class="analysis-skeleton-head"><i></i><span></span></div>
@@ -4635,6 +4809,26 @@ export class VisualizationWorkspace {
       this.analysis = analysis;
       this.bottleneckSummary = result.bottleneck;
       this.elements.performance.innerHTML = renderSchedulePerformance(analysis);
+      const overview = this.elements.performance.querySelector<HTMLElement>(".overview-card");
+      const kpis = this.root.getElementById("visualReplayKpis");
+      if (overview) {
+        if (kpis) {
+          kpis.innerHTML = overview.outerHTML;
+          const labels = kpis.querySelectorAll<HTMLElement>(".performance-kpi-label > span:first-child");
+          ["产能 · 截至当前", "平均重算 · 整次", "瓶颈利用率 · 统计窗", "LoadLock 效率 · 整次"].forEach((label, index) => {
+            if (labels[index]) labels[index].textContent = label;
+          });
+          const help = kpis.querySelector<HTMLElement>(".is-primary .performance-kpi-help");
+          if (help) {
+            help.setAttribute("aria-label", "截至回放时刻的产能，与下方趋势图所选口径一致；样本不足时不显示数值");
+            const tooltip = help.querySelector<HTMLElement>(".performance-kpi-tooltip");
+            if (tooltip) tooltip.textContent = help.getAttribute("aria-label");
+          }
+        }
+        overview.remove();
+      }
+      mountAnalysisWorkspace(this.elements.performance, updateThroughputChartRange);
+      updateReplayThroughput(this.root, this.time, updateThroughputChartRange);
       const windowSlot = this.elements.performance.querySelector(".bottleneck-window-slot");
       if (windowSlot) {
         this.elements.performanceWindow.tabIndex = 0;
@@ -4647,6 +4841,10 @@ export class VisualizationWorkspace {
       if (requestVersion !== this.analysisRequestVersion) return;
       this.analysis = null;
       this.bottleneckSummary = null;
+      for (const id of ["visualReplayKpis"]) {
+        const container = this.root.getElementById(id);
+        if (container) container.textContent = "指标计算失败，请在下方分析区重新加载";
+      }
       this.elements.performance.innerHTML = `
         <div class="analysis-error-state">
           <strong>数据获取失败</strong>
@@ -4664,18 +4862,13 @@ export class VisualizationWorkspace {
     this.pause();
     this.setTopologyVisible(false);
     this.elements.toolbar.hidden = false;
-    this.elements.groupAnalysis.hidden = true;
     this.elements.content.hidden = true;
-    this.elements.empty.hidden = false;
     this.elements.playbackEmpty.hidden = false;
-    this.elements.empty.classList.toggle("is-loading", loading);
     this.elements.playbackEmpty.classList.toggle("is-loading", loading);
-    this.elements.empty.classList.remove("is-error");
     this.elements.playbackEmpty.classList.remove("is-error");
     const loadingMarkup = loading
       ? `<span class="visual-loader" aria-hidden="true"></span><strong>${escapeHtml(message)}</strong>`
       : `<strong>${escapeHtml(message)}</strong>`;
-    this.elements.empty.innerHTML = loadingMarkup;
     this.elements.playbackEmpty.innerHTML = loadingMarkup;
   }
 
@@ -4684,21 +4877,16 @@ export class VisualizationWorkspace {
     this.pause();
     this.setTopologyVisible(false);
     this.elements.toolbar.hidden = false;
-    this.elements.groupAnalysis.hidden = true;
     this.elements.content.hidden = true;
-    this.elements.empty.hidden = false;
     this.elements.playbackEmpty.hidden = false;
-    this.elements.empty.classList.remove("is-loading");
     this.elements.playbackEmpty.classList.remove("is-loading");
-    this.elements.empty.classList.add("is-error");
     this.elements.playbackEmpty.classList.add("is-error");
     const errorMarkup = `
       <strong>无法加载 MoveList</strong>
       <span>${escapeHtml(message)}</span>
       <label class="btn visual-import-button">${icon("upload")}重新选择文件<input type="file" accept=".json,application/json" data-visual-retry></label>`;
-    this.elements.empty.innerHTML = errorMarkup;
     this.elements.playbackEmpty.innerHTML = errorMarkup;
-    [this.elements.empty, this.elements.playbackEmpty].forEach(container => {
+    [this.elements.playbackEmpty].forEach(container => {
       const retryInput = container.querySelector<HTMLInputElement>("[data-visual-retry]");
       retryInput?.addEventListener("change", () => {
         const file = retryInput.files?.item(0);

@@ -131,21 +131,27 @@ def test_module_parallel_same_time_order_is_deterministic() -> None:
     assert events == [("start", 3), ("start", 2), ("finish", 3), ("start", 4), ("finish", 2), ("finish", 4)]
 
 
-def test_batch_plan_defaults_to_hongye_and_compatibility() -> None:
-    """批量计划默认打开 HongYe Check 与兼容模式。"""
+def test_batch_plan_defaults_to_hongye_without_time_fluctuation() -> None:
+    """批量计划默认保留校验，波动独立且默认关闭，不再输出兼容开关。"""
     device = {"name": "test", "device": {"Robots": {}, "Stations": {}}, "routes": [], "cleans": []}
     plan = build_workspace_batch_plan(device, {"rounds": [], "options": {}}, "heuristic", {})
     assert plan["hongYeCheck"] is True
-    assert plan["compatibilityMode"] is True
+    assert "compatibilityMode" not in plan
+    assert plan["executionTimingEnabled"] is False
 
 
-def test_frontend_moves_run_options_into_settings_dialog() -> None:
-    """开始运行区只保留设置按钮，运行与批量并发选项位于可访问 dialog。"""
+def test_frontend_merges_run_actions_with_strategy_and_restores_settings_dialog() -> None:
+    """开始运行应与策略合并，运行设置恢复为齿轮触发的弹窗。"""
     template = (ROOT / "realtime_scheduler" / "frontend" / "config_editor.html").read_text(encoding="utf-8")
+    sidebar = template.split('<aside class="side" id="scheduleSide">', 1)[1].split("</aside>", 1)[0]
+    assert 'id="runSettingsFields"' not in template
+    assert 'class="panel run-launch-panel"' not in template
+    assert sidebar.index("运行策略") < sidebar.index("开始运行")
+    assert 'id="algorithmHoverInfo"' not in sidebar
     assert 'id="openRunSettingsButton"' in template
     assert 'id="runSettingsDialog"' in template
-    assert 'id="compatibilityModeInput" type="checkbox" checked' in template
-    assert "模块并行推进；按 PreMoveID 延后动作，并自动补齐开关门动作。" in template
+    assert 'id="compatibilityModeInput"' not in template
+    assert 'id="executionTimingEnabledInput" type="checkbox"' in template
     assert "HongYe Check <em>推荐</em>" in template
     assert "不计算 Heuristic 性能基线" in template
     assert 'id="skipValidationInput"' not in template
@@ -153,6 +159,7 @@ def test_frontend_moves_run_options_into_settings_dialog() -> None:
     assert 'id="batchParallelismInput" class="run-setting-number" type="number" min="1" max="30"' in template
     assert 'id="validationParallelismInput"' in template
     assert 'id="validationParallelismInput" class="run-setting-number" type="number" min="1" max="15"' in template
+    assert "每路约占" in template
     assert 'id="cleanValidationWaccleanInput" type="checkbox" checked' in template
     assert "取消勾选后仅忽略该类型的触发时机和次数" in template
     assert "HongYe 校验共享配额" in template
