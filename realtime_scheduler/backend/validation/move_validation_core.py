@@ -1673,10 +1673,10 @@ def _apply_omitted_zero_duration_process(
 ) -> None:
     """为当前腔室内可证明的零时长驻片补齐已加工状态。
 
-    双腔必须两槽同时完成：只有全部未加工驻片都能证明为零时长，才一起补齐。
-    单腔仍按片补齐。库存站和 LoadLock 不走产品 Process 语义。
+    只允许双腔 PM 省略逻辑层的零时长 ProcessMove，并且必须两槽同时完成。
+    Aligner 即使逻辑 Route 时长为零，也必须保留物理解包生成的显式校准动作。
     """
-    if station.is_load_lock or station.completes_material_on_place:
+    if not _is_paired_process_chamber(station):
         return
     unprocessed = [
         slot
@@ -1685,18 +1685,13 @@ def _apply_omitted_zero_duration_process(
     ]
     if not unprocessed:
         return
-    if _is_paired_process_chamber(station):
-        if not all(
-            _is_omitted_zero_duration_process(state, station.name, slot.material)
-            for slot in unprocessed
-        ):
-            return
-        for slot in unprocessed:
-            _finish_omitted_zero_duration_slot(state, station.name, slot)
+    if not all(
+        _is_omitted_zero_duration_process(state, station.name, slot.material)
+        for slot in unprocessed
+    ):
         return
     for slot in unprocessed:
-        if _is_omitted_zero_duration_process(state, station.name, slot.material):
-            _finish_omitted_zero_duration_slot(state, station.name, slot)
+        _finish_omitted_zero_duration_slot(state, station.name, slot)
 
 
 def _zero_duration_environment_transitions(
@@ -2321,11 +2316,19 @@ def _start_process(state: MachineState, move: Mapping[str, Any], end_time: float
                 for name in _values(move, "PJobName")
                 if str(name).strip()
             }
+            pjob_scoped_wac = state.uses_pjob_scoped_wac(station)
             for pending_key in list(state.pending_wac_obligations):
                 if (
                     pending_key[0] == station.name
                     and pending_key[3] == clean_task_name
-                    and (not selected_pjobs or pending_key[1] in selected_pjobs)
+                    # 单腔 WAC 周期按 PJob 隔离；双腔/多槽 PM 使用物理腔室
+                    # 全局周期，一次合法清洁必须清除同任务的全部待办，不能因
+                    # Clean Move 携带了另一个 PJobName 留下幽灵义务。
+                    and (
+                        not pjob_scoped_wac
+                        or not selected_pjobs
+                        or pending_key[1] in selected_pjobs
+                    )
                 ):
                     state.pending_wac_obligations.discard(pending_key)
             for variable_name in state.clean_task_state_variables.get(
