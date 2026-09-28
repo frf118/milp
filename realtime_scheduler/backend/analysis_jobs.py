@@ -32,13 +32,18 @@ MAXIMUM_TIME_BUDGET_SECONDS = 600
 SUPPORTED_METRIC_GROUPS = frozenset({
     "basic", "throughput", "residence", "resources", "bottleneck", "loadlock",
 })
+METRIC_ID_ALIASES = {
+    "company_capacity_improvement": "company_capacity_ratio",
+}
+REMOVED_METRIC_IDS = frozenset({"baseline_improvement"})
 METRIC_GROUP_BY_ID = {
     "validation": "basic",
     "makespan": "basic",
-    "baseline_improvement": "basic",
     "cpu_time": "basic",
     "average_recompute_time": "basic",
     "throughput": "throughput",
+    "company_capacity_baseline": "basic",
+    "company_capacity_ratio": "throughput",
     "departure_interval_cv": "throughput",
     "process_chamber_dwell": "residence",
     "robot_wafer_dwell": "residence",
@@ -149,11 +154,17 @@ def create_test_group_analysis_job(payload: Mapping[str, Any]) -> Dict[str, Any]
     if raw_metric_ids is not None:
         if not isinstance(raw_metric_ids, list) or not all(isinstance(item, str) for item in raw_metric_ids):
             raise ValueError("metricIds 必须是字符串数组")
-        unknown_metric_ids = set(raw_metric_ids) - set(METRIC_GROUP_BY_ID)
+        normalized_metric_ids = []
+        for metric_id in raw_metric_ids:
+            if metric_id in REMOVED_METRIC_IDS:
+                continue
+            normalized_metric_ids.append(METRIC_ID_ALIASES.get(metric_id, metric_id))
+        unknown_metric_ids = set(normalized_metric_ids) - set(METRIC_GROUP_BY_ID)
         if unknown_metric_ids:
             raise ValueError(f"不支持的分析指标：{', '.join(sorted(unknown_metric_ids))}")
-        if not raw_metric_ids:
+        if not normalized_metric_ids:
             raise ValueError("请至少选择一个计算指标")
+        raw_metric_ids = normalized_metric_ids
         metric_groups = {METRIC_GROUP_BY_ID[metric_id] for metric_id in raw_metric_ids}
     else:
         metric_groups = set(payload.get("metricGroups") or ["basic"])
@@ -263,8 +274,8 @@ def _run_test_group_analysis_job(job_id: str) -> None:
                 key: case.get(key)
                 for key in (
                     "id", "name", "status", "validation", "makespan",
-                    "baselineMakespan", "cpuTimeMs", "elapsedTimeMs", "error",
-                    "comparisonKey",
+                    "baselineMakespan", "companyCapacityBaselineWph",
+                    "cpuTimeMs", "elapsedTimeMs", "error",
                 )
             }
             result_id = str(case.get("resultId") or "")
@@ -353,10 +364,7 @@ def _run_test_group_analysis_job(job_id: str) -> None:
         pending["analysisStatus"] = "timeout" if timed_out else "cancelled"
         pending["error"] = "超过分析时间预算" if timed_out else "用户已取消分析"
         results.append(pending)
-    summary = analyze_test_group_performance(
-        results,
-        str(payload.get("referenceCaseId") or ""),
-    )
+    summary = analyze_test_group_performance(results)
     summary["selectedMetricGroups"] = sorted(metric_groups)
     summary["selectedMetricIds"] = list(job["selectedMetricIds"])
     summary["cacheHitCount"] = cache_hits

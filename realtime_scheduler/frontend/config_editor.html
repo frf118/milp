@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>调度平台</title>
   <link rel="stylesheet" href="/assets/katex.min.css?v=1.4.4">
-  <link rel="stylesheet" href="/assets/config_editor.css?v=1.6.4">
-  <link rel="stylesheet" href="/assets/run_workspace.css?v=1.6.4">
+  <link rel="stylesheet" href="/assets/config_editor.css?v=1.6.10">
+  <link rel="stylesheet" href="/assets/run_workspace.css?v=1.6.10">
 </head>
 <body>
   <a class="skip-link" href="#mainContent">跳到主要内容</a>
@@ -40,7 +40,7 @@
       <div class="sidebar-footer">
         <span class="sidebar-footer-label">系统状态</span>
         <div class="service-pill" id="serviceState">本地服务</div>
-        <span class="frontend-version">V1.6.4</span>
+        <span class="frontend-version">V1.6.10</span>
       </div>
     </aside>
 
@@ -55,7 +55,7 @@
               </div>
             </div>
           </article>
-          <section class="batch-test-details" id="batchTestDetails" aria-live="polite" hidden></section>
+          <div class="run-preview-stack" id="runPreviewArea">
           <article class="panel result-panel" id="runResultsView">
             <div class="panel-head">
               <div class="result-view-tabs" role="tablist" aria-label="结果视图"><button class="result-view-tab active" id="resultPreviewViewButton" type="button" data-result-view="results" role="tab" aria-selected="true">结果预览</button><button class="result-view-tab" id="analysisReportViewButton" type="button" data-result-view="analysis" role="tab" aria-selected="false" disabled>分析报告</button></div>
@@ -75,6 +75,8 @@
               <div class="result-actions"><a class="btn batch-log-download" id="resultBatchLogButton" href="#" download aria-disabled="true">导出本批日志</a><a class="btn primary" id="batchGanttButton" href="#" target="_blank" aria-disabled="true">全部甘特图</a></div>
             </div>
           </article>
+          <section class="batch-test-details" id="batchTestDetails" aria-live="polite" hidden></section>
+          </div>
         <div id="runAnalysisView" hidden>
           <article class="visual-workbench">
             <section class="test-group-analysis" id="testGroupAnalysisPanel" hidden aria-live="polite"></section>
@@ -109,7 +111,7 @@
             <div class="catalog-toolbar">
               <div class="workspace-device-controls"><select id="deviceSelect" data-compact-label="设备" aria-label="设备"><option value="">尚未导入设备</option></select></div>
               <div class="workspace-control-row catalog-group-control"><select id="testGroupSelect" data-compact-label="测试组别" aria-label="测试组别"><option value="">尚无测试组</option></select><div class="workspace-icon-actions" aria-label="测试组别操作"><button class="btn workspace-icon-button" id="newGroupButton" type="button" title="新增组别" aria-label="新增组别" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button class="btn danger workspace-icon-button" id="deleteGroupButton" type="button" title="删除组别" aria-label="删除组别" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 11v5m4-5v5M9 7l1-2h4l1 2M7 7l1 13h8l1-13"/></svg></button><button class="btn workspace-icon-button" id="renameGroupButton" type="button" title="重命名组别" aria-label="重命名组别" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16.5V20h3.5L18 9.5 14.5 6 4 16.5zM13.5 7l3.5 3.5"/></svg></button></div></div>
-              <button class="btn primary catalog-new-test" id="newTestButton" type="button" disabled>＋ 新建测试</button>
+              <div class="catalog-primary-actions"><button class="btn" id="importCompanyBaselineButton" type="button">导入产能 Baseline</button><input id="companyBaselineFile" type="file" accept=".csv,text/csv" hidden><button class="btn primary catalog-new-test" id="newTestButton" type="button" disabled>＋ 新建测试</button></div>
               <div class="workspace-status sr-only" id="workspaceStatus" role="status" aria-live="polite"></div>
             </div>
           </article>
@@ -415,29 +417,29 @@
       <section class="analysis-options-page active" data-analysis-page="1">
         <div class="analysis-options-section-head"><strong>计算指标</strong><small>设置会保存为个人偏好</small></div>
         <div class="analysis-metric-options">
-          <label><input type="checkbox" checked value="validation" data-analysis-metric>校验结果</label>
-          <label><input type="checkbox" checked value="makespan" data-analysis-metric>Makespan</label>
-          <label><input type="checkbox" checked value="baseline_improvement" data-analysis-metric>相对 Baseline 改善</label>
-          <label><input type="checkbox" checked value="cpu_time" data-analysis-metric>CPU Time</label>
-          <label><input type="checkbox" checked value="average_recompute_time" data-analysis-metric>平均重算时间</label>
           <label><input type="checkbox" checked value="throughput" data-analysis-metric>产能</label>
+          <label><input type="checkbox" checked value="average_recompute_time" data-analysis-metric>平均重算时间</label>
+          <label><input type="checkbox" checked value="company_capacity_baseline" data-analysis-metric>产能基线</label>
+          <label><input type="checkbox" checked value="company_capacity_ratio" data-analysis-metric title="算法产能除以公司产能基线">产能比</label>
+          <label><input type="checkbox" checked value="bottleneck_candidates" data-analysis-metric>瓶颈</label>
+          <label><input type="checkbox" checked value="makespan" data-analysis-metric>Makespan</label>
+          <label><input type="checkbox" checked value="validation" data-analysis-metric>校验结果</label>
+          <label><input type="checkbox" checked value="cpu_time" data-analysis-metric>算法总耗时</label>
+          <label><input type="checkbox" checked value="resource_utilization" data-analysis-metric>资源利用率</label>
           <label><input type="checkbox" checked value="departure_interval_cv" data-analysis-metric>出站间隔 CV</label>
           <label><input type="checkbox" checked value="process_chamber_dwell" data-analysis-metric>加工腔驻留均值</label>
           <label><input type="checkbox" checked value="robot_wafer_dwell" data-analysis-metric>机器手驻留均值</label>
           <label><input type="checkbox" checked value="system_residence" data-analysis-metric>系统停留均值</label>
           <label><input type="checkbox" checked value="system_residence_cv" data-analysis-metric>系统停留 CV</label>
-          <label><input type="checkbox" checked value="resource_utilization" data-analysis-metric>资源利用率</label>
-          <label><input type="checkbox" checked value="bottleneck_candidates" data-analysis-metric>瓶颈候选</label>
           <label><input type="checkbox" checked value="loadlock_wafers_per_cycle" data-analysis-metric>LoadLock 每周期晶圆</label>
           <label><input type="checkbox" checked value="loadlock_full_cycle_ratio" data-analysis-metric>LoadLock 满载周期率</label>
           <label><input type="checkbox" checked value="loadlock_empty_cycle_ratio" data-analysis-metric>LoadLock 空载周期率</label>
         </div>
       </section>
       <section class="analysis-options-page" data-analysis-page="2" hidden>
-        <div class="analysis-options-section-head"><strong>参与对比的测试</strong><button class="text-button" id="analysisToggleAllTests" type="button">取消全选</button></div>
+        <div class="analysis-options-section-head"><strong>选择分析的测试</strong><button class="text-button" id="analysisToggleAllTests" type="button">取消全选</button></div>
         <div class="analysis-test-options" id="analysisTestOptions"></div>
         <div class="analysis-options-controls">
-          <label>参考测试<select id="analysisReferenceTest"></select></label>
           <label>统计窗口<select id="analysisWindowMode"><option value="steady">稳态窗口</option><option value="full">完整周期</option></select></label>
           <label>时间预算<select id="analysisTimeBudget"><option value="30">快速 · 30 秒</option><option value="120" selected>标准 · 2 分钟</option><option value="300">完整 · 5 分钟</option></select></label>
         </div>
@@ -783,7 +785,7 @@
     </aside>
   </dialog>
 
-  <script type="module" src="/assets/config_editor.js?v=1.6.4"></script>
+  <script type="module" src="/assets/config_editor.js?v=1.6.10"></script>
   <dialog id="testDraftDialog" aria-labelledby="testDraftTitle">
     <h2 id="testDraftTitle">测试有未保存的修改</h2><p>保存后再离开，或放弃本次修改。</p>
     <form method="dialog" class="editor-save-actions"><button class="btn" value="cancel" autofocus>继续编辑</button><button class="btn" value="discard">放弃修改</button><button class="btn primary" value="save">保存并继续</button></form>

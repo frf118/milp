@@ -57,6 +57,7 @@ __export(workspace_visualizer_test_entry_exports, {
   setReplayInspectorExpanded: () => setReplayInspectorExpanded,
   simplifyThroughputPoints: () => simplifyThroughputPoints,
   snapshotWithFullDeviceModules: () => snapshotWithFullDeviceModules,
+  testGroupSummaryCsv: () => testGroupSummaryCsv,
   updateReplayThroughput: () => updateReplayThroughput,
   updateWaferProgressPanel: () => updateWaferProgressPanel,
   waferDispatchProgress: () => waferDispatchProgress
@@ -4576,6 +4577,78 @@ var VisualizationWorkspace = class {
 function createVisualizationWorkspace(root = document) {
   return new VisualizationWorkspace(root);
 }
+
+// src/group_analysis_view.ts
+function csvNumber(value, digits) {
+  return value === null || !Number.isFinite(value) ? "\u2014" : value.toFixed(digits);
+}
+function csvPercent(value, fromRatio = false) {
+  const normalized = value === null ? null : value * (fromRatio ? 100 : 1);
+  return csvNumber(normalized, 2);
+}
+function caseLabel(item, index) {
+  return item.name || `t${index + 1}`;
+}
+function csvEscape(value) {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+var DEFAULT_SELECTED_METRIC_IDS = [
+  "throughput",
+  "average_recompute_time",
+  "company_capacity_baseline",
+  "company_capacity_ratio",
+  "bottleneck_candidates",
+  "makespan",
+  "validation",
+  "cpu_time",
+  "resource_utilization",
+  "departure_interval_cv",
+  "process_chamber_dwell",
+  "robot_wafer_dwell",
+  "system_residence",
+  "system_residence_cv"
+];
+function selectedMetricIds(summary) {
+  return new Set(summary.selectedMetricIds ?? DEFAULT_SELECTED_METRIC_IDS);
+}
+function bottleneckText(item) {
+  return `${item.bottleneckResource || "\u2014"}${item.bottleneckCandidateCount > 1 ? ` +${item.bottleneckCandidateCount - 1} \u4E2A\u5019\u9009` : ""}`;
+}
+function validationText(item) {
+  if (item.analysisStatus && item.analysisStatus !== "completed") {
+    return item.error || item.analysisStatus || "\u2014";
+  }
+  return item.validationPassed ? "\u901A\u8FC7" : item.validation || item.status || "\u2014";
+}
+var CSV_COLUMNS = [
+  { metricId: "throughput", header: "\u4EA7\u80FD\uFF08\u7247/\u5C0F\u65F6\uFF09", value: (item) => csvNumber(item.throughputPerHour, 1) },
+  { metricId: "average_recompute_time", header: "\u5E73\u5747\u91CD\u7B97\u65F6\u95F4\uFF08ms\uFF09", value: (item) => csvNumber(item.averageRecomputeTimeMs ?? null, 1) },
+  { metricId: "company_capacity_baseline", header: "\u4EA7\u80FD\u57FA\u7EBF\uFF08\u7247/\u5C0F\u65F6\uFF09", value: (item) => csvNumber(item.companyCapacityBaselineWph ?? null, 1) },
+  { metricId: "company_capacity_ratio", header: "\u4EA7\u80FD\u6BD4", value: (item) => csvNumber(item.companyCapacityRatio ?? null, 2) },
+  { metricId: "bottleneck_candidates", header: "\u74F6\u9888", value: bottleneckText },
+  { metricId: "makespan", header: "Makespan\uFF08s\uFF09", value: (item) => csvNumber(item.makespan, 2) },
+  { metricId: "validation", header: "\u6821\u9A8C\u7ED3\u679C", value: validationText },
+  { metricId: "cpu_time", header: "\u7B97\u6CD5\u603B\u8017\u65F6\uFF08ms\uFF09", value: (item) => csvNumber(item.cpuTimeMs, 1) },
+  { metricId: "resource_utilization", header: "\u5229\u7528\u7387\uFF08%\uFF09", value: (item) => csvPercent(item.bottleneckUtilization, true) },
+  { metricId: "departure_interval_cv", header: "\u51FA\u7AD9 CV", value: (item) => csvNumber(item.departureIntervalCv, 2) },
+  { metricId: "process_chamber_dwell", header: "\u52A0\u5DE5\u8154\u9A7B\u7559\u5747\u503C\uFF08s\uFF09", value: (item) => csvNumber(item.processChamberDwellMeanSeconds, 2) },
+  { metricId: "robot_wafer_dwell", header: "\u673A\u5668\u624B\u9A7B\u7559\u5747\u503C\uFF08s\uFF09", value: (item) => csvNumber(item.robotWaferDwellMeanSeconds, 2) },
+  { metricId: "system_residence", header: "\u7CFB\u7EDF\u505C\u7559\u5747\u503C\uFF08s\uFF09", value: (item) => csvNumber(item.waferSystemResidenceMeanSeconds, 2) },
+  { metricId: "system_residence_cv", header: "\u7CFB\u7EDF\u505C\u7559 CV", value: (item) => csvNumber(item.waferSystemResidenceCv, 2) },
+  { metricId: "loadlock_wafers_per_cycle", header: "LoadLock \u6BCF\u5468\u671F\u6676\u5706\uFF08\u7247\uFF09", value: (item) => csvNumber(item.loadLockWafersPerCycle, 2) },
+  { metricId: "loadlock_full_cycle_ratio", header: "LoadLock \u6EE1\u8F7D\u5468\u671F\u7387\uFF08%\uFF09", value: (item) => csvPercent(item.loadLockFullCycleRatio, true) },
+  { metricId: "loadlock_empty_cycle_ratio", header: "LoadLock \u7A7A\u8F7D\u5468\u671F\u7387\uFF08%\uFF09", value: (item) => csvPercent(item.loadLockEmptyCycleRatio, true) }
+];
+function testGroupSummaryCsv(summary) {
+  const selected = selectedMetricIds(summary);
+  const columns = CSV_COLUMNS.filter((column) => selected.has(column.metricId));
+  const headers = ["\u6D4B\u8BD5", ...columns.map((column) => column.header)];
+  const rows = summary.cases.map((item, index) => [
+    caseLabel(item, index),
+    ...columns.map((column) => column.value(item, summary))
+  ].map(csvEscape));
+  return [headers.map(csvEscape).join(","), ...rows.map((row) => row.join(","))].join("\r\n");
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   alignOriginalDecisionTraceToMoves,
@@ -4616,6 +4689,7 @@ function createVisualizationWorkspace(root = document) {
   setReplayInspectorExpanded,
   simplifyThroughputPoints,
   snapshotWithFullDeviceModules,
+  testGroupSummaryCsv,
   updateReplayThroughput,
   updateWaferProgressPanel,
   waferDispatchProgress

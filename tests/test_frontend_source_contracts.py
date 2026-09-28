@@ -330,6 +330,16 @@ class ConfigEditorFrontendTests(unittest.TestCase):
         self.assertIn('id="nextDiffBtn"', viewer)
         self.assertIn("function timeWithPlan(current, planned, estimated = false)", viewer)
         self.assertIn("hasExecutionTimeDifference(bar.rec, durationOnly)", viewer)
+        self.assertIn("function describeMove(raw)", viewer)
+        self.assertIn("max-width: 320px", viewer)
+        self.assertIn('class="tooltip-description"', viewer)
+        self.assertIn('class="tooltip-description">${escapeHtml(describeMove(raw))}', viewer)
+        self.assertIn('旋转${destination ? `到 ${destination}` : ""}', viewer)
+        self.assertNotIn("Move描述:", viewer)
+        self.assertIn("case 4:", viewer)
+        self.assertIn("const robot = firstTooltipText(raw && raw.Robot", viewer)
+        self.assertIn("dom.tooltip.innerHTML = header + rows + description", viewer)
+        self.assertNotIn("GanttMoveSemantics", viewer)
 
     def test_result_preview_and_group_analysis_use_main_area(self) -> None:
         """结果预览应保持简洁，并提供独立的测试组分析入口。"""
@@ -454,14 +464,15 @@ class ConfigEditorFrontendTests(unittest.TestCase):
             '<span class="eyebrow">测试组结果分析</span>',
         ):
             self.assertNotIn(removed_content, group_view_source)
-        self.assertIn('class="group-analysis-table-head"', group_view_source)
+        self.assertIn('class="group-analysis-head"', group_view_source)
         self.assertNotIn('<div class="group-kpi-grid">', group_view_source)
         self.assertIn('<section class="group-analysis-table-wrap">', group_view_source)
         self.assertIn('data-return-run-results', group_view_source)
         self.assertIn('返回运行结果', group_view_source)
         self.assertNotIn('参考测试：', group_view_source)
+        self.assertNotIn("<th>相对参考</th>", group_view_source)
         self.assertNotIn('项命中缓存', group_view_source)
-        self.assertIn("逐测试指标对比", group_view_source)
+        self.assertIn("逐测试指标", group_view_source)
         self.assertNotIn("function throughputChart", group_view_source)
         self.assertIn("<th>产能</th>", group_view_source)
         self.assertNotIn("<th>吞吐</th>", group_view_source)
